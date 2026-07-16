@@ -208,6 +208,7 @@ $SESH_HOME/
         ├── meta.json
         ├── events.jsonl
         ├── lock
+        ├── operation.lock
         ├── refs/
         │   ├── active-run.json
         │   ├── latest-checkpoint
@@ -230,6 +231,10 @@ State directories are created with mode `0700` and regular files with mode
 ownership, symlink traversal, and insecure permissions on canonical state.
 Run-inbox files are derived or untrusted input; canonical storage never trusts
 them without parsing and validation.
+
+Canonical V1 JSON requires repository, worktree, cwd, dirty, and symlink-target
+paths to be valid UTF-8. Sesh refuses an unsupported path before session or fork
+activation and never records a lossy replacement string.
 
 Blobs are scoped to a session rather than globally deduplicated. This makes
 complete session deletion understandable: deleting one session removes every
@@ -255,6 +260,7 @@ than assumed safe.
     "session_id": "<uuid>",
     "run_id": "<uuid-or-null>",
     "provider": "claude",
+    "idempotency_key": "<provider-stable-key-or-null>",
     "type": "provider.tool.completed",
     "payload": {}
   }
@@ -263,12 +269,14 @@ than assumed safe.
 
 The checksum covers the canonical UTF-8 JSON encoding of `event`. Typed payloads
 use stable struct fields and ordered maps so encoding is reproducible. Under the
-session lock, storage reads the last valid event, allocates the next sequence,
-appends exactly one newline-terminated envelope, and flushes it before success.
+short-lived journal lock, storage reads the last valid event, allocates the next
+sequence, appends exactly one newline-terminated envelope, and flushes it before
+success.
 
-On startup, Sesh may discard an incomplete or checksum-invalid final line only.
-Invalid data before the final line is corruption and causes a fail-closed
-diagnostic; Sesh does not guess at history repair.
+On startup, Sesh may discard only an incomplete final line without a newline.
+A complete checksum-invalid final line and invalid data anywhere earlier are
+corruption and cause a fail-closed diagnostic; Sesh does not guess at history
+repair.
 
 V1 event families are:
 
@@ -279,10 +287,12 @@ V1 event families are:
 - `run.handshake`
 - `run.stopped`
 - `run.recovered`
+- `cwd.changed`
 - `provider.prompt.submitted`
 - `provider.tool.requested`
 - `provider.tool.completed`
 - `provider.tool.failed`
+- `provider.stop.observed`
 - `git.snapshot`
 - `checkpoint.created`
 - `capture.failed`
@@ -353,6 +363,10 @@ The normalized hook lifecycle is:
 
 The supervisor independently records process exit, including signal and status,
 because lifecycle hooks are not guaranteed after a hard process failure.
+
+When a provider exposes an opaque tool response but no structured command exit
+status, Sesh stores that response verbatim and labels the status as incomplete.
+It does not parse provider-formatted prose to manufacture a structured fact.
 
 Claude receives a bundled Sesh plugin through `--plugin-dir`. Plugin hooks merge
 with existing Claude hooks and do not write `.claude` files into the repository.
@@ -430,11 +444,15 @@ present; arrays may be empty. A transition checkpoint instead contains
 has explicit per-field and total byte limits. Event references must exist in the
 same session at or before `through_sequence`.
 
+The V1 typed narrative limit is 32 KiB, leaving deterministic room in the
+65,536-byte handoff for repository facts, recent failures, and omission
+metadata.
+
 A provider submission enters an inbox as an atomic file, then the supervisor
 validates it, appends `checkpoint.created`, and writes immutable JSON and
 rendered Markdown named by the resulting event sequence. A transition
 checkpoint is built directly from committed canonical state under the session
-lock.
+journal lock.
 
 `latest-checkpoint` points to either kind. `latest-narrative-checkpoint` points
 only to explicit narrative. Both refs contain only a sequence and change through
@@ -462,12 +480,12 @@ The handoff contains, in order:
 9. Exact omitted event ranges and local inspection commands
 
 The default rendered limit is 65,536 UTF-8 bytes. Selection is structural and
-deterministic; no model ranks content. The latest checkpoint and current Git
-facts are retained first, followed by the latest narrative checkpoint. When
-post-narrative history exceeds the remaining space, the renderer retains newest
-complete events and emits the omitted sequence range. `handoff.md` and a bounded
-`recent-events.jsonl` copy are placed in the new run inbox so the provider can
-inspect them without canonical-store access.
+deterministic; no model ranks content. The latest checkpoint, current Git
+counts/fingerprint, and latest narrative checkpoint are retained. Path details,
+post-narrative events, recent commands, and capture-gap details have explicit
+omission counts or ranges when they exceed the remaining space. `handoff.md`
+and a bounded `recent-events.jsonl` copy are placed in the new run inbox so the
+provider can inspect them without canonical-store access.
 
 The new provider receives the detailed handoff through `SessionStart` and only
 a fixed initial user prompt:
@@ -485,7 +503,7 @@ checkpointed.
 `sesh switch <provider>` performs these steps:
 
 1. Resolve and validate the worktree ref.
-2. Acquire the session lock.
+2. Acquire the session lifecycle-operation lock.
 3. Reject a live provider lease.
 4. Recover a verifiably stale lease if present.
 5. Validate the saved cwd.
@@ -495,18 +513,20 @@ checkpointed.
 9. Render the handoff and run inbox atomically.
 10. Create a pending run lease owned by the current supervisor and append
     `run.started`.
-11. Release the session lock.
+11. Release the lifecycle-operation lock.
 12. Launch the provider in the saved cwd and atomically add its child-process
     identity to the lease.
 13. Require the SessionStart handshake within a 60-second startup deadline.
-14. If the handshake fails, terminate the child, reacquire the lock, record the
-    failed run, and clear the lease.
-15. On normal exit, reacquire the lock, append `run.stopped`, observe Git, and
-    clear the lease.
+14. If the handshake fails, terminate the child, reacquire the
+    lifecycle-operation lock, record the failed run, and clear the lease.
+15. On normal exit, reacquire the lifecycle-operation lock, append `run.stopped`,
+    observe Git, and clear the lease.
 
-The session lock protects storage mutations, not the entire interactive
-provider lifetime. The live lease prevents a second provider attachment. Hooks
-take the same short-lived storage lock when appending events.
+`operation.lock` serializes provider lifecycle and fork transactions, but is not
+held for the interactive provider lifetime. `lock` serializes journal sequence
+allocation and append, including hook writes. Keeping the locks distinct lets a
+SessionStart hook append its handshake after the lifecycle transaction creates
+the lease. The live lease prevents a second provider attachment.
 
 ## Session Fork Transaction
 
@@ -547,7 +567,7 @@ and an exact cleanup command.
 
 ## Concurrency and Failure Model
 
-Each journal mutation uses the session advisory lock. Parallel provider hooks
+Each journal mutation uses the journal advisory lock. Parallel provider hooks
 are serialized in receipt order and retain both provider occurrence time and
 Sesh record time. IDs supplied by a provider are used as idempotency keys where
 available so a retried identical hook cannot create a second fact.
@@ -586,13 +606,22 @@ before future export or sync. Complete `sesh delete` is the only V1 history
 removal operation; selective event rewriting is deferred because it complicates
 append-only integrity and can leave secret copies in checkpoint or blob history.
 
-Canonical storage is never writable by the provider. The provider receives
-write access only to its per-run checkpoint inbox. Checkpoint promotion validates
-schema, size, session/run association, event references, file type, ownership,
-and path containment.
+Fork artifacts and child run handoffs can contain parent-session content. Sesh
+therefore refuses parent deletion while child sessions remain, deletes children
+first, and removes terminal operation artifacts with the parent session. Git
+worktrees and branches remain source-code state and are never deleted by session
+deletion.
+
+Adapters add only the per-run checkpoint inbox to provider writable roots;
+canonical storage is not added as a workspace. Hook subprocesses perform
+canonical writes after validation. This is not an OS security boundary: a
+provider given unrestricted same-user shell access may still reach any file the
+developer can. Checkpoint promotion validates schema, size, session/run
+association, event references, file type, ownership, and path containment.
 
 Executables and Git are invoked with argument vectors. Hook commands are static
-and contain no interpolated prompt, branch, path, or session content. Provider
+and expand only the quoted `SESH_HOOK_BIN` executable path; they contain no
+interpolated prompt, branch, worktree, or session content. Provider
 names are a closed V1 enum, and passthrough arguments remain individual OS
 strings.
 
