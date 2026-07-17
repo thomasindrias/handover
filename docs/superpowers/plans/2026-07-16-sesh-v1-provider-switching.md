@@ -3792,7 +3792,7 @@ rtk git commit -m "feat: supervise provider runs with leases"
 - Modify: `tests/support/mod.rs`
 - Create: `tests/run_session.rs`
 
-- [ ] **Step 1: Add executable-fixture support and a failing run test**
+- [x] **Step 1: Add executable-fixture support and a failing run test**
 
 Add to `tests/support/mod.rs`:
 
@@ -3834,13 +3834,13 @@ exit 23
 
 After exit, invoke `sesh log --json` only after Task 15; for this task inspect `$SESH_HOME/sessions/*/events.jsonl` directly and assert the ordered event types include `session.created`, `git.snapshot`, `run.started`, `run.handshake`, `provider.prompt.submitted`, and `run.stopped`. Add a second fake provider that submits the identical `SessionStart` and `PostToolUse` payload twice; assert each idempotency key produces one event and one post-tool Git snapshot.
 
-- [ ] **Step 2: Run the test and verify `run` is not recognized**
+- [x] **Step 2: Run the test and verify `run` is not recognized**
 
 Run: `rtk cargo test --test run_session`
 
 Expected: FAIL because the CLI has no `run` or `__hook` commands.
 
-- [ ] **Step 3: Expand the CLI only with commands implemented in this task**
+- [x] **Step 3: Expand the CLI only with commands implemented in this task**
 
 Replace `src/cli.rs` with:
 
@@ -3870,7 +3870,7 @@ pub enum Command {
 }
 ```
 
-- [ ] **Step 4: Make normalized hooks carry and validate cwd**
+- [x] **Step 4: Make normalized hooks carry and validate cwd**
 
 Change `normalize` to return:
 
@@ -3885,7 +3885,7 @@ pub struct NormalizedHook {
 
 Read required `cwd` and `hook_event_name` once, retain them, and update hook contract tests. Canonicalize hook cwd and require it to be a directory inside the canonical bound worktree. `SessionStart` must equal the saved cwd used for launch. For later hooks, add a journal `append_optional` primitive whose closure sees committed events under the journal lock; use it to append `cwd.changed` only when the relative cwd differs from the last committed value. This prevents concurrent hooks from producing duplicate cwd facts. Add `SessionStore::saved_cwd_relative()` that derives the latest value from verified events and falls back to the immutable initial value in `SessionMeta`; never rewrite `meta.json`.
 
-- [ ] **Step 5: Implement app dispatch, run creation, and hook mapping**
+- [x] **Step 5: Implement app dispatch, run creation, and hook mapping**
 
 Create `src/app.rs` with `run(cli, environment, runtime) -> Result<i32>` and two focused functions:
 
@@ -3971,7 +3971,7 @@ For SessionStart, return `session_start_output(contents_of_SESH_HANDOFF_PATH)`. 
 
 On any ingestion failure, atomically write `runs/<run-id>/capture-failed.json` with phase, timestamp, and error before returning `capture_failure_output(provider, event_name, error)`. A later `UserPromptSubmit` or `PreToolUse` must check this sentinel first and block until `sesh doctor --repair` proves storage healthy and clears it. If the input is too malformed to recover `hook_event_name`, write the sentinel, print a concise error to stderr, and exit non-zero so the provider treats the hook itself as failed.
 
-- [ ] **Step 6: Wire main without swallowing child exit codes**
+- [x] **Step 6: Wire main without swallowing child exit codes**
 
 `src/lib.rs` exports `app`, and exposes:
 
@@ -4007,7 +4007,7 @@ fn main() -> ExitCode {
 }
 ```
 
-- [ ] **Step 7: Verify the first real vertical slice**
+- [x] **Step 7: Verify the first real vertical slice**
 
 Run:
 
@@ -4019,7 +4019,7 @@ rtk cargo clippy --all-targets --all-features -- -D warnings
 
 Expected: PASS. Confirm the fake provider receives its terminal streams by inheriting them; no output-capture pipe may replace stdout/stderr.
 
-- [ ] **Step 8: Commit `sesh run`**
+- [x] **Step 8: Commit `sesh run`**
 
 ```bash
 rtk git add src tests
