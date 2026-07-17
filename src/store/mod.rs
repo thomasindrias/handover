@@ -1,6 +1,7 @@
 pub mod atomic;
 pub mod blob;
 pub mod journal;
+pub mod lease;
 pub mod refs;
 pub mod session;
 
