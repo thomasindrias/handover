@@ -202,7 +202,7 @@ target is nested inside any other registered worktree
 target branch or path already exists
 ```
 
-Use `git check-ignore` nowhere: `git ls-files --others --exclude-standard -z` is the one inclusion source, so ignored files never enter the manifest.
+`git ls-files --others --exclude-standard -z` remains the only inclusion source for copied untracked files. Git does not enumerate FIFOs, sockets, or devices there, so fork preflight must also perform a read-only metadata walk rooted at the source worktree. Never follow symlinks; prune the root `.git` administration entry and recorded gitlink directories. Batch candidate directories and special nodes through `git check-ignore -z --stdin`: prune ignored directories, ignore an ignored special node, and refuse every unignored special node. This fork-only walk discovers unsupported state without adding ignored content to the copy manifest.
 
 - [ ] **Step 6: Add preflight refusal tests**
 
