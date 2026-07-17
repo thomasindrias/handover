@@ -1,0 +1,1 @@
+{"session_id":"codex-native-1","turn_id":"turn-1","transcript_path":null,"cwd":"/work/oauth","model":"gpt-test","permission_mode":"default","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"cargo test oauth_callback"},"tool_response":"Chunk ID: test\nProcess exited with code 0\nFinal output:\nok\n","tool_use_id":"tool-2"}
