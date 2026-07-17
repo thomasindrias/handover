@@ -1,3 +1,4 @@
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -25,4 +26,12 @@ pub fn init_repo(path: &Path) {
     std::fs::write(path.join("README.md"), "initial\n").unwrap();
     git(path, &["add", "README.md"]);
     git(path, &["commit", "-m", "initial"]);
+}
+
+#[allow(dead_code)]
+pub fn write_executable(path: &Path, body: &str) {
+    std::fs::write(path, body).unwrap();
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).unwrap();
 }

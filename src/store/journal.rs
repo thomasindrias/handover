@@ -13,6 +13,7 @@ pub struct PendingEvent {
     pub recorded_at: String,
     pub run_id: Option<RunId>,
     pub provider: Option<Provider>,
+    pub idempotency_key: Option<String>,
     pub kind: EventKind,
 }
 
@@ -22,6 +23,13 @@ pub struct PendingEventMeta {
     pub recorded_at: String,
     pub run_id: Option<RunId>,
     pub provider: Option<Provider>,
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AppendOutcome {
+    Appended(Event),
+    Existing(Event),
 }
 
 #[derive(Clone, Debug)]
@@ -50,14 +58,21 @@ impl EventJournal {
             recorded_at,
             run_id,
             provider,
+            idempotency_key,
             kind,
         } = pending;
+        if idempotency_key.is_some() {
+            return Err(Error::InvalidState(
+                "idempotent events must use append_idempotent".into(),
+            ));
+        }
         self.append_with(
             PendingEventMeta {
                 occurred_at,
                 recorded_at,
                 run_id,
                 provider,
+                idempotency_key: None,
             },
             move |_, _| Ok(kind),
         )
@@ -68,13 +83,26 @@ impl EventJournal {
         pending: PendingEventMeta,
         build_kind: impl FnOnce(u64, &[EventEnvelope]) -> Result<EventKind>,
     ) -> Result<Event> {
+        self.append_optional(pending, |sequence, events| {
+            build_kind(sequence, events).map(Some)
+        })?
+        .ok_or_else(|| Error::InvalidState("event builder did not produce an event".into()))
+    }
+
+    pub fn append_optional(
+        &self,
+        pending: PendingEventMeta,
+        build_kind: impl FnOnce(u64, &[EventEnvelope]) -> Result<Option<EventKind>>,
+    ) -> Result<Option<Event>> {
         self.with_lock(|file| {
             let events = repair_and_read(file, &self.path, &self.session_id)?;
             let sequence = events
                 .last()
                 .map_or(Some(1), |item| item.event.sequence.checked_add(1))
                 .ok_or_else(|| Error::InvalidState("event sequence overflow".into()))?;
-            let kind = build_kind(sequence, &events)?;
+            let Some(kind) = build_kind(sequence, &events)? else {
+                return Ok(None);
+            };
             let event = Event {
                 schema_version: 1,
                 sequence,
@@ -83,15 +111,51 @@ impl EventJournal {
                 session_id: self.session_id.clone(),
                 run_id: pending.run_id,
                 provider: pending.provider,
+                idempotency_key: pending.idempotency_key,
                 kind,
             };
-            let envelope = EventEnvelope::seal(event.clone())?;
-            file.seek(SeekFrom::End(0))
-                .map_err(|source| io(&self.path, source))?;
-            file.write_all(&envelope.line()?)
-                .map_err(|source| io(&self.path, source))?;
-            file.sync_data().map_err(|source| io(&self.path, source))?;
-            Ok(event)
+            write_event(file, &self.path, &event)?;
+            Ok(Some(event))
+        })
+    }
+
+    pub fn append_idempotent(&self, pending: PendingEvent) -> Result<AppendOutcome> {
+        let key = pending.idempotency_key.clone().ok_or_else(|| {
+            Error::InvalidState("idempotent append requires an idempotency key".into())
+        })?;
+        self.with_lock(|file| {
+            let events = repair_and_read(file, &self.path, &self.session_id)?;
+            if let Some(existing) = events
+                .iter()
+                .find(|item| item.event.idempotency_key.as_deref() == Some(&key))
+            {
+                if existing.event.run_id == pending.run_id
+                    && existing.event.provider == pending.provider
+                    && existing.event.kind == pending.kind
+                {
+                    return Ok(AppendOutcome::Existing(existing.event.clone()));
+                }
+                return Err(Error::InvalidState(format!(
+                    "idempotency key {key:?} conflicts with an existing event"
+                )));
+            }
+            let sequence = events
+                .last()
+                .map_or(Some(1), |item| item.event.sequence.checked_add(1))
+                .ok_or_else(|| Error::InvalidState("event sequence overflow".into()))?;
+            let event = Event {
+                schema_version: 1,
+                sequence,
+                occurred_at: pending.occurred_at,
+                recorded_at: pending.recorded_at,
+                session_id: self.session_id.clone(),
+                run_id: pending.run_id,
+                provider: pending.provider,
+                idempotency_key: Some(key),
+                kind: pending.kind,
+            };
+            write_event(file, &self.path, &event)?;
+            Ok(AppendOutcome::Appended(event))
         })
     }
 
@@ -118,6 +182,15 @@ impl EventJournal {
             (Ok(_), Err(error)) => Err(error),
         }
     }
+}
+
+fn write_event(file: &mut std::fs::File, path: &Path, event: &Event) -> Result<()> {
+    let envelope = EventEnvelope::seal(event.clone())?;
+    file.seek(SeekFrom::End(0))
+        .map_err(|source| io(path, source))?;
+    file.write_all(&envelope.line()?)
+        .map_err(|source| io(path, source))?;
+    file.sync_data().map_err(|source| io(path, source))
 }
 
 fn open_private_rw(path: &Path, parent: &Path) -> Result<std::fs::File> {
@@ -258,6 +331,7 @@ mod tests {
             recorded_at: "2026-07-16T10:00:01Z".into(),
             run_id: None,
             provider: Some(Provider::Claude),
+            idempotency_key: None,
             kind: EventKind::ProviderPromptSubmitted {
                 prompt: ContentRef::Inline {
                     text: prompt.into(),
@@ -295,6 +369,7 @@ mod tests {
             recorded_at: "2026-07-16T10:00:02Z".into(),
             run_id: None,
             provider: Some(Provider::Claude),
+            idempotency_key: None,
         };
 
         let event = journal
@@ -313,6 +388,73 @@ mod tests {
         });
         assert!(error.is_err());
         assert_eq!(journal.read_repair().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn idempotent_append_reuses_exact_events_and_rejects_conflicts() {
+        let temp = private_temp();
+        let journal = EventJournal::new(temp.path(), SessionId::new());
+        let mut event = pending("one");
+        event.idempotency_key = Some("prompt:stable".into());
+
+        let first = journal.append_idempotent(event.clone()).unwrap();
+        let second = journal.append_idempotent(event.clone()).unwrap();
+
+        assert!(matches!(first, super::AppendOutcome::Appended(_)));
+        assert!(matches!(second, super::AppendOutcome::Existing(_)));
+        assert_eq!(journal.read_repair().unwrap().len(), 1);
+
+        event.kind = EventKind::ProviderPromptSubmitted {
+            prompt: ContentRef::Inline {
+                text: "different".into(),
+            },
+        };
+        assert!(journal.append_idempotent(event).is_err());
+        assert_eq!(journal.read_repair().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn optional_append_suppresses_concurrent_duplicate_facts() {
+        let temp = private_temp();
+        let journal = Arc::new(EventJournal::new(temp.path(), SessionId::new()));
+        let barrier = Arc::new(Barrier::new(8));
+        let meta = PendingEventMeta {
+            occurred_at: "2026-07-16T10:00:00Z".into(),
+            recorded_at: "2026-07-16T10:00:00Z".into(),
+            run_id: None,
+            provider: Some(Provider::Claude),
+            idempotency_key: None,
+        };
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let journal = Arc::clone(&journal);
+                let barrier = Arc::clone(&barrier);
+                let meta = meta.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    journal.append_optional(meta, |_, committed| {
+                        let exists = committed.iter().any(|item| {
+                            matches!(
+                                &item.event.kind,
+                                EventKind::CwdChanged { cwd_relative }
+                                    if cwd_relative == std::path::Path::new("apps/web")
+                            )
+                        });
+                        Ok((!exists).then_some(EventKind::CwdChanged {
+                            cwd_relative: std::path::PathBuf::from("apps/web"),
+                        }))
+                    })
+                })
+            })
+            .collect();
+
+        let appended = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap().unwrap().is_some())
+            .filter(|appended| *appended)
+            .count();
+        assert_eq!(appended, 1);
+        assert_eq!(journal.read_repair().unwrap().len(), 1);
     }
 
     #[test]
