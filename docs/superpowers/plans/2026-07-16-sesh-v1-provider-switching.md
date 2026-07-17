@@ -3258,7 +3258,7 @@ rtk git commit -m "feat: render deterministic provider handoffs"
 - Test: `src/provider/claude.rs`
 - Test: `src/provider/codex.rs`
 
-- [ ] **Step 1: Write failing launch-spec tests**
+- [x] **Step 1: Write failing launch-spec tests**
 
 Add tests that build both adapters with cwd `/work/oauth/apps/web`, inbox `/state/run/inbox`, integration root `/state/integrations`, and provider flags `--model test`. Assert:
 
@@ -3294,13 +3294,13 @@ assert!(codex.args.windows(2).any(|pair| {
 
 Also assert neither argument vector contains a transcript path, prompt content, session ID, or dynamically interpolated session data. The only shell expansion allowed in hook definitions is the exact quoted static token `$SESH_HOOK_BIN`.
 
-- [ ] **Step 2: Run adapter tests and verify launch types are absent**
+- [x] **Step 2: Run adapter tests and verify launch types are absent**
 
 Run: `rtk cargo test provider::claude::tests provider::codex::tests`
 
 Expected: FAIL with missing adapters.
 
-- [ ] **Step 3: Add the provider contract**
+- [x] **Step 3: Add the provider contract**
 
 Add `StateLayout::integrations() -> PathBuf`, returning `<root>/integrations`; adapter setup creates versioned children with mode `0700`.
 
@@ -3351,7 +3351,7 @@ pub fn adapter(provider: Provider) -> Box<dyn ProviderAdapter> {
 }
 ```
 
-- [ ] **Step 4: Add static Claude plugin assets**
+- [x] **Step 4: Add static Claude plugin assets**
 
 Create `src/provider/assets/claude-plugin.json`:
 
@@ -3383,7 +3383,7 @@ Create `src/provider/assets/claude-hooks.json`:
 
 Use immutable create for a missing versioned asset. If a path already exists, hash and compare it to the embedded bytes; accept an exact match and refuse a mismatch instead of overwriting trusted hook definitions in place. Hook changes require a new integration version. Both launch specs set `SESH_HOOK_BIN` to the canonical `context.hook_bin` and the static hook commands quote that one variable, preventing repository-local PATH shadowing. `launch_spec` prepends `--plugin-dir`, the versioned directory, `--add-dir`, and the inbox. It then appends user provider arguments. Append the bootstrap positional prompt only when `context.bootstrap` is `Some`.
 
-- [ ] **Step 5: Implement the Codex per-launch overlay**
+- [x] **Step 5: Implement the Codex per-launch overlay**
 
 Use repeated `-c` arguments with these exact static TOML values:
 
@@ -3397,7 +3397,7 @@ hooks.Stop=[{hooks=[{type="command",command="\"$SESH_HOOK_BIN\" __hook codex",ti
 
 `CodexAdapter::launch_spec` appends `--add-dir <inbox>`, `-C <cwd>`, then user provider flags, then the optional bootstrap prompt. `setup` immutably writes the exact overlay lines to `<integration_root>/codex/1/hooks.txt` for inspection, accepts only an existing exact-byte match, and invokes no model. `probe` executes `<provider> --version` and returns trimmed stdout for both adapters.
 
-- [ ] **Step 6: Verify adapters preserve flags and contain no session content**
+- [x] **Step 6: Verify adapters preserve flags and contain no session content**
 
 Run:
 
@@ -3409,7 +3409,7 @@ rtk cargo clippy --all-targets --all-features -- -D warnings
 
 Expected: PASS. Use `OsString` comparisons; do not convert provider arguments through UTF-8 or a shell.
 
-- [ ] **Step 7: Commit provider launch adapters**
+- [x] **Step 7: Commit provider launch adapters**
 
 ```bash
 rtk git add src/provider
