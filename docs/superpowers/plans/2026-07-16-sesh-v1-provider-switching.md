@@ -84,7 +84,7 @@ Keep provider JSON parsing out of `model`, Git commands out of `app`, and filesy
 - Create: `src/cli.rs`
 - Test: `tests/cli_contract.rs`
 
-- [ ] **Step 1: Create the manifest and failing CLI contract test**
+- [x] **Step 1: Create the manifest and failing CLI contract test**
 
 Create `Cargo.toml`:
 
@@ -160,13 +160,13 @@ fn version_comes_from_the_package() {
 }
 ```
 
-- [ ] **Step 2: Run the test and verify the binary target is missing**
+- [x] **Step 2: Run the test and verify the binary target is missing**
 
 Run: `rtk cargo test --test cli_contract`
 
 Expected: FAIL because `src/main.rs` and the `sesh` binary do not exist.
 
-- [ ] **Step 3: Add the minimal CLI implementation**
+- [x] **Step 3: Add the minimal CLI implementation**
 
 Create `src/cli.rs`:
 
@@ -199,7 +199,7 @@ fn main() {
 }
 ```
 
-- [ ] **Step 4: Verify the bootstrap is clean**
+- [x] **Step 4: Verify the bootstrap is clean**
 
 Run:
 
@@ -211,7 +211,7 @@ rtk cargo test --test cli_contract
 
 Expected: all commands PASS.
 
-- [ ] **Step 5: Commit the bootstrap**
+- [x] **Step 5: Commit the bootstrap**
 
 ```bash
 rtk git add Cargo.toml Cargo.lock rust-toolchain.toml .gitignore src tests/cli_contract.rs
@@ -228,7 +228,7 @@ rtk git commit -m "chore: bootstrap sesh CLI"
 - Test: `src/store/mod.rs`
 - Test: `src/store/atomic.rs`
 
-- [ ] **Step 1: Write failing tests for state precedence and permissions**
+- [x] **Step 1: Write failing tests for state precedence and permissions**
 
 Add these tests to `src/store/mod.rs`:
 
@@ -383,13 +383,13 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the focused tests and verify the modules are missing**
+- [x] **Step 2: Run the focused tests and verify the modules are missing**
 
 Run: `rtk cargo test store::`
 
 Expected: FAIL because `store`, `Environment`, `StateLayout`, and `replace_private` do not exist.
 
-- [ ] **Step 3: Implement the state layout and typed errors**
+- [x] **Step 3: Implement the state layout and typed errors**
 
 Create `src/error.rs`:
 
@@ -667,7 +667,7 @@ pub mod error;
 pub mod store;
 ```
 
-- [ ] **Step 4: Run the tests and all static checks**
+- [x] **Step 4: Run the tests and all static checks**
 
 Run:
 
@@ -679,7 +679,7 @@ rtk cargo clippy --all-targets --all-features -- -D warnings
 
 Expected: PASS. If Clippy flags the temporary-name construction, fix the code rather than allowing the lint.
 
-- [ ] **Step 5: Commit private storage layout**
+- [x] **Step 5: Commit private storage layout**
 
 ```bash
 rtk git add src
@@ -698,7 +698,7 @@ rtk git commit -m "feat: add private local state layout"
 - Modify: `src/lib.rs`
 - Test: `src/model/event.rs`
 
-- [ ] **Step 1: Write the failing envelope-integrity tests**
+- [x] **Step 1: Write the failing envelope-integrity tests**
 
 Add this test module to the new `src/model/event.rs` before its implementation:
 
@@ -746,13 +746,13 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the focused test and verify the model is absent**
+- [x] **Step 2: Run the focused test and verify the model is absent**
 
 Run: `rtk cargo test model::event::tests`
 
 Expected: FAIL with unresolved model types.
 
-- [ ] **Step 3: Implement stable IDs and provider names**
+- [x] **Step 3: Implement stable IDs and provider names**
 
 Create `src/model/ids.rs`:
 
@@ -854,7 +854,7 @@ impl Runtime for SystemRuntime {
 }
 ```
 
-- [ ] **Step 4: Implement Git fact types and the sealed event envelope**
+- [x] **Step 4: Implement Git fact types and the sealed event envelope**
 
 Create `src/model/git.rs`:
 
@@ -1039,7 +1039,7 @@ pub mod model;
 pub mod runtime;
 ```
 
-- [ ] **Step 5: Verify serialization and linting**
+- [x] **Step 5: Verify serialization and linting**
 
 Run:
 
@@ -1051,7 +1051,7 @@ rtk cargo clippy --all-targets --all-features -- -D warnings
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit the normalized event contract**
+- [x] **Step 6: Commit the normalized event contract**
 
 ```bash
 rtk git add src Cargo.lock
@@ -1065,7 +1065,7 @@ rtk git commit -m "feat: define normalized session events"
 - Modify: `src/store/mod.rs`
 - Test: `src/store/journal.rs`
 
-- [ ] **Step 1: Write failing journal tests**
+- [x] **Step 1: Write failing journal tests**
 
 Add to `src/store/journal.rs`:
 
@@ -1185,13 +1185,13 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the journal tests and verify they fail**
+- [x] **Step 2: Run the journal tests and verify they fail**
 
 Run: `rtk cargo test store::journal::tests`
 
 Expected: FAIL because `EventJournal` and `PendingEvent` are undefined.
 
-- [ ] **Step 3: Implement locked append and tail-only recovery**
+- [x] **Step 3: Implement locked append and tail-only recovery**
 
 Create `src/store/journal.rs` with these public types and behavior:
 
@@ -1353,7 +1353,7 @@ Immediately after opening the lock and journal descriptors, validate with `File:
 
 Add `pub mod journal;` to `src/store/mod.rs`.
 
-- [ ] **Step 4: Verify recovery behavior and the full suite**
+- [x] **Step 4: Verify recovery behavior and the full suite**
 
 Run:
 
@@ -1365,7 +1365,7 @@ rtk cargo clippy --all-targets --all-features -- -D warnings
 
 Expected: PASS. Confirm the corruption test fails if the implementation is temporarily changed to discard the first invalid line.
 
-- [ ] **Step 5: Commit the journal**
+- [x] **Step 5: Commit the journal**
 
 ```bash
 rtk git add src/store
@@ -1382,7 +1382,7 @@ rtk git commit -m "feat: add recoverable event journal"
 - Create: `tests/git_observer.rs`
 - Modify: `src/lib.rs`
 
-- [ ] **Step 1: Add real-Git test helpers and a failing observation test**
+- [x] **Step 1: Add real-Git test helpers and a failing observation test**
 
 Create `tests/support/mod.rs`:
 
@@ -1491,13 +1491,13 @@ fn reports_a_dirty_submodule_explicitly() {
 }
 ```
 
-- [ ] **Step 2: Run the integration test and verify the Git facade is missing**
+- [x] **Step 2: Run the integration test and verify the Git facade is missing**
 
 Run: `rtk cargo test --test git_observer`
 
 Expected: FAIL because `sesh::git::Git` does not exist.
 
-- [ ] **Step 3: Implement argument-vector Git execution**
+- [x] **Step 3: Implement argument-vector Git execution**
 
 Create `src/git/command.rs`:
 
@@ -1550,7 +1550,7 @@ impl GitCommand {
 }
 ```
 
-- [ ] **Step 4: Implement identity, NUL-delimited path lists, and hashing**
+- [x] **Step 4: Implement identity, NUL-delimited path lists, and hashing**
 
 Create `src/git/observe.rs` with this interface and exact command set:
 
@@ -1831,7 +1831,7 @@ impl Git {
 
 Add `pub mod git;` to `src/lib.rs`.
 
-- [ ] **Step 5: Run the real-Git test and repair detached-HEAD handling if needed**
+- [x] **Step 5: Run the real-Git test and repair detached-HEAD handling if needed**
 
 Run:
 
@@ -1843,7 +1843,7 @@ rtk cargo clippy --all-targets --all-features -- -D warnings
 
 Expected: PASS. The intentionally non-zero `symbolic-ref --quiet` result must become `branch: None`; no stderr should reach the user for detached HEAD.
 
-- [ ] **Step 6: Commit Git observation**
+- [x] **Step 6: Commit Git observation**
 
 ```bash
 rtk git add src tests
@@ -1860,7 +1860,7 @@ rtk git commit -m "feat: observe git worktree state"
 - Modify: `src/store/mod.rs`
 - Test: `src/store/session.rs`
 
-- [ ] **Step 1: Write failing tests for create, lookup, and duplicate refusal**
+- [x] **Step 1: Write failing tests for create, lookup, and duplicate refusal**
 
 Add to `src/store/session.rs`:
 
@@ -1950,13 +1950,13 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests and verify the session facade is missing**
+- [x] **Step 2: Run the tests and verify the session facade is missing**
 
 Run: `rtk cargo test store::session::tests`
 
 Expected: FAIL with unresolved `SessionStore` and `SessionMeta`.
 
-- [ ] **Step 3: Add session metadata and worktree refs**
+- [x] **Step 3: Add session metadata and worktree refs**
 
 Create `src/model/session.rs`:
 
@@ -2023,7 +2023,7 @@ mod session;
 pub use session::{SessionMeta, WorktreeRef};
 ```
 
-- [ ] **Step 4: Implement the SessionStore transaction**
+- [x] **Step 4: Implement the SessionStore transaction**
 
 Create `src/store/session.rs`:
 
@@ -2184,7 +2184,7 @@ pub mod session;
 pub use session::SessionStore;
 ```
 
-- [ ] **Step 5: Verify session creation and ref lookup**
+- [x] **Step 5: Verify session creation and ref lookup**
 
 Run:
 
@@ -2196,7 +2196,7 @@ rtk cargo clippy --all-targets --all-features -- -D warnings
 
 Expected: PASS. Inspect the temporary test state during a debug run and confirm no path under the fake worktree contains Sesh state.
 
-- [ ] **Step 6: Commit the session registry**
+- [x] **Step 6: Commit the session registry**
 
 ```bash
 rtk git add src
