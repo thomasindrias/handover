@@ -3049,7 +3049,7 @@ rtk git commit -m "feat: add immutable session checkpoints"
 - Create: `src/handoff.rs`
 - Test: `src/handoff.rs`
 
-- [ ] **Step 1: Write failing ordering and truncation tests**
+- [x] **Step 1: Write failing ordering and truncation tests**
 
 Add to `src/handoff.rs`:
 
@@ -3107,13 +3107,13 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests and verify the renderer is absent**
+- [x] **Step 2: Run the tests and verify the renderer is absent**
 
 Run: `rtk cargo test handoff::tests`
 
 Expected: FAIL because `HandoffInput` and `render` do not exist.
 
-- [ ] **Step 3: Implement the structural renderer**
+- [x] **Step 3: Implement the structural renderer**
 
 Create these typed renderer inputs. Keep rendering independent of provider JSON and filesystem access:
 
@@ -3224,7 +3224,7 @@ Add a `#[cfg(test)] HandoffInput::fixture` using a transition at sequence 19, a 
 
 Do not add a summarizer. The latest test and failure sections, Git counts/fingerprint, and at least the latest capture gap are required. Selection drops oldest events, oldest recent commands, lexically last path details, then oldest gap details; every omission remains explicit. Cap each capture-gap message at 1 KiB with an omitted-byte count, cap the latest-test output excerpt at 2 KiB, and make the failure excerpt trim only at UTF-8 character boundaries, keeping the first 2 KiB and final 6 KiB where possible with the exact omitted byte count.
 
-- [ ] **Step 4: Add golden coverage for no narrative checkpoint**
+- [x] **Step 4: Add golden coverage for no narrative checkpoint**
 
 Add a test whose `narrative_checkpoint` is `None`. Assert the handoff literally says:
 
@@ -3236,7 +3236,7 @@ Run: `rtk cargo test handoff::tests`
 
 Expected: PASS.
 
-- [ ] **Step 5: Verify determinism and commit**
+- [x] **Step 5: Verify determinism and commit**
 
 Run:
 
