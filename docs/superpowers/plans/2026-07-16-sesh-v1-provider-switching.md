@@ -2216,7 +2216,7 @@ rtk git commit -m "feat: bind sessions to git worktrees"
 - Create: `tests/fixtures/hooks/codex-post-tool.json`
 - Modify: `src/lib.rs`
 
-- [ ] **Step 1: Add sanitized hook fixtures**
+- [x] **Step 1: Add sanitized hook fixtures**
 
 Create `tests/fixtures/hooks/claude-session-start.json`:
 
@@ -2248,7 +2248,7 @@ Create `tests/fixtures/hooks/codex-post-tool.json`:
 {"session_id":"codex-native-1","turn_id":"turn-1","transcript_path":null,"cwd":"/work/oauth","model":"gpt-test","permission_mode":"default","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"cargo test oauth_callback"},"tool_response":"Chunk ID: test\nProcess exited with code 0\nFinal output:\nok\n","tool_use_id":"tool-2"}
 ```
 
-- [ ] **Step 2: Write failing cross-provider contract tests**
+- [x] **Step 2: Write failing cross-provider contract tests**
 
 Create `tests/hook_contract.rs`:
 
@@ -2389,13 +2389,13 @@ fn capture_failure_blocks_before_work_for_both_providers() {
 }
 ```
 
-- [ ] **Step 3: Run the contract tests and verify the provider layer is missing**
+- [x] **Step 3: Run the contract tests and verify the provider layer is missing**
 
 Run: `rtk cargo test --test hook_contract`
 
 Expected: FAIL because `provider::hook` does not exist.
 
-- [ ] **Step 4: Implement tolerant normalization and fail-closed output**
+- [x] **Step 4: Implement tolerant normalization and fail-closed output**
 
 Create `src/provider/hook.rs`:
 
@@ -2571,7 +2571,7 @@ pub mod hook;
 
 Add `pub mod provider;` to `src/lib.rs`.
 
-- [ ] **Step 5: Verify both provider fixtures and unknown-field compatibility**
+- [x] **Step 5: Verify both provider fixtures and unknown-field compatibility**
 
 Run:
 
@@ -2582,7 +2582,7 @@ rtk cargo clippy --all-targets --all-features -- -D warnings
 
 Expected: PASS. The five fixture-backed tests above are the drift sentinel: every fixture must be loaded by exactly one named test.
 
-- [ ] **Step 6: Commit normalized hook ingestion**
+- [x] **Step 6: Commit normalized hook ingestion**
 
 ```bash
 rtk git add src tests
