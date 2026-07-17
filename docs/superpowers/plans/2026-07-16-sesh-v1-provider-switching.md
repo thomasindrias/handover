@@ -2600,7 +2600,7 @@ rtk git commit -m "feat: normalize provider hook events"
 - Modify: `src/store/journal.rs`
 - Test: `src/checkpoint.rs`
 
-- [ ] **Step 1: Write failing tests for narrative validation and transition inheritance**
+- [x] **Step 1: Write failing tests for narrative validation and transition inheritance**
 
 Add to `src/checkpoint.rs`:
 
@@ -2664,13 +2664,13 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the focused tests and verify checkpoint types are absent**
+- [x] **Step 2: Run the focused tests and verify checkpoint types are absent**
 
 Run: `rtk cargo test checkpoint::tests`
 
 Expected: FAIL with unresolved checkpoint types.
 
-- [ ] **Step 3: Implement the checkpoint model and validation**
+- [x] **Step 3: Implement the checkpoint model and validation**
 
 Create `src/model/checkpoint.rs` with these exact public types:
 
@@ -2816,7 +2816,7 @@ pub struct Checkpoint {
 
 Export these types from `src/model/mod.rs`.
 
-- [ ] **Step 4: Add sequence-aware journal append and checkpoint promotion**
+- [x] **Step 4: Add sequence-aware journal append and checkpoint promotion**
 
 Introduce metadata that does not carry an event kind, then make the existing `append` delegate to one sequence-allocation path in `src/store/journal.rs`:
 
@@ -3006,7 +3006,7 @@ Ok((event, stored))
 
 The transition method uses the same shape with `stage_transition`. The artifact is durable before its journal event; the mutable refs advance only after the journal event is durable. A crash can therefore leave an unreferenced artifact or a stale ref, never a ref to an uncommitted event. Task 16 rebuilds refs and reports orphan artifacts during recovery.
 
-- [ ] **Step 5: Add session-scoped blob storage for large command output**
+- [x] **Step 5: Add session-scoped blob storage for large command output**
 
 Create `src/store/blob.rs` with `BlobStore::put(bytes) -> ContentRef`. Keep strings up to 8 KiB inline; otherwise write once to `blobs/sha256/<first-two>/<rest>` with mode `0600` and return the hash and byte length. Add `ContentRef::{Inline, Blob}` to `src/model/event.rs`; change prompt content from `String` to `ContentRef` and tool response/stdout/stderr fields from `Option<String>` to `Option<ContentRef>`. Update the hook contract assertions and handoff blob resolution accordingly.
 
@@ -3023,7 +3023,7 @@ pub enum ContentRef {
 
 On an existing blob path, open with `O_NOFOLLOW`, require a private regular file, and re-hash before reuse. A mismatched blob is corruption. If two hooks race to create the same blob, the losing immutable create re-opens and verifies the winner rather than reporting a false capture failure.
 
-- [ ] **Step 6: Verify checkpoint immutability and blob deduplication**
+- [x] **Step 6: Verify checkpoint immutability and blob deduplication**
 
 Run:
 
@@ -3036,7 +3036,7 @@ rtk cargo clippy --all-targets --all-features -- -D warnings
 
 Expected: PASS. A second write of identical blob bytes must reuse the same path; a second checkpoint at the same sequence must fail.
 
-- [ ] **Step 7: Commit checkpoints and blobs**
+- [x] **Step 7: Commit checkpoints and blobs**
 
 ```bash
 rtk git add src
