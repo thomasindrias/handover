@@ -1,0 +1,26 @@
+[package]
+name = "sesh"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A local-first session layer for coding agents"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+fs2 = "0.4"
+hex = "0.4"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+shell-words = "1"
+signal-hook = "0.3"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "macros"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+pretty_assertions = "1"
+tempfile = "3"
