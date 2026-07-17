@@ -1,4 +1,5 @@
 pub mod atomic;
+pub mod journal;
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};

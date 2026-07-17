@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use crate::model::{GitSnapshot, Provider, RunId, SessionId, WorktreeIdentity};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "payload")]
+#[serde(tag = "type", content = "payload", deny_unknown_fields)]
 pub enum EventKind {
     #[serde(rename = "session.created")]
     SessionCreated { worktree: WorktreeIdentity },
@@ -87,6 +87,7 @@ pub struct Event {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EventEnvelope {
     pub checksum: String,
     pub event: Event,
@@ -179,5 +180,17 @@ mod tests {
                 "payload": { "prompt": "fix oauth" }
             })
         );
+    }
+
+    #[test]
+    fn envelope_and_payload_reject_unknown_fields() {
+        let envelope = EventEnvelope::seal(event()).unwrap();
+        let mut outer = serde_json::to_value(&envelope).unwrap();
+        outer["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<EventEnvelope>(outer).is_err());
+
+        let mut payload = serde_json::to_value(envelope).unwrap();
+        payload["event"]["payload"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<EventEnvelope>(payload).is_err());
     }
 }
