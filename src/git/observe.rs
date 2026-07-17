@@ -25,7 +25,7 @@ pub fn snapshot(command: &GitCommand, cwd: &Path) -> Result<GitSnapshot> {
         .strip_prefix(&worktree)
         .map_err(|_| Error::Command("cwd is outside discovered worktree".into()))?
         .to_path_buf();
-    let key = worktree_key(&common_git_dir, &git_dir);
+    let key = WorktreeIdentity::derive_key(&common_git_dir, &git_dir);
     let identity = WorktreeIdentity {
         common_git_dir,
         git_dir,
@@ -33,6 +33,7 @@ pub fn snapshot(command: &GitCommand, cwd: &Path) -> Result<GitSnapshot> {
         cwd_relative,
         key,
     };
+    identity.validate()?;
 
     let head = command.text(&worktree, ["rev-parse", "HEAD"])?;
     require_object_id(&head)?;
@@ -124,14 +125,6 @@ fn require_object_id(value: &str) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-fn worktree_key(common_git_dir: &Path, git_dir: &Path) -> String {
-    let mut digest = Sha256::new();
-    digest.update(common_git_dir.as_os_str().as_encoded_bytes());
-    digest.update([0]);
-    digest.update(git_dir.as_os_str().as_encoded_bytes());
-    hex::encode(digest.finalize())
 }
 
 fn paths(bytes: Vec<u8>) -> Result<Vec<PathBuf>> {

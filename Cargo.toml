@@ -16,7 +16,7 @@ sha2 = "0.10"
 shell-words = "1"
 signal-hook = "0.3"
 thiserror = "2"
-time = { version = "0.3", features = ["formatting", "macros"] }
+time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
