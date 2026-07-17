@@ -3426,7 +3426,7 @@ rtk git commit -m "feat: add claude and codex adapters"
 - Test: `src/store/lease.rs`
 - Test: `src/supervisor.rs`
 
-- [ ] **Step 1: Write failing lease identity tests**
+- [x] **Step 1: Write failing lease identity tests**
 
 Add tests proving:
 
@@ -3471,13 +3471,13 @@ fn operation_lock_serializes_lease_check_and_create() {
 }
 ```
 
-- [ ] **Step 2: Run the lease tests and verify they fail**
+- [x] **Step 2: Run the lease tests and verify they fail**
 
 Run: `rtk cargo test store::lease::tests`
 
 Expected: FAIL because lease types are undefined.
 
-- [ ] **Step 3: Implement process identity and atomic lease state**
+- [x] **Step 3: Implement process identity and atomic lease state**
 
 Create `src/store/lease.rs` with:
 
@@ -3638,11 +3638,11 @@ impl LeaseStore {
 
 Get the host with `hostname` once when creating a lease; trim it and fail if it is empty. Add `pub mod lease;` to `src/store/mod.rs`.
 
-- [ ] **Step 4: Write a failing supervisor test with a fake provider**
+- [x] **Step 4: Write a failing supervisor test with a fake provider**
 
 The fake provider must invoke the test's handshake callback, sleep briefly, and exit `23`. Assert `Supervisor::launch` returns `handshake_completed: true` and `facts.exit_code: Some(23)`, captures a child process identity, and leaves the lease intact. Then simulate the caller appending `run.stopped`, clear the expected lease, and assert it is absent. Add separate cases for exit-before-handshake and handshake timeout; both must return observed exit facts with `handshake_completed: false` so the caller can journal the failed run before clearing its lease.
 
-- [ ] **Step 5: Implement inherited-I/O launch and handshake polling**
+- [x] **Step 5: Implement inherited-I/O launch and handshake polling**
 
 Create `src/supervisor.rs` with:
 
@@ -3763,7 +3763,7 @@ Wrap the spawned process immediately in a `ChildGuard` whose `Drop` kills and re
 
 Implement `SignalForwarder` in the same file. `start` accepts the captured `ProcessIdentity`, registers `SIGTERM` and `SIGHUP` with `signal_hook::iterator::Signals`, saves its `Handle`, and spawns a thread. Before each `libc::kill`, re-capture the PID identity and forward only if it still equals the child identity; stop the thread when it does not. Its `Drop` implementation closes the handle and joins the thread, so all early returns above are covered. Add a safety comment immediately above `libc::kill` explaining the identity check and residual check-to-signal race. Do not register `SIGINT`; the provider and Sesh share the terminal foreground process group and both receive terminal Ctrl-C.
 
-- [ ] **Step 6: Verify process and lease behavior**
+- [x] **Step 6: Verify process and lease behavior**
 
 Run:
 
@@ -3774,7 +3774,7 @@ rtk cargo clippy --all-targets --all-features -- -D warnings
 
 Expected: PASS. The test must fail if `ProcessIdentity::is_live` checks PID without comparing `start_token`.
 
-- [ ] **Step 7: Commit leases and supervision**
+- [x] **Step 7: Commit leases and supervision**
 
 ```bash
 rtk git add src
