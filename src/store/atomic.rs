@@ -107,7 +107,7 @@ fn write_new_private(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn sync_directory(path: &Path) -> Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     let directory = std::fs::File::open(path).map_err(|source| io(path, source))?;
     directory.sync_all().map_err(|source| io(path, source))
 }

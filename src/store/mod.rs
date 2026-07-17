@@ -1,9 +1,13 @@
 pub mod atomic;
 pub mod journal;
+pub mod refs;
+pub mod session;
+
+pub use session::SessionStore;
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result, io};
@@ -94,15 +98,14 @@ impl StateLayout {
         }
 
         let format = self.root.join("FORMAT");
-        if format.exists() {
-            let bytes = atomic::read_private(&format)?;
-            if bytes != b"sesh-state 1\n" {
-                return Err(Error::InvalidState(
-                    "unsupported Sesh state format; expected 1".into(),
-                ));
+        match std::fs::symlink_metadata(&format) {
+            Ok(_) => validate_format(&format)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if atomic::create_private(&format, b"sesh-state 1\n").is_err() {
+                    validate_format(&format)?;
+                }
             }
-        } else {
-            atomic::create_private(&format, b"sesh-state 1\n")?;
+            Err(source) => return Err(io(&format, source)),
         }
         Ok(())
     }
@@ -114,6 +117,15 @@ impl StateLayout {
             .map_err(|source| io(&self.root, source))?;
         Ok(Self::new(root))
     }
+}
+
+fn validate_format(path: &Path) -> Result<()> {
+    if atomic::read_private(path)? != b"sesh-state 1\n" {
+        return Err(Error::InvalidState(
+            "unsupported Sesh state format; expected 1".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_from(cwd: &Path, path: PathBuf) -> PathBuf {
@@ -131,7 +143,9 @@ pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
         Err(source) => return Err(io(path, source)),
     };
     if !existed {
-        std::fs::create_dir_all(path).map_err(|source| io(path, source))?;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(path).map_err(|source| io(path, source))?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
             .map_err(|source| io(path, source))?;
     }
@@ -153,11 +167,16 @@ pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
             metadata.uid(),
         )));
     }
-    if metadata.permissions().mode() & 0o777 != 0o700 {
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
         return Err(Error::InvalidState(format!(
             "private state directory {} must have mode 0700",
             path.display(),
         )));
+    }
+    if mode != 0o700 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|source| io(path, source))?;
     }
     Ok(())
 }
@@ -168,10 +187,11 @@ mod tests {
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
+    use std::sync::{Arc, Barrier};
 
     use tempfile::TempDir;
 
-    use super::{Environment, StateLayout};
+    use super::{Environment, StateLayout, validate_format};
 
     #[test]
     fn sesh_home_wins_over_xdg_and_home() {
@@ -303,5 +323,26 @@ mod tests {
         std::fs::write(layout.root().join("FORMAT"), b"sesh-state 999\n").unwrap();
 
         assert!(layout.ensure().is_err());
+    }
+
+    #[test]
+    fn concurrent_ensure_calls_are_idempotent() {
+        let temp = TempDir::new().unwrap();
+        let layout = StateLayout::new(temp.path().join("state"));
+        let barrier = Arc::new(Barrier::new(8));
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let layout = layout.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                layout.ensure()
+            }));
+        }
+
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        validate_format(&layout.root().join("FORMAT")).unwrap();
     }
 }
