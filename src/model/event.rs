@@ -2,7 +2,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
-use crate::model::{GitSnapshot, Provider, RunId, SessionId, WorktreeIdentity};
+use crate::model::{CheckpointKind, GitSnapshot, Provider, RunId, SessionId, WorktreeIdentity};
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "storage", rename_all = "snake_case")]
+pub enum ContentRef {
+    Inline { text: String },
+    Blob { sha256: String, bytes: usize },
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", deny_unknown_fields)]
@@ -35,7 +42,7 @@ pub enum EventKind {
     #[serde(rename = "cwd.changed")]
     CwdChanged { cwd_relative: std::path::PathBuf },
     #[serde(rename = "provider.prompt.submitted")]
-    ProviderPromptSubmitted { prompt: String },
+    ProviderPromptSubmitted { prompt: ContentRef },
     #[serde(rename = "provider.tool.requested")]
     ProviderToolRequested {
         tool_name: String,
@@ -47,9 +54,9 @@ pub enum EventKind {
     ProviderToolCompleted {
         tool_name: String,
         tool_use_id: String,
-        response: Option<String>,
-        stdout: Option<String>,
-        stderr: Option<String>,
+        response: Option<ContentRef>,
+        stdout: Option<ContentRef>,
+        stderr: Option<ContentRef>,
         exit_code: Option<i32>,
         duration_ms: Option<u64>,
     },
@@ -65,7 +72,7 @@ pub enum EventKind {
     GitSnapshot { snapshot: GitSnapshot },
     #[serde(rename = "checkpoint.created")]
     CheckpointCreated {
-        checkpoint_kind: String,
+        checkpoint_kind: CheckpointKind,
         through_sequence: u64,
         path: String,
     },
@@ -123,7 +130,7 @@ impl EventEnvelope {
 
 #[cfg(test)]
 mod tests {
-    use super::{Event, EventEnvelope, EventKind};
+    use super::{ContentRef, Event, EventEnvelope, EventKind};
     use crate::model::{Provider, RunId, SessionId};
 
     fn event() -> Event {
@@ -136,7 +143,9 @@ mod tests {
             run_id: Some(RunId::parse("22222222-2222-4222-8222-222222222222").unwrap()),
             provider: Some(Provider::Claude),
             kind: EventKind::ProviderPromptSubmitted {
-                prompt: "fix oauth".into(),
+                prompt: ContentRef::Inline {
+                    text: "fix oauth".into(),
+                },
             },
         }
     }
@@ -177,7 +186,12 @@ mod tests {
                 "run_id": "22222222-2222-4222-8222-222222222222",
                 "provider": "claude",
                 "type": "provider.prompt.submitted",
-                "payload": { "prompt": "fix oauth" }
+                "payload": {
+                    "prompt": {
+                        "storage": "inline",
+                        "text": "fix oauth"
+                    }
+                }
             })
         );
     }

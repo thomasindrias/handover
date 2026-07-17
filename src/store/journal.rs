@@ -17,6 +17,14 @@ pub struct PendingEvent {
 }
 
 #[derive(Clone, Debug)]
+pub struct PendingEventMeta {
+    pub occurred_at: String,
+    pub recorded_at: String,
+    pub run_id: Option<RunId>,
+    pub provider: Option<Provider>,
+}
+
+#[derive(Clone, Debug)]
 pub struct EventJournal {
     session_id: SessionId,
     path: PathBuf,
@@ -37,12 +45,36 @@ impl EventJournal {
     }
 
     pub fn append(&self, pending: PendingEvent) -> Result<Event> {
+        let PendingEvent {
+            occurred_at,
+            recorded_at,
+            run_id,
+            provider,
+            kind,
+        } = pending;
+        self.append_with(
+            PendingEventMeta {
+                occurred_at,
+                recorded_at,
+                run_id,
+                provider,
+            },
+            move |_, _| Ok(kind),
+        )
+    }
+
+    pub fn append_with(
+        &self,
+        pending: PendingEventMeta,
+        build_kind: impl FnOnce(u64, &[EventEnvelope]) -> Result<EventKind>,
+    ) -> Result<Event> {
         self.with_lock(|file| {
             let events = repair_and_read(file, &self.path, &self.session_id)?;
             let sequence = events
                 .last()
                 .map_or(Some(1), |item| item.event.sequence.checked_add(1))
                 .ok_or_else(|| Error::InvalidState("event sequence overflow".into()))?;
+            let kind = build_kind(sequence, &events)?;
             let event = Event {
                 schema_version: 1,
                 sequence,
@@ -51,7 +83,7 @@ impl EventJournal {
                 session_id: self.session_id.clone(),
                 run_id: pending.run_id,
                 provider: pending.provider,
-                kind: pending.kind,
+                kind,
             };
             let envelope = EventEnvelope::seal(event.clone())?;
             file.seek(SeekFrom::End(0))
@@ -210,8 +242,9 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{EventJournal, PendingEvent};
-    use crate::model::{EventKind, Provider, SessionId};
+    use super::{EventJournal, PendingEvent, PendingEventMeta};
+    use crate::error::Error;
+    use crate::model::{ContentRef, EventKind, Provider, SessionId};
 
     fn private_temp() -> TempDir {
         let temp = TempDir::new().unwrap();
@@ -226,7 +259,9 @@ mod tests {
             run_id: None,
             provider: Some(Provider::Claude),
             kind: EventKind::ProviderPromptSubmitted {
-                prompt: prompt.into(),
+                prompt: ContentRef::Inline {
+                    text: prompt.into(),
+                },
             },
         }
     }
@@ -248,6 +283,36 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn append_with_allocates_under_lock_and_does_not_append_on_builder_failure() {
+        let temp = private_temp();
+        let journal = EventJournal::new(temp.path(), SessionId::new());
+        journal.append(pending("one")).unwrap();
+        let meta = PendingEventMeta {
+            occurred_at: "2026-07-16T10:00:02Z".into(),
+            recorded_at: "2026-07-16T10:00:02Z".into(),
+            run_id: None,
+            provider: Some(Provider::Claude),
+        };
+
+        let event = journal
+            .append_with(meta.clone(), |sequence, committed| {
+                assert_eq!(sequence, 2);
+                assert_eq!(committed.len(), 1);
+                Ok(EventKind::ProviderPromptSubmitted {
+                    prompt: ContentRef::Inline { text: "two".into() },
+                })
+            })
+            .unwrap();
+        assert_eq!(event.sequence, 2);
+
+        let error = journal.append_with(meta, |_, _| {
+            Err(Error::InvalidState("do not append".into()))
+        });
+        assert!(error.is_err());
+        assert_eq!(journal.read_repair().unwrap().len(), 2);
     }
 
     #[test]

@@ -3,14 +3,15 @@ use std::path::PathBuf;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use crate::checkpoint::{CheckpointService, StoredCheckpoint};
 use crate::error::{Error, Result, io};
 use crate::model::{
-    Event, EventKind, GitSnapshot, Provider, RunId, SessionId, SessionMeta, WorktreeIdentity,
-    WorktreeRef,
+    CheckpointAuthor, CheckpointKind, Event, EventKind, GitSnapshot, NarrativeInput, Provider,
+    RunId, SessionId, SessionMeta, WorktreeIdentity, WorktreeRef,
 };
 use crate::runtime::Runtime;
 use crate::store::StateLayout;
-use crate::store::journal::{EventJournal, PendingEvent};
+use crate::store::journal::{EventJournal, PendingEvent, PendingEventMeta};
 use crate::store::refs::{read_json, write_json_create};
 
 #[derive(Clone, Debug)]
@@ -160,6 +161,106 @@ impl SessionStore {
             .map(|items| items.into_iter().map(|item| item.event).collect())
     }
 
+    pub fn create_narrative_checkpoint(
+        &self,
+        runtime: &dyn Runtime,
+        run_id: Option<RunId>,
+        provider: Option<Provider>,
+        author: CheckpointAuthor,
+        narrative: NarrativeInput,
+    ) -> Result<(Event, StoredCheckpoint)> {
+        validate_checkpoint_author(author.clone(), provider)?;
+        let now = runtime.now()?;
+        let meta = PendingEventMeta {
+            occurred_at: now.clone(),
+            recorded_at: now,
+            run_id,
+            provider,
+        };
+        let service = CheckpointService::new(&self.session_dir());
+        let mut staged = None;
+        let journal = EventJournal::new(&self.session_dir(), self.meta.id.clone());
+        let event = journal.append_with(meta, |sequence, committed_events| {
+            let known_sequences = committed_events
+                .iter()
+                .map(|item| item.event.sequence)
+                .collect::<std::collections::BTreeSet<_>>();
+            if narrative
+                .related_event_sequences
+                .iter()
+                .any(|item| !known_sequences.contains(item))
+            {
+                return Err(Error::InvalidState(
+                    "checkpoint references an event not committed in this session".into(),
+                ));
+            }
+            let stored = service.stage_narrative(sequence, author, narrative)?;
+            let relative = format!("checkpoints/{sequence:012}.json");
+            let through_sequence = stored.checkpoint.through_sequence;
+            staged = Some(stored);
+            Ok(EventKind::CheckpointCreated {
+                checkpoint_kind: CheckpointKind::Narrative,
+                through_sequence,
+                path: relative,
+            })
+        })?;
+        let stored =
+            staged.ok_or_else(|| Error::InvalidState("checkpoint was not staged".into()))?;
+        service.commit_refs(&stored)?;
+        Ok((event, stored))
+    }
+
+    pub fn create_transition_checkpoint(
+        &self,
+        runtime: &dyn Runtime,
+        run_id: Option<RunId>,
+        provider: Option<Provider>,
+        narrative_checkpoint_sequence: Option<u64>,
+    ) -> Result<(Event, StoredCheckpoint)> {
+        let now = runtime.now()?;
+        let meta = PendingEventMeta {
+            occurred_at: now.clone(),
+            recorded_at: now,
+            run_id,
+            provider,
+        };
+        let service = CheckpointService::new(&self.session_dir());
+        let mut staged = None;
+        let journal = EventJournal::new(&self.session_dir(), self.meta.id.clone());
+        let event = journal.append_with(meta, |sequence, committed_events| {
+            if let Some(narrative_sequence) = narrative_checkpoint_sequence {
+                let points_to_narrative = committed_events.iter().any(|item| {
+                    item.event.sequence == narrative_sequence
+                        && matches!(
+                            item.event.kind,
+                            EventKind::CheckpointCreated {
+                                checkpoint_kind: CheckpointKind::Narrative,
+                                ..
+                            }
+                        )
+                });
+                if !points_to_narrative {
+                    return Err(Error::InvalidState(
+                        "transition does not reference a committed narrative checkpoint".into(),
+                    ));
+                }
+            }
+            let stored = service.stage_transition(sequence, narrative_checkpoint_sequence)?;
+            let relative = format!("checkpoints/{sequence:012}.json");
+            let through_sequence = stored.checkpoint.through_sequence;
+            staged = Some(stored);
+            Ok(EventKind::CheckpointCreated {
+                checkpoint_kind: CheckpointKind::Transition,
+                through_sequence,
+                path: relative,
+            })
+        })?;
+        let stored =
+            staged.ok_or_else(|| Error::InvalidState("checkpoint was not staged".into()))?;
+        service.commit_refs(&stored)?;
+        Ok((event, stored))
+    }
+
     pub fn remove_binding(&self) -> Result<()> {
         let path = self
             .layout
@@ -224,6 +325,17 @@ fn already_bound(reference: &WorktreeRef) -> Error {
     ))
 }
 
+fn validate_checkpoint_author(author: CheckpointAuthor, provider: Option<Provider>) -> Result<()> {
+    if let CheckpointAuthor::Provider(author_provider) = author {
+        if provider != Some(author_provider) {
+            return Err(Error::InvalidState(
+                "provider checkpoint author does not match event provider".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
@@ -233,7 +345,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::SessionStore;
-    use crate::model::{GitSnapshot, SessionId, WorktreeIdentity};
+    use crate::model::{
+        CheckpointAuthor, CheckpointKind, EventKind, GitSnapshot, NarrativeInput, Provider,
+        SessionId, WorktreeIdentity,
+    };
     use crate::runtime::Runtime;
     use crate::store::StateLayout;
 
@@ -303,6 +418,109 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn checkpoint_artifacts_precede_the_event_and_refs_follow_it() {
+        let temp = TempDir::new().unwrap();
+        let layout = StateLayout::new(temp.path().join("state"));
+        let store = SessionStore::create(&layout, &FixedRuntime, snapshot()).unwrap();
+        let mut narrative =
+            NarrativeInput::minimal("Implement OAuth", "PKCE done", "Fix callback test");
+        narrative.related_event_sequences = vec![2];
+
+        let (narrative_event, narrative_stored) = store
+            .create_narrative_checkpoint(
+                &FixedRuntime,
+                None,
+                Some(Provider::Claude),
+                CheckpointAuthor::Provider(Provider::Claude),
+                narrative,
+            )
+            .unwrap();
+        assert_eq!(narrative_event.sequence, 3);
+        assert!(matches!(
+            narrative_event.kind,
+            EventKind::CheckpointCreated {
+                checkpoint_kind: CheckpointKind::Narrative,
+                through_sequence: 2,
+                ..
+            }
+        ));
+        assert!(narrative_stored.json_path.exists());
+        assert!(narrative_stored.markdown_path.exists());
+        assert_eq!(
+            crate::store::refs::read_json::<u64>(
+                &store.session_dir().join("refs/latest-checkpoint")
+            )
+            .unwrap(),
+            3
+        );
+        assert_eq!(
+            crate::store::refs::read_json::<u64>(
+                &store.session_dir().join("refs/latest-narrative-checkpoint")
+            )
+            .unwrap(),
+            3
+        );
+
+        let (transition_event, transition_stored) = store
+            .create_transition_checkpoint(&FixedRuntime, None, None, Some(3))
+            .unwrap();
+        assert_eq!(transition_event.sequence, 4);
+        assert_eq!(
+            transition_stored.checkpoint.narrative_checkpoint_sequence,
+            Some(3)
+        );
+        assert!(transition_stored.checkpoint.narrative.is_none());
+        assert_eq!(
+            crate::store::refs::read_json::<u64>(
+                &store.session_dir().join("refs/latest-checkpoint")
+            )
+            .unwrap(),
+            4
+        );
+        assert_eq!(
+            crate::store::refs::read_json::<u64>(
+                &store.session_dir().join("refs/latest-narrative-checkpoint")
+            )
+            .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn invalid_checkpoint_references_do_not_append_or_stage() {
+        let temp = TempDir::new().unwrap();
+        let layout = StateLayout::new(temp.path().join("state"));
+        let store = SessionStore::create(&layout, &FixedRuntime, snapshot()).unwrap();
+        let mut narrative = NarrativeInput::minimal("Objective", "Summary", "Next");
+        narrative.related_event_sequences = vec![99];
+
+        assert!(
+            store
+                .create_narrative_checkpoint(
+                    &FixedRuntime,
+                    None,
+                    None,
+                    CheckpointAuthor::Human,
+                    narrative,
+                )
+                .is_err()
+        );
+        assert_eq!(store.events().unwrap().len(), 2);
+        assert_eq!(
+            std::fs::read_dir(store.session_dir().join("checkpoints"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(
+            store
+                .create_transition_checkpoint(&FixedRuntime, None, None, Some(1))
+                .is_err()
+        );
+        assert_eq!(store.events().unwrap().len(), 2);
     }
 
     #[test]
