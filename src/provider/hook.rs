@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde_json::{Map, Value};
 
 use crate::error::{Error, Result};
@@ -55,7 +57,14 @@ pub struct HookOutput {
     pub exit_code: i32,
 }
 
-pub fn normalize(provider: Provider, bytes: &[u8]) -> Result<HookEvent> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NormalizedHook {
+    pub cwd: PathBuf,
+    pub event_name: String,
+    pub event: HookEvent,
+}
+
+pub fn normalize(provider: Provider, bytes: &[u8]) -> Result<NormalizedHook> {
     if bytes.len() > MAX_PAYLOAD_BYTES {
         return Err(invalid(
             provider,
@@ -69,11 +78,17 @@ pub fn normalize(provider: Provider, bytes: &[u8]) -> Result<HookEvent> {
         .as_object()
         .ok_or_else(|| invalid(provider, "hook payload must be a JSON object"))?;
 
-    let event = required_string(provider, object, "hook_event_name", MAX_NAME_BYTES, true)?;
+    let event_name = required_string(provider, object, "hook_event_name", MAX_NAME_BYTES, true)?;
     let native_session_id = required_string(provider, object, "session_id", MAX_ID_BYTES, true)?;
-    required_string(provider, object, "cwd", MAX_CWD_BYTES, true)?;
+    let cwd = PathBuf::from(required_string(
+        provider,
+        object,
+        "cwd",
+        MAX_CWD_BYTES,
+        true,
+    )?);
 
-    match event.as_str() {
+    let event = match event_name.as_str() {
         "SessionStart" => Ok(HookEvent::SessionStarted { native_session_id }),
         "UserPromptSubmit" => Ok(HookEvent::UserPromptSubmitted {
             native_session_id,
@@ -122,7 +137,12 @@ pub fn normalize(provider: Provider, bytes: &[u8]) -> Result<HookEvent> {
             provider,
             format!("unsupported hook event {other:?}"),
         )),
-    }
+    }?;
+    Ok(NormalizedHook {
+        cwd,
+        event_name,
+        event,
+    })
 }
 
 pub fn session_start_output(handoff: &str) -> HookOutput {

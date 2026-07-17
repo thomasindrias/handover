@@ -89,6 +89,8 @@ pub struct Event {
     pub session_id: SessionId,
     pub run_id: Option<RunId>,
     pub provider: Option<Provider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     #[serde(flatten)]
     pub kind: EventKind,
 }
@@ -142,6 +144,7 @@ mod tests {
             session_id: SessionId::parse("11111111-1111-4111-8111-111111111111").unwrap(),
             run_id: Some(RunId::parse("22222222-2222-4222-8222-222222222222").unwrap()),
             provider: Some(Provider::Claude),
+            idempotency_key: None,
             kind: EventKind::ProviderPromptSubmitted {
                 prompt: ContentRef::Inline {
                     text: "fix oauth".into(),

@@ -3,14 +3,16 @@ use sesh::provider::hook::{HookEvent, capture_failure_output, normalize, session
 
 #[test]
 fn normalizes_claude_prompt_without_persisting_transcript_path() {
-    let event = normalize(
+    let normalized = normalize(
         Provider::Claude,
         include_bytes!("fixtures/hooks/claude-user-prompt.json"),
     )
     .unwrap();
+    assert_eq!(normalized.cwd, std::path::Path::new("/work/oauth"));
+    assert_eq!(normalized.event_name, "UserPromptSubmit");
 
     assert_eq!(
-        event,
+        normalized.event,
         HookEvent::UserPromptSubmitted {
             native_session_id: "claude-native-1".into(),
             prompt: "Implement the OAuth callback".into(),
@@ -20,14 +22,14 @@ fn normalizes_claude_prompt_without_persisting_transcript_path() {
 
 #[test]
 fn normalizes_claude_session_start() {
-    let event = normalize(
+    let normalized = normalize(
         Provider::Claude,
         include_bytes!("fixtures/hooks/claude-session-start.json"),
     )
     .unwrap();
 
     assert_eq!(
-        event,
+        normalized.event,
         HookEvent::SessionStarted {
             native_session_id: "claude-native-1".into(),
         }
@@ -36,14 +38,14 @@ fn normalizes_claude_session_start() {
 
 #[test]
 fn normalizes_claude_tool_result() {
-    let event = normalize(
+    let normalized = normalize(
         Provider::Claude,
         include_bytes!("fixtures/hooks/claude-post-tool.json"),
     )
     .unwrap();
 
     assert!(matches!(
-        event,
+        normalized.event,
         HookEvent::ToolCompleted {
             tool_name,
             exit_code: Some(101),
@@ -54,14 +56,14 @@ fn normalizes_claude_tool_result() {
 
 #[test]
 fn normalizes_codex_tool_request() {
-    let event = normalize(
+    let normalized = normalize(
         Provider::Codex,
         include_bytes!("fixtures/hooks/codex-pre-tool.json"),
     )
     .unwrap();
 
     assert!(matches!(
-        event,
+        normalized.event,
         HookEvent::ToolRequested {
             command: Some(command),
             tool_use_id,
@@ -77,10 +79,10 @@ fn normalizes_codex_tool_result_with_unknown_fields_allowed() {
     value["future_field"] = serde_json::json!({"ignored": true});
     let bytes = serde_json::to_vec(&value).unwrap();
 
-    let event = normalize(Provider::Codex, &bytes).unwrap();
+    let normalized = normalize(Provider::Codex, &bytes).unwrap();
 
     assert!(matches!(
-        event,
+        normalized.event,
         HookEvent::ToolCompleted {
             response: Some(response),
             exit_code: None,
@@ -142,7 +144,9 @@ fn normalizes_failure_and_stop_events() {
         "error": "permission denied"
     });
     assert_eq!(
-        normalize(Provider::Claude, &serde_json::to_vec(&failure).unwrap()).unwrap(),
+        normalize(Provider::Claude, &serde_json::to_vec(&failure).unwrap())
+            .unwrap()
+            .event,
         HookEvent::ToolFailed {
             native_session_id: "native".into(),
             tool_name: "Bash".into(),
@@ -153,7 +157,7 @@ fn normalizes_failure_and_stop_events() {
 
     let stopped = br#"{"session_id":"native","cwd":"/work","hook_event_name":"Stop"}"#;
     assert_eq!(
-        normalize(Provider::Codex, stopped).unwrap(),
+        normalize(Provider::Codex, stopped).unwrap().event,
         HookEvent::Stopped {
             native_session_id: "native".into()
         }

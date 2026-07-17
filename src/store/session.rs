@@ -151,6 +151,7 @@ impl SessionStore {
             recorded_at: now,
             run_id,
             provider,
+            idempotency_key: None,
             kind,
         })
     }
@@ -159,6 +160,16 @@ impl SessionStore {
         EventJournal::new(&self.session_dir(), self.meta.id.clone())
             .read_repair()
             .map(|items| items.into_iter().map(|item| item.event).collect())
+    }
+
+    pub fn saved_cwd_relative(&self) -> Result<PathBuf> {
+        let mut cwd = self.meta.worktree.cwd_relative.clone();
+        for event in self.events()? {
+            if let EventKind::CwdChanged { cwd_relative } = event.kind {
+                cwd = cwd_relative;
+            }
+        }
+        Ok(cwd)
     }
 
     pub fn create_narrative_checkpoint(
@@ -176,6 +187,7 @@ impl SessionStore {
             recorded_at: now,
             run_id,
             provider,
+            idempotency_key: None,
         };
         let service = CheckpointService::new(&self.session_dir());
         let mut staged = None;
@@ -223,6 +235,7 @@ impl SessionStore {
             recorded_at: now,
             run_id,
             provider,
+            idempotency_key: None,
         };
         let service = CheckpointService::new(&self.session_dir());
         let mut staged = None;
@@ -521,6 +534,37 @@ mod tests {
                 .is_err()
         );
         assert_eq!(store.events().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn saved_cwd_is_derived_from_verified_events_without_mutating_metadata() {
+        let temp = TempDir::new().unwrap();
+        let layout = StateLayout::new(temp.path().join("state"));
+        let store = SessionStore::create(&layout, &FixedRuntime, snapshot()).unwrap();
+        assert_eq!(
+            store.saved_cwd_relative().unwrap(),
+            PathBuf::from("apps/web")
+        );
+
+        store
+            .append(
+                &FixedRuntime,
+                None,
+                None,
+                EventKind::CwdChanged {
+                    cwd_relative: PathBuf::from("crates/api"),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.saved_cwd_relative().unwrap(),
+            PathBuf::from("crates/api")
+        );
+        assert_eq!(
+            store.meta().worktree.cwd_relative,
+            PathBuf::from("apps/web")
+        );
     }
 
     #[test]

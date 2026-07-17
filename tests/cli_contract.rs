@@ -20,3 +20,13 @@ fn version_comes_from_the_package() {
         .success()
         .stdout(predicate::str::contains("sesh 0.1.0"));
 }
+
+#[test]
+fn implemented_commands_are_visible_and_internal_hooks_are_hidden() {
+    cargo_bin_cmd!("sesh")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("run"))
+        .stdout(predicate::str::contains("__hook").not());
+}
