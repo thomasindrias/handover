@@ -2,6 +2,7 @@ pub mod checkpoint;
 pub mod cli;
 pub mod error;
 pub mod git;
+pub mod handoff;
 pub mod model;
 pub mod provider;
 pub mod runtime;
