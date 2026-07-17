@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorktreeIdentity {
     pub common_git_dir: PathBuf,
     pub git_dir: PathBuf,
@@ -12,6 +13,7 @@ pub struct WorktreeIdentity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DirtyPath {
     pub path: PathBuf,
     pub sha256: Option<String>,
@@ -20,6 +22,7 @@ pub struct DirtyPath {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GitSnapshot {
     pub identity: WorktreeIdentity,
     pub branch: Option<String>,
