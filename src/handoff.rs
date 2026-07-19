@@ -45,6 +45,12 @@ pub struct HandoffInput {
     pub capture_gaps: Vec<CaptureGap>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenderedHandoff {
+    pub markdown: String,
+    pub recent_event_sequences: Vec<u64>,
+}
+
 #[derive(Clone, Debug)]
 struct GitSummary {
     staged: usize,
@@ -63,6 +69,10 @@ struct OmittedPaths {
 }
 
 pub fn render(input: HandoffInput, max_bytes: usize) -> Result<String> {
+    render_with_selection(input, max_bytes).map(|rendered| rendered.markdown)
+}
+
+pub fn render_with_selection(input: HandoffInput, max_bytes: usize) -> Result<RenderedHandoff> {
     input.validate()?;
     let mut events = input.recent_events.clone();
     let mut commands = input.recent_commands.clone();
@@ -88,8 +98,11 @@ pub fn render(input: HandoffInput, max_bytes: usize) -> Result<String> {
             omitted_paths,
             &omitted_gaps,
         )?;
-        if output.len() <= max_bytes {
-            return Ok(output);
+        if output.len() <= max_bytes && recent_event_bytes(&events) <= max_bytes {
+            return Ok(RenderedHandoff {
+                markdown: output,
+                recent_event_sequences: events.iter().map(|item| item.0).collect(),
+            });
         }
         if !events.is_empty() {
             let count = removal_batch(events.len(), 0);
@@ -142,6 +155,75 @@ pub fn render(input: HandoffInput, max_bytes: usize) -> Result<String> {
             "required handoff facts exceed configured byte limit".into(),
         ));
     }
+}
+
+pub fn is_recognized_test_command(command: &str) -> bool {
+    if command.bytes().any(|byte| {
+        matches!(
+            byte,
+            b';' | b'|' | b'&' | b'<' | b'>' | b'\n' | b'\r' | b'`'
+        )
+    }) || command.contains("$(")
+    {
+        return false;
+    }
+    let Ok(tokens) = shell_words::split(command) else {
+        return false;
+    };
+    let mut remaining = tokens.as_slice();
+    loop {
+        match remaining.first().map(String::as_str) {
+            Some("command" | "rtk") => remaining = &remaining[1..],
+            Some("env") => {
+                remaining = &remaining[1..];
+                while let Some(token) = remaining.first() {
+                    if matches!(token.as_str(), "-i" | "--ignore-environment")
+                        || is_environment_assignment(token)
+                    {
+                        remaining = &remaining[1..];
+                    } else {
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    matches_prefix(remaining, &["cargo", "test"])
+        || matches_prefix(remaining, &["pytest"])
+        || matches_prefix(remaining, &["python", "-m", "pytest"])
+        || matches_prefix(remaining, &["go", "test"])
+        || matches_prefix(remaining, &["npm", "test"])
+        || matches_prefix(remaining, &["npm", "run", "test"])
+        || matches_prefix(remaining, &["pnpm", "test"])
+        || matches_prefix(remaining, &["yarn", "test"])
+        || matches_prefix(remaining, &["bun", "test"])
+}
+
+fn recent_event_bytes(events: &[(u64, String)]) -> usize {
+    events
+        .iter()
+        .map(|(_, line)| line.len().saturating_add(1))
+        .sum()
+}
+
+fn matches_prefix(tokens: &[String], expected: &[&str]) -> bool {
+    tokens.len() >= expected.len()
+        && tokens
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual == expected)
+}
+
+fn is_environment_assignment(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
 impl HandoffInput {
@@ -809,7 +891,10 @@ fn removal_batch(len: usize, retain: usize) -> usize {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{HandoffInput, head_tail_excerpt, render, render_ranges};
+    use super::{
+        HandoffInput, head_tail_excerpt, is_recognized_test_command, render, render_ranges,
+        render_with_selection,
+    };
     use crate::model::{DirtyPath, Provider};
 
     #[test]
@@ -963,5 +1048,68 @@ mod tests {
         input.to_provider = Provider::Claude;
         let output = render(input, 65_536).unwrap();
         assert!(output.contains("`codex` → `claude`"));
+    }
+
+    #[test]
+    fn recognized_tests_are_tokenized_without_executing_shell_syntax() {
+        for command in [
+            "cargo test oauth",
+            "pytest -q",
+            "python -m pytest tests/oauth.py",
+            "go test ./...",
+            "npm test -- --runInBand",
+            "npm run test -- oauth",
+            "pnpm test",
+            "yarn test",
+            "bun test",
+            "rtk cargo test",
+            "command pytest",
+            "env -i RUST_LOG=debug cargo test",
+            "env --ignore-environment command rtk cargo test",
+        ] {
+            assert!(is_recognized_test_command(command), "missed {command:?}");
+        }
+        for command in [
+            "cargo check",
+            "pytestish",
+            "env --unset=HOME cargo test",
+            "cargo test ; touch sentinel",
+            "touch sentinel; cargo test",
+            "cargo test | tee output",
+            "cargo test > output",
+            "cargo $(printf test)",
+        ] {
+            assert!(
+                !is_recognized_test_command(command),
+                "misclassified {command:?}"
+            );
+        }
+        let temp = tempfile::TempDir::new().unwrap();
+        let sentinel = temp.path().join("sentinel");
+        assert!(!is_recognized_test_command(&format!(
+            "touch {}; cargo test",
+            sentinel.display()
+        )));
+        assert!(!sentinel.exists());
+    }
+
+    #[test]
+    fn renderer_reports_the_exact_events_selected_for_the_bounded_copy() {
+        let mut input = HandoffInput::fixture();
+        input.recent_events = (1..=20)
+            .map(|sequence| (sequence, "x".repeat(512)))
+            .collect();
+
+        let rendered = render_with_selection(input, 4_096).unwrap();
+
+        assert!(rendered.markdown.len() <= 4_096);
+        assert!(
+            rendered
+                .recent_event_sequences
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
+        assert!(rendered.recent_event_sequences.last() == Some(&20));
+        assert!(rendered.markdown.contains("Omitted event sequences"));
     }
 }

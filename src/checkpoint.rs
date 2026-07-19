@@ -129,6 +129,23 @@ impl CheckpointService {
     }
 }
 
+pub fn load_verified_checkpoint(session_dir: &Path, event_sequence: u64) -> Result<Checkpoint> {
+    let stem = format!("{event_sequence:012}");
+    let directory = session_dir.join("checkpoints");
+    let json_path = directory.join(format!("{stem}.json"));
+    let markdown_path = directory.join(format!("{stem}.md"));
+    let checkpoint: Checkpoint = read_json(&json_path)?;
+    validate_checkpoint_shape(event_sequence, &checkpoint)?;
+    let markdown = read_private(&markdown_path)?;
+    if markdown != render_markdown(event_sequence, &checkpoint)?.as_bytes() {
+        return Err(Error::InvalidState(format!(
+            "checkpoint Markdown {} does not match its canonical JSON",
+            markdown_path.display()
+        )));
+    }
+    Ok(checkpoint)
+}
+
 fn validate_checkpoint_shape(event_sequence: u64, checkpoint: &Checkpoint) -> Result<()> {
     if checkpoint.schema_version != 1
         || event_sequence == 0
@@ -509,7 +526,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{CheckpointService, edit_narrative, read_narrative_json};
+    use super::{CheckpointService, edit_narrative, load_verified_checkpoint, read_narrative_json};
     use crate::model::{CheckpointAuthor, NarrativeInput, Provider};
     use crate::store::Environment;
 
@@ -588,6 +605,26 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn verified_checkpoint_requires_matching_immutable_json_and_markdown() {
+        let temp = TempDir::new().unwrap();
+        let service = CheckpointService::for_test(temp.path());
+        let stored = service
+            .stage_narrative(
+                2,
+                CheckpointAuthor::Human,
+                NarrativeInput::minimal("Objective", "Summary", "Next"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            load_verified_checkpoint(temp.path(), 2).unwrap(),
+            stored.checkpoint
+        );
+        std::fs::write(&stored.markdown_path, b"forged\n").unwrap();
+        assert!(load_verified_checkpoint(temp.path(), 2).is_err());
     }
 
     #[test]
