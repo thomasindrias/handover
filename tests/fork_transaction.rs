@@ -2,10 +2,18 @@ mod support;
 
 use std::os::unix::fs::{PermissionsExt, symlink};
 
-use sesh::fork::{ForkOperationStore, capture_fork_artifacts};
+use sesh::error::Error;
+use sesh::fork::{
+    ForkOperationStore, StagedChildProof, capture_fork_artifacts, recover_fork_failure,
+    recover_fork_failure_with_live_child,
+};
 use sesh::git::Git;
-use sesh::model::{ForkOperation, ForkPhase, OperationId, SessionId, UntrackedEntry};
-use sesh::store::StateLayout;
+use sesh::git::fork::{materialize, observe_target_proof};
+use sesh::model::{
+    EventKind, ForkOperation, ForkPhase, OperationId, RunId, SessionId, UntrackedEntry,
+};
+use sesh::runtime::Runtime;
+use sesh::store::{SessionStore, StateLayout};
 use support::{git, init_repo, repository_fingerprint};
 use tempfile::TempDir;
 
@@ -87,6 +95,360 @@ fn capture_rolls_back_if_source_changes_at_the_artifact_boundary() {
         retained.error.as_deref(),
         Some("source changed during fork capture")
     );
+}
+
+#[test]
+fn rollback_removes_only_targets_matching_each_durable_precommit_phase() {
+    for phase in [
+        ForkPhase::Prepared,
+        ForkPhase::ArtifactsCaptured,
+        ForkPhase::WorktreeCreated,
+        ForkPhase::StagedApplied,
+        ForkPhase::UnstagedApplied,
+        ForkPhase::UntrackedCopied,
+        ForkPhase::Verified,
+        ForkPhase::ChildStaged,
+    ] {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        prepare_capture_matrix(&repo);
+        let source_before = repository_fingerprint(&repo);
+        let target = temp.path().join("target");
+        let layout = StateLayout::new(temp.path().join("state"));
+        let operation = prepared_operation(&repo, target.clone());
+        let store = ForkOperationStore::create(&layout, &operation).unwrap();
+
+        if phase != ForkPhase::Prepared {
+            capture_fork_artifacts(&store, &repo, || Ok(())).unwrap();
+        }
+        if matches!(
+            phase,
+            ForkPhase::WorktreeCreated
+                | ForkPhase::StagedApplied
+                | ForkPhase::UnstagedApplied
+                | ForkPhase::UntrackedCopied
+                | ForkPhase::Verified
+                | ForkPhase::ChildStaged
+        ) {
+            let injected = materialize(&store, &repo, |durable| {
+                if durable == phase {
+                    Err(Error::InvalidState(format!(
+                        "injected failure after {durable:?}"
+                    )))
+                } else {
+                    Ok(())
+                }
+            });
+            if phase == ForkPhase::ChildStaged {
+                injected.unwrap();
+                store
+                    .transition(ForkPhase::Verified, ForkPhase::ChildStaged, |record| {
+                        record.child_session_id =
+                            Some(SessionId::parse("22222222-2222-4222-8222-222222222222").unwrap());
+                        record.source_checkpoint_sequence = Some(1);
+                    })
+                    .unwrap();
+            } else {
+                injected.unwrap_err();
+            }
+        }
+
+        let recovered = recover_fork_failure(&store, "injected precommit failure", None).unwrap();
+        assert_eq!(recovered.phase, ForkPhase::RolledBack, "phase {phase:?}");
+        assert!(!target.exists(), "phase {phase:?}");
+        assert!(
+            git_optional(
+                &repo,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "refs/heads/sesh/fork-test"
+                ]
+            )
+            .is_none(),
+            "phase {phase:?}"
+        );
+        assert_eq!(
+            repository_fingerprint(&repo),
+            source_before,
+            "phase {phase:?}"
+        );
+    }
+}
+
+#[test]
+fn rollback_preserves_a_target_changed_after_the_last_durable_phase() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    prepare_capture_matrix(&repo);
+    let source_before = repository_fingerprint(&repo);
+    let target = temp.path().join("target");
+    let layout = StateLayout::new(temp.path().join("state"));
+    let operation = prepared_operation(&repo, target.clone());
+    let store = ForkOperationStore::create(&layout, &operation).unwrap();
+    capture_fork_artifacts(&store, &repo, || Ok(())).unwrap();
+    materialize(&store, &repo, |_| Ok(())).unwrap();
+    std::fs::write(target.join("changed-after-phase.txt"), "must survive\n").unwrap();
+
+    let error = recover_fork_failure(&store, "injected failure", None).unwrap_err();
+
+    assert!(error.to_string().contains("target worktree"));
+    assert!(target.join("changed-after-phase.txt").exists());
+    assert_eq!(
+        git_optional(
+            &repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/heads/sesh/fork-test"
+            ]
+        )
+        .as_deref(),
+        Some(operation.target_head.as_str())
+    );
+    assert_eq!(repository_fingerprint(&repo), source_before);
+    assert_eq!(
+        store.operation().unwrap().phase,
+        ForkPhase::NeedsManualRecovery
+    );
+}
+
+#[test]
+fn live_mutation_proof_recovers_a_git_change_not_written_to_the_operation_record() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    let target = temp.path().canonicalize().unwrap().join("target");
+    let layout = StateLayout::new(temp.path().join("state"));
+    let operation = prepared_operation(&repo, target.clone());
+    let store = ForkOperationStore::create(&layout, &operation).unwrap();
+    capture_fork_artifacts(&store, &repo, || Ok(())).unwrap();
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "sesh/fork-test",
+            target.to_str().unwrap(),
+            operation.target_head.as_str(),
+        ],
+    );
+    let proof = observe_target_proof(&operation).unwrap().unwrap();
+    assert_eq!(
+        store.operation().unwrap().phase,
+        ForkPhase::ArtifactsCaptured
+    );
+
+    let recovered =
+        recover_fork_failure(&store, "operation record write failed", Some(&proof)).unwrap();
+
+    assert_eq!(recovered.phase, ForkPhase::RolledBack);
+    assert!(!target.exists());
+    assert!(
+        git_optional(
+            &repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/heads/sesh/fork-test"
+            ]
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn a_crash_loses_ephemeral_mutation_proof_and_preserves_the_unrecorded_target() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    let target = temp.path().canonicalize().unwrap().join("target");
+    let layout = StateLayout::new(temp.path().join("state"));
+    let operation = prepared_operation(&repo, target.clone());
+    let store = ForkOperationStore::create(&layout, &operation).unwrap();
+    capture_fork_artifacts(&store, &repo, || Ok(())).unwrap();
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "sesh/fork-test",
+            target.to_str().unwrap(),
+            operation.target_head.as_str(),
+        ],
+    );
+
+    let error = recover_fork_failure(&store, "recovery after process death", None).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("no durable or live mutation proof")
+    );
+    assert!(target.exists());
+    assert_eq!(
+        store.operation().unwrap().phase,
+        ForkPhase::NeedsManualRecovery
+    );
+}
+
+#[test]
+fn rollback_removes_an_exact_staged_child_before_its_proven_target() {
+    let fixture = staged_child_fixture();
+
+    let recovered =
+        recover_fork_failure(&fixture.store, "injected child staging failure", None).unwrap();
+
+    assert_eq!(recovered.phase, ForkPhase::RolledBack);
+    assert!(!fixture.child_dir.exists());
+    assert!(!fixture.target.exists());
+}
+
+#[test]
+fn live_child_proof_recovers_staging_before_the_operation_record_write() {
+    let fixture = staged_child_fixture_before_record();
+    let proof = StagedChildProof {
+        child_session_id: fixture.child_id.clone(),
+        source_checkpoint_sequence: 3,
+    };
+
+    let recovered = recover_fork_failure_with_live_child(
+        &fixture.store,
+        "child phase record write failed",
+        None,
+        Some(&proof),
+    )
+    .unwrap();
+
+    assert_eq!(recovered.phase, ForkPhase::RolledBack);
+    assert!(!fixture.child_dir.exists());
+    assert!(!fixture.target.exists());
+}
+
+#[test]
+fn rollback_preserves_all_artifacts_when_the_staged_child_inventory_changed() {
+    let fixture = staged_child_fixture();
+    let unexpected = fixture.child_dir.join("unexpected.txt");
+    std::fs::write(&unexpected, "not created by the fork transaction\n").unwrap();
+
+    let error =
+        recover_fork_failure(&fixture.store, "injected child staging failure", None).unwrap_err();
+
+    assert!(error.to_string().contains("staged child session"));
+    assert!(unexpected.exists());
+    assert!(fixture.target.exists());
+    assert_eq!(
+        fixture.store.operation().unwrap().phase,
+        ForkPhase::NeedsManualRecovery
+    );
+}
+
+#[test]
+fn rollback_preserves_the_staged_child_when_target_proof_fails() {
+    let fixture = staged_child_fixture();
+    std::fs::write(
+        fixture.target.join("changed-after-child-stage.txt"),
+        "must preserve the whole transaction\n",
+    )
+    .unwrap();
+
+    recover_fork_failure(&fixture.store, "injected child staging failure", None).unwrap_err();
+
+    assert!(fixture.child_dir.exists());
+    assert!(
+        fixture
+            .target
+            .join("changed-after-child-stage.txt")
+            .exists()
+    );
+    assert_eq!(
+        fixture.store.operation().unwrap().phase,
+        ForkPhase::NeedsManualRecovery
+    );
+}
+
+#[test]
+fn committed_lineage_recovers_forward_without_removing_git_state() {
+    for phase in [
+        ForkPhase::ChildStaged,
+        ForkPhase::LineageCommitted,
+        ForkPhase::ChildBound,
+        ForkPhase::RunLeased,
+    ] {
+        let fixture = staged_child_fixture();
+        let operation = fixture.store.operation().unwrap();
+        fixture
+            .parent
+            .append(
+                &FixedRuntime,
+                None,
+                None,
+                EventKind::SessionForked {
+                    operation_id: operation.id.clone(),
+                    child_session_id: operation.child_session_id.clone().unwrap(),
+                    parent_checkpoint_sequence: 3,
+                    target_worktree: operation.target_worktree.clone(),
+                    target_branch: operation.target_branch.clone(),
+                },
+            )
+            .unwrap();
+        if phase != ForkPhase::ChildStaged {
+            fixture
+                .store
+                .transition(ForkPhase::ChildStaged, ForkPhase::LineageCommitted, |_| {})
+                .unwrap();
+        }
+        let child = SessionStore::open(&fixture.layout, fixture.child_id.clone()).unwrap();
+        if matches!(phase, ForkPhase::ChildBound | ForkPhase::RunLeased) {
+            child.bind_worktree().unwrap();
+            fixture
+                .store
+                .transition(ForkPhase::LineageCommitted, ForkPhase::ChildBound, |_| {})
+                .unwrap();
+        }
+        if phase == ForkPhase::RunLeased {
+            fixture
+                .store
+                .transition(ForkPhase::ChildBound, ForkPhase::RunLeased, |_| {})
+                .unwrap();
+        }
+
+        let recovered =
+            recover_fork_failure(&fixture.store, "injected postcommit failure", None).unwrap();
+
+        let expected = if phase == ForkPhase::RunLeased {
+            ForkPhase::Complete
+        } else {
+            ForkPhase::ChildBound
+        };
+        assert_eq!(recovered.phase, expected, "phase {phase:?}");
+        assert!(fixture.target.exists(), "phase {phase:?}");
+        assert_eq!(
+            git_optional(
+                &fixture.parent.meta().worktree.worktree,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "refs/heads/sesh/fork-test"
+                ]
+            )
+            .as_deref(),
+            Some(operation.target_head.as_str()),
+            "phase {phase:?}"
+        );
+        assert!(
+            SessionStore::find_for_worktree(&fixture.layout, &child.meta().worktree)
+                .unwrap()
+                .is_some(),
+            "phase {phase:?}"
+        );
+    }
 }
 
 #[test]
@@ -224,6 +586,12 @@ fn capture_records_recursive_submodules_without_absolute_git_metadata() {
 
 fn prepared_operation(repo: &std::path::Path, target: std::path::PathBuf) -> ForkOperation {
     let source = Git::new().snapshot(repo).unwrap();
+    let target = target
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap()
+        .join(target.file_name().unwrap());
     ForkOperation {
         schema_version: 1,
         id: OperationId::parse("99999999-9999-4999-8999-999999999999").unwrap(),
@@ -242,6 +610,82 @@ fn prepared_operation(repo: &std::path::Path, target: std::path::PathBuf) -> For
         target_created: false,
         error: None,
         updated_at: "2026-07-19T10:00:00Z".into(),
+    }
+}
+
+struct StagedChildFixture {
+    _temp: TempDir,
+    layout: StateLayout,
+    parent: SessionStore,
+    store: ForkOperationStore,
+    target: std::path::PathBuf,
+    child_dir: std::path::PathBuf,
+    child_id: SessionId,
+}
+
+fn staged_child_fixture() -> StagedChildFixture {
+    let fixture = staged_child_fixture_before_record();
+    fixture
+        .store
+        .transition(ForkPhase::Verified, ForkPhase::ChildStaged, |record| {
+            record.child_session_id = Some(fixture.child_id.clone());
+            record.source_checkpoint_sequence = Some(3);
+        })
+        .unwrap();
+    fixture
+}
+
+fn staged_child_fixture_before_record() -> StagedChildFixture {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    prepare_capture_matrix(&repo);
+    let target = temp.path().canonicalize().unwrap().join("target");
+    let layout = StateLayout::new(temp.path().join("state"));
+    let runtime = FixedRuntime;
+    let parent =
+        SessionStore::create(&layout, &runtime, Git::new().snapshot(&repo).unwrap()).unwrap();
+    let operation = prepared_operation(&repo, target.clone());
+    let store = ForkOperationStore::create(&layout, &operation).unwrap();
+    capture_fork_artifacts(&store, &repo, || Ok(())).unwrap();
+    materialize(&store, &repo, |_| Ok(())).unwrap();
+    let child_id = SessionId::parse("22222222-2222-4222-8222-222222222222").unwrap();
+    let child = SessionStore::stage_child(
+        &layout,
+        &runtime,
+        Git::new().snapshot(&target).unwrap(),
+        parent.id().clone(),
+        3,
+        child_id.clone(),
+    )
+    .unwrap();
+    StagedChildFixture {
+        child_dir: child.session_dir(),
+        _temp: temp,
+        layout,
+        parent,
+        store,
+        target,
+        child_id,
+    }
+}
+
+struct FixedRuntime;
+
+impl Runtime for FixedRuntime {
+    fn now(&self) -> sesh::error::Result<String> {
+        Ok("2026-07-19T10:00:00Z".into())
+    }
+
+    fn session_id(&self) -> SessionId {
+        SessionId::parse("11111111-1111-4111-8111-111111111111").unwrap()
+    }
+
+    fn run_id(&self) -> RunId {
+        RunId::parse("33333333-3333-4333-8333-333333333333").unwrap()
+    }
+
+    fn operation_id(&self) -> OperationId {
+        OperationId::parse("99999999-9999-4999-8999-999999999999").unwrap()
     }
 }
 
@@ -285,6 +729,26 @@ fn git_bytes(cwd: &std::path::Path, args: &[&str]) -> Vec<u8> {
         String::from_utf8_lossy(&output.stderr)
     );
     output.stdout
+}
+
+fn git_optional(cwd: &std::path::Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("--no-pager")
+        .arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .unwrap();
+    match output.status.code() {
+        Some(0) => Some(String::from_utf8(output.stdout).unwrap().trim().to_owned()),
+        Some(1) => None,
+        _ => panic!(
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    }
 }
 
 fn git_allow_file(cwd: &std::path::Path, args: &[&str], paths: &[&std::path::Path]) {

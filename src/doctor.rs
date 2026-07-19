@@ -5,7 +5,12 @@ use serde::Serialize;
 
 use crate::checkpoint::load_verified_checkpoint;
 use crate::error::{Error, Result, io};
-use crate::model::{CheckpointKind, EventEnvelope, EventKind, Provider, SessionId};
+use crate::fork::{ForkOperationStore, lineage_commit_evidence, recover_committed_fork};
+use crate::git::fork::{MutationProof, observe_target_proof};
+use crate::model::{
+    CheckpointKind, EventEnvelope, EventKind, ForkOperation, ForkPhase, OperationId, Provider,
+    SessionId,
+};
 use crate::provider::adapter;
 use crate::store::StateLayout;
 use crate::store::atomic::{create_private, read_private, sync_directory};
@@ -19,6 +24,10 @@ pub struct Diagnostic {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repair_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_argv: Option<Vec<String>>,
 }
 
 impl Diagnostic {
@@ -28,6 +37,8 @@ impl Diagnostic {
             severity: "error".into(),
             message: message.into(),
             repair_command: None,
+            command: None,
+            command_argv: None,
         }
     }
 
@@ -37,6 +48,8 @@ impl Diagnostic {
             severity: "warning".into(),
             message: message.into(),
             repair_command: repairable.then(|| "sesh doctor --repair".into()),
+            command: None,
+            command_argv: None,
         }
     }
 
@@ -46,6 +59,8 @@ impl Diagnostic {
             severity: "repaired".into(),
             message: message.into(),
             repair_command: None,
+            command: None,
+            command_argv: None,
         }
     }
 }
@@ -296,6 +311,8 @@ pub fn check_sessions(layout: &StateLayout) -> Vec<Diagnostic> {
                         severity: severity.into(),
                         message: format!("run {} lease is present", lease.run_id),
                         repair_command: None,
+                        command: None,
+                        command_argv: None,
                     });
                 }
             }
@@ -356,7 +373,240 @@ pub fn repair(layout: &StateLayout) -> Vec<Diagnostic> {
         rebuild_checkpoint_refs(&path, &scan.envelopes, &mut diagnostics);
         repair_capture_sentinels(&path, &mut diagnostics);
     }
+    diagnostics.extend(repair_forks(layout));
     diagnostics
+}
+
+pub fn check_forks(layout: &StateLayout) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let entries = match std::fs::read_dir(layout.operations()) {
+        Ok(entries) => entries,
+        Err(error) => {
+            diagnostics.push(Diagnostic::error(
+                "fork_record_corrupt",
+                format!("cannot list fork operations: {error}"),
+            ));
+            return diagnostics;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                diagnostics.push(Diagnostic::error(
+                    "fork_record_corrupt",
+                    format!("cannot inspect a fork operation entry: {error}"),
+                ));
+                continue;
+            }
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            diagnostics.push(Diagnostic::error(
+                "fork_record_corrupt",
+                format!(
+                    "fork operation path {} is not UTF-8",
+                    entry.path().display()
+                ),
+            ));
+            continue;
+        };
+        let id = match OperationId::parse(&name) {
+            Ok(id) => id,
+            Err(error) => {
+                diagnostics.push(Diagnostic::error(
+                    "fork_record_corrupt",
+                    format!("invalid fork operation directory {name:?}: {error}"),
+                ));
+                continue;
+            }
+        };
+        let operation = match ForkOperationStore::read(layout, id) {
+            Ok(operation) => operation,
+            Err(error) => {
+                diagnostics.push(Diagnostic::error(
+                    "fork_record_corrupt",
+                    format!("fork operation {name} is invalid: {error}"),
+                ));
+                continue;
+            }
+        };
+        if matches!(operation.phase, ForkPhase::Complete | ForkPhase::RolledBack) {
+            continue;
+        }
+        let committed = match lineage_commit_evidence(layout, &operation) {
+            Ok(committed) => committed,
+            Err(error) => {
+                diagnostics.push(fork_diagnostic(
+                    "fork_record_corrupt",
+                    "error",
+                    &operation,
+                    format!("parent lineage evidence is invalid: {error}"),
+                    false,
+                ));
+                continue;
+            }
+        };
+        if matches!(
+            operation.phase,
+            ForkPhase::LineageCommitted | ForkPhase::ChildBound | ForkPhase::RunLeased
+        ) && !committed
+        {
+            diagnostics.push(fork_diagnostic(
+                "fork_record_corrupt",
+                "error",
+                &operation,
+                "phase claims committed lineage but the parent event is absent".into(),
+                false,
+            ));
+            continue;
+        }
+
+        let target = observe_target_proof(&operation);
+        let expected = operation_target_proof(&operation);
+        let changed = match (&target, &expected) {
+            (Ok(Some(fresh)), Some(expected)) => fresh != expected,
+            (Ok(None), _) => operation.target_created,
+            (Err(_), _) => true,
+            (Ok(Some(_)), None) => false,
+        };
+        if changed || operation.phase == ForkPhase::NeedsManualRecovery {
+            let detail = match target {
+                Err(error) => format!("target cannot be proven: {error}"),
+                Ok(None) => "recorded target worktree is absent".into(),
+                Ok(Some(_)) => "target differs from its recorded fingerprint or inventory".into(),
+            };
+            diagnostics.push(fork_diagnostic(
+                "fork_target_changed",
+                "error",
+                &operation,
+                detail,
+                false,
+            ));
+        } else if committed {
+            diagnostics.push(fork_diagnostic(
+                "fork_postcommit_incomplete",
+                "warning",
+                &operation,
+                "parent lineage is committed; forward repair is available".into(),
+                true,
+            ));
+        } else if operation.target_created || matches!(target, Ok(Some(_))) {
+            let detail = if operation.target_created {
+                "lineage is uncommitted; the target still matches the last durable boundary"
+            } else {
+                "lineage is uncommitted and the target has no crash-durable mutation proof"
+            };
+            diagnostics.push(fork_diagnostic(
+                "fork_precommit_crash",
+                "warning",
+                &operation,
+                detail.into(),
+                false,
+            ));
+        } else {
+            diagnostics.push(fork_diagnostic(
+                "fork_in_progress",
+                "warning",
+                &operation,
+                "operation has not created a target and may still be active".into(),
+                false,
+            ));
+        }
+    }
+    diagnostics
+}
+
+fn repair_forks(layout: &StateLayout) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let Ok(entries) = std::fs::read_dir(layout.operations()) else {
+        return diagnostics;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(id) = OperationId::parse(&name) else {
+            continue;
+        };
+        let Ok(store) = ForkOperationStore::open(layout, id) else {
+            continue;
+        };
+        let Ok(before) = store.operation() else {
+            continue;
+        };
+        if !lineage_commit_evidence(layout, &before).unwrap_or(false)
+            || matches!(before.phase, ForkPhase::Complete | ForkPhase::RolledBack)
+        {
+            continue;
+        }
+        match recover_committed_fork(&store) {
+            Ok(after) => diagnostics.push(Diagnostic::repaired(
+                "fork.forward_repaired",
+                format!(
+                    "advanced fork operation {} from {:?} to {:?} without changing its target",
+                    after.id, before.phase, after.phase
+                ),
+            )),
+            Err(error) => diagnostics.push(fork_diagnostic(
+                "fork_target_changed",
+                "error",
+                &before,
+                format!("forward repair stopped: {error}"),
+                false,
+            )),
+        }
+    }
+    diagnostics
+}
+
+fn operation_target_proof(operation: &ForkOperation) -> Option<MutationProof> {
+    Some(MutationProof {
+        fingerprint: operation.target_fingerprint.clone()?,
+        cleanup_inventory_sha256: operation.target_cleanup_inventory_sha256.clone()?,
+    })
+}
+
+fn fork_diagnostic(
+    code: &str,
+    severity: &str,
+    operation: &ForkOperation,
+    detail: String,
+    repairable: bool,
+) -> Diagnostic {
+    let inspect_root = if std::fs::symlink_metadata(&operation.target_worktree).is_ok() {
+        &operation.target_worktree
+    } else {
+        &operation.source_worktree.worktree
+    };
+    let argv = vec![
+        "git".to_owned(),
+        "-C".to_owned(),
+        inspect_root.to_string_lossy().into_owned(),
+        "status".to_owned(),
+        "--short".to_owned(),
+        "--branch".to_owned(),
+        "--untracked-files=all".to_owned(),
+    ];
+    let display = argv
+        .iter()
+        .map(|argument| shell_words::quote(argument).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Diagnostic {
+        code: code.into(),
+        severity: severity.into(),
+        message: format!(
+            "fork {} phase {:?}; source session {}; target {}; branch {:?}: {detail}; inspect with {display}",
+            operation.id,
+            operation.phase,
+            operation.source_session_id,
+            operation.target_worktree.display(),
+            operation.target_branch,
+        ),
+        repair_command: repairable.then(|| "sesh doctor --repair".into()),
+        command: Some(display),
+        command_argv: Some(argv),
+    }
 }
 
 struct JournalScan {

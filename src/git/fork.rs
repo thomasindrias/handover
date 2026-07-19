@@ -9,11 +9,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result, io};
-use crate::fork::ForkOperationStore;
+use crate::fork::{ForkOperationStore, recover_fork_failure};
 use crate::git::command::GitCommand;
 use crate::git::fingerprint::{SubmoduleEntry, canonical_json, capture};
 use crate::git::observe;
-use crate::model::{ForkPhase, GitSnapshot, Provider, UntrackedEntry, UntrackedKind};
+use crate::model::{
+    ForkFingerprint, ForkOperation, ForkPhase, GitSnapshot, Provider, UntrackedEntry, UntrackedKind,
+};
 use crate::store::atomic::{read_private, sync_directory};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,6 +37,194 @@ pub struct ForkPreflight {
     pub source: GitSnapshot,
     pub target: ForkTarget,
     pub source_head: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MutationProof {
+    pub fingerprint: ForkFingerprint,
+    pub cleanup_inventory_sha256: String,
+}
+
+pub fn observe_target_proof(operation: &ForkOperation) -> Result<Option<MutationProof>> {
+    let metadata = match std::fs::symlink_metadata(&operation.target_worktree) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(io(&operation.target_worktree, source)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::InvalidState(format!(
+            "fork target worktree {} is not a real directory",
+            operation.target_worktree.display()
+        )));
+    }
+    let target_root = operation
+        .target_worktree
+        .canonicalize()
+        .map_err(|source| io(&operation.target_worktree, source))?;
+    if target_root != operation.target_worktree {
+        return Err(Error::InvalidState(format!(
+            "fork target worktree {} no longer resolves to its recorded path",
+            operation.target_worktree.display()
+        )));
+    }
+    let command = GitCommand;
+    let snapshot = observe::snapshot(&command, &target_root)?;
+    if snapshot.identity.worktree != operation.target_worktree
+        || snapshot.identity.common_git_dir != operation.source_worktree.common_git_dir
+        || snapshot.head != operation.target_head
+        || snapshot.branch.as_deref() != Some(operation.target_branch.as_str())
+    {
+        return Err(Error::InvalidState(format!(
+            "fork target worktree {} is no longer registered at the recorded branch and HEAD",
+            operation.target_worktree.display()
+        )));
+    }
+    let inventory = capture_inventory(&target_root)?;
+    Ok(Some(MutationProof {
+        fingerprint: capture(&command, &target_root)?.fingerprint,
+        cleanup_inventory_sha256: inventory.sha256,
+    }))
+}
+
+pub fn remove_target_with_proof(operation: &ForkOperation, expected: &MutationProof) -> Result<()> {
+    validate_target_with_proof(operation, expected)?;
+    let command = GitCommand;
+    command.output(
+        &operation.source_worktree.worktree,
+        [
+            OsString::from("worktree"),
+            OsString::from("remove"),
+            OsString::from("--force"),
+            operation.target_worktree.as_os_str().to_os_string(),
+        ],
+    )?;
+    remove_proven_branch(&command, operation)
+}
+
+pub fn validate_target_with_proof(
+    operation: &ForkOperation,
+    expected: &MutationProof,
+) -> Result<()> {
+    let fresh = observe_target_proof(operation)?.ok_or_else(|| {
+        Error::InvalidState(format!(
+            "fork target worktree {} is absent",
+            operation.target_worktree.display()
+        ))
+    })?;
+    if &fresh != expected {
+        return Err(Error::InvalidState(format!(
+            "fork target worktree {} changed after its last proven boundary",
+            operation.target_worktree.display()
+        )));
+    }
+
+    let command = GitCommand;
+    require_registered_target(&command, operation)
+}
+
+pub fn remove_proven_branch(command: &GitCommand, operation: &ForkOperation) -> Result<()> {
+    let reference = format!("refs/heads/{}", operation.target_branch);
+    let head = command
+        .optional_text_exit_one(
+            &operation.source_worktree.worktree,
+            ["rev-parse", "--verify", "--quiet", reference.as_str()],
+        )?
+        .ok_or_else(|| {
+            Error::InvalidState(format!(
+                "fork target branch {:?} is absent",
+                operation.target_branch
+            ))
+        })?;
+    if head != operation.target_head {
+        return Err(Error::InvalidState(format!(
+            "fork target branch {:?} changed from its recorded HEAD",
+            operation.target_branch
+        )));
+    }
+    if worktree_listing(&command.output(
+        &operation.source_worktree.worktree,
+        ["worktree", "list", "--porcelain", "-z"],
+    )?)?
+    .iter()
+    .any(|entry| entry.branch.as_deref() == Some(reference.as_str()))
+    {
+        return Err(Error::InvalidState(format!(
+            "fork target branch {:?} is still used by a worktree",
+            operation.target_branch
+        )));
+    }
+    command.output(
+        &operation.source_worktree.worktree,
+        [
+            OsString::from("branch"),
+            OsString::from("-D"),
+            OsString::from("--"),
+            OsString::from(&operation.target_branch),
+        ],
+    )?;
+    Ok(())
+}
+
+#[derive(Default)]
+struct WorktreeListingEntry {
+    path: Option<PathBuf>,
+    head: Option<String>,
+    branch: Option<String>,
+}
+
+fn require_registered_target(command: &GitCommand, operation: &ForkOperation) -> Result<()> {
+    let entries = worktree_listing(&command.output(
+        &operation.source_worktree.worktree,
+        ["worktree", "list", "--porcelain", "-z"],
+    )?)?;
+    let expected_branch = format!("refs/heads/{}", operation.target_branch);
+    let matches = entries.iter().filter(|entry| {
+        entry.path.as_deref() == Some(operation.target_worktree.as_path())
+            && entry.head.as_deref() == Some(operation.target_head.as_str())
+            && entry.branch.as_deref() == Some(expected_branch.as_str())
+    });
+    if matches.count() != 1 {
+        return Err(Error::InvalidState(format!(
+            "fork target worktree {} is not uniquely registered at the recorded branch and HEAD",
+            operation.target_worktree.display()
+        )));
+    }
+    Ok(())
+}
+
+fn worktree_listing(bytes: &[u8]) -> Result<Vec<WorktreeListingEntry>> {
+    let mut entries = Vec::new();
+    let mut current = WorktreeListingEntry::default();
+    for field in bytes.split(|byte| *byte == 0) {
+        if field.is_empty() {
+            if current.path.is_some() {
+                entries.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        if let Some(raw) = field.strip_prefix(b"worktree ") {
+            if current.path.is_some() {
+                entries.push(std::mem::take(&mut current));
+            }
+            let path = PathBuf::from(OsString::from_vec(raw.to_vec()));
+            require_utf8_path(&path, "registered worktree")?;
+            current.path = Some(path);
+        } else if let Some(raw) = field.strip_prefix(b"HEAD ") {
+            current.head = Some(
+                String::from_utf8(raw.to_vec())
+                    .map_err(|_| Error::InvalidState("worktree HEAD is not UTF-8".into()))?,
+            );
+        } else if let Some(raw) = field.strip_prefix(b"branch ") {
+            current.branch = Some(
+                String::from_utf8(raw.to_vec())
+                    .map_err(|_| Error::InvalidState("worktree branch is not UTF-8".into()))?,
+            );
+        }
+    }
+    if current.path.is_some() {
+        entries.push(current);
+    }
+    Ok(entries)
 }
 
 pub fn default_target(source_worktree: &Path, operation_id: &str) -> Result<ForkTarget> {
@@ -476,7 +666,11 @@ pub fn materialize(
         &expected_source,
         SemanticLayer::Clean,
     )?;
-    store.transition(
+    let proof = MutationProof {
+        fingerprint: target_fingerprint.clone(),
+        cleanup_inventory_sha256: inventory.sha256.clone(),
+    };
+    if let Err(error) = store.transition(
         ForkPhase::ArtifactsCaptured,
         ForkPhase::WorktreeCreated,
         |record| {
@@ -485,8 +679,12 @@ pub fn materialize(
             record.target_fingerprint = Some(target_fingerprint.clone());
             record.target_cleanup_inventory_sha256 = Some(inventory.sha256.clone());
         },
-    )?;
-    boundary(ForkPhase::WorktreeCreated)?;
+    ) {
+        return materialization_error(store, error, Some(&proof));
+    }
+    if let Err(error) = boundary(ForkPhase::WorktreeCreated) {
+        return materialization_error(store, error, None);
+    }
 
     require_unchanged_target(&command, &target_root, &target_fingerprint, &inventory)?;
     apply_patch(
@@ -514,15 +712,23 @@ pub fn materialize(
         &expected_source,
         SemanticLayer::Staged,
     )?;
-    store.transition(
+    let proof = MutationProof {
+        fingerprint: target_fingerprint.clone(),
+        cleanup_inventory_sha256: inventory.sha256.clone(),
+    };
+    if let Err(error) = store.transition(
         ForkPhase::WorktreeCreated,
         ForkPhase::StagedApplied,
         |record| {
             record.target_fingerprint = Some(target_fingerprint.clone());
             record.target_cleanup_inventory_sha256 = Some(inventory.sha256.clone());
         },
-    )?;
-    boundary(ForkPhase::StagedApplied)?;
+    ) {
+        return materialization_error(store, error, Some(&proof));
+    }
+    if let Err(error) = boundary(ForkPhase::StagedApplied) {
+        return materialization_error(store, error, None);
+    }
 
     require_unchanged_target(&command, &target_root, &target_fingerprint, &inventory)?;
     apply_patch(
@@ -550,24 +756,38 @@ pub fn materialize(
         &expected_source,
         SemanticLayer::Unstaged,
     )?;
-    store.transition(
+    let proof = MutationProof {
+        fingerprint: target_fingerprint.clone(),
+        cleanup_inventory_sha256: inventory.sha256.clone(),
+    };
+    if let Err(error) = store.transition(
         ForkPhase::StagedApplied,
         ForkPhase::UnstagedApplied,
         |record| {
             record.target_fingerprint = Some(target_fingerprint.clone());
             record.target_cleanup_inventory_sha256 = Some(inventory.sha256.clone());
         },
-    )?;
-    boundary(ForkPhase::UnstagedApplied)?;
+    ) {
+        return materialization_error(store, error, Some(&proof));
+    }
+    if let Err(error) = boundary(ForkPhase::UnstagedApplied) {
+        return materialization_error(store, error, None);
+    }
 
     require_unchanged_target(&command, &target_root, &target_fingerprint, &inventory)?;
-    restore_untracked(store, &target_root, &untracked)?;
-    restore_submodules(
+    if let Err(error) = restore_untracked(store, &target_root, &untracked) {
+        let proof = observe_target_proof(&operation).ok().flatten();
+        return materialization_error(store, error, proof.as_ref());
+    }
+    if let Err(error) = restore_submodules(
         &command,
         &expected_source.identity.worktree,
         &target_root,
         &submodules,
-    )?;
+    ) {
+        let proof = observe_target_proof(&operation).ok().flatten();
+        return materialization_error(store, error, proof.as_ref());
+    }
     let next_inventory = capture_inventory(&target_root)?;
     verify_allowed_inventory(
         &command,
@@ -586,15 +806,23 @@ pub fn materialize(
         &expected_source,
         SemanticLayer::Complete,
     )?;
-    store.transition(
+    let proof = MutationProof {
+        fingerprint: target_fingerprint.clone(),
+        cleanup_inventory_sha256: inventory.sha256.clone(),
+    };
+    if let Err(error) = store.transition(
         ForkPhase::UnstagedApplied,
         ForkPhase::UntrackedCopied,
         |record| {
             record.target_fingerprint = Some(target_fingerprint.clone());
             record.target_cleanup_inventory_sha256 = Some(inventory.sha256.clone());
         },
-    )?;
-    boundary(ForkPhase::UntrackedCopied)?;
+    ) {
+        return materialization_error(store, error, Some(&proof));
+    }
+    if let Err(error) = boundary(ForkPhase::UntrackedCopied) {
+        return materialization_error(store, error, None);
+    }
 
     let fresh_source = capture(&command, source_cwd)?;
     if &fresh_source.fingerprint != source_fingerprint {
@@ -610,12 +838,36 @@ pub fn materialize(
             "target changed during fork verification".into(),
         ));
     }
-    let verified = store.transition(ForkPhase::UntrackedCopied, ForkPhase::Verified, |record| {
-        record.target_fingerprint = Some(fresh_target);
-        record.target_cleanup_inventory_sha256 = Some(final_inventory.sha256);
-    })?;
-    boundary(ForkPhase::Verified)?;
+    let proof = MutationProof {
+        fingerprint: fresh_target.clone(),
+        cleanup_inventory_sha256: final_inventory.sha256.clone(),
+    };
+    let verified =
+        match store.transition(ForkPhase::UntrackedCopied, ForkPhase::Verified, |record| {
+            record.target_fingerprint = Some(fresh_target);
+            record.target_cleanup_inventory_sha256 = Some(final_inventory.sha256);
+        }) {
+            Ok(verified) => verified,
+            Err(error) => return materialization_error(store, error, Some(&proof)),
+        };
+    if let Err(error) = boundary(ForkPhase::Verified) {
+        return materialization_error(store, error, None);
+    }
     Ok(verified)
+}
+
+fn materialization_error<T>(
+    store: &ForkOperationStore,
+    error: Error,
+    live_proof: Option<&MutationProof>,
+) -> Result<T> {
+    let message = error.to_string();
+    match recover_fork_failure(store, &message, live_proof) {
+        Ok(_) => Err(error),
+        Err(recovery_error) => Err(Error::InvalidState(format!(
+            "{message}; fork recovery failed: {recovery_error}"
+        ))),
+    }
 }
 
 fn verified_patches(
