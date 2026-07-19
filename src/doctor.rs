@@ -1,0 +1,687 @@
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::Path;
+
+use serde::Serialize;
+
+use crate::checkpoint::load_verified_checkpoint;
+use crate::error::{Error, Result, io};
+use crate::model::{CheckpointKind, EventEnvelope, EventKind, Provider, SessionId};
+use crate::provider::adapter;
+use crate::store::StateLayout;
+use crate::store::atomic::{create_private, read_private, sync_directory};
+use crate::store::lease::{LeaseStore, SessionOperationLock, host_name};
+use crate::store::refs::write_json;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct Diagnostic {
+    pub code: String,
+    pub severity: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair_command: Option<String>,
+}
+
+impl Diagnostic {
+    fn error(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            severity: "error".into(),
+            message: message.into(),
+            repair_command: None,
+        }
+    }
+
+    fn warning(code: &str, message: impl Into<String>, repairable: bool) -> Self {
+        Self {
+            code: code.into(),
+            severity: "warning".into(),
+            message: message.into(),
+            repair_command: repairable.then(|| "sesh doctor --repair".into()),
+        }
+    }
+
+    fn repaired(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            severity: "repaired".into(),
+            message: message.into(),
+            repair_command: None,
+        }
+    }
+}
+
+pub fn check_format(layout: &StateLayout) -> Vec<Diagnostic> {
+    let path = layout.root().join("FORMAT");
+    match read_private(&path) {
+        Ok(bytes) if bytes == b"sesh-state 1\n" => Vec::new(),
+        Ok(_) => vec![Diagnostic::error(
+            "format.unsupported",
+            format!("{} does not contain `sesh-state 1`", path.display()),
+        )],
+        Err(error) => vec![Diagnostic::error(
+            "format.unavailable",
+            format!("cannot read {}: {error}", path.display()),
+        )],
+    }
+}
+
+pub fn check_permissions(layout: &StateLayout) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    check_permission_path(layout.root(), &mut diagnostics);
+    diagnostics
+}
+
+fn check_permission_path(path: &Path, diagnostics: &mut Vec<Diagnostic>) {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            diagnostics.push(Diagnostic::error(
+                "permissions.unavailable",
+                format!("cannot inspect {}: {error}", path.display()),
+            ));
+            return;
+        }
+    };
+    // SAFETY: geteuid has no preconditions and does not dereference pointers.
+    let effective_uid = unsafe { libc::geteuid() };
+    let mode = metadata.permissions().mode() & 0o777;
+    let expected = if metadata.is_dir() { 0o700 } else { 0o600 };
+    if metadata.file_type().is_symlink() || metadata.uid() != effective_uid || mode != expected {
+        diagnostics.push(Diagnostic::error(
+            "permissions.insecure",
+            format!(
+                "{} must be owned by the current user with mode {expected:04o}",
+                path.display()
+            ),
+        ));
+        return;
+    }
+    if metadata.is_dir() {
+        match std::fs::read_dir(path) {
+            Ok(entries) => {
+                for entry in entries {
+                    match entry {
+                        Ok(entry) => check_permission_path(&entry.path(), diagnostics),
+                        Err(error) => diagnostics.push(Diagnostic::error(
+                            "permissions.unavailable",
+                            format!("cannot inspect {}: {error}", path.display()),
+                        )),
+                    }
+                }
+            }
+            Err(error) => diagnostics.push(Diagnostic::error(
+                "permissions.unavailable",
+                format!("cannot list {}: {error}", path.display()),
+            )),
+        }
+    }
+}
+
+pub fn check_git(cwd: &Path) -> Vec<Diagnostic> {
+    let version = std::process::Command::new("git").arg("--version").output();
+    match version {
+        Err(error) => {
+            return vec![Diagnostic::error(
+                "git.missing",
+                format!("cannot execute git: {error}"),
+            )];
+        }
+        Ok(output) if !output.status.success() => {
+            return vec![Diagnostic::error("git.unusable", "git --version failed")];
+        }
+        Ok(_) => {}
+    }
+    match std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+    {
+        Ok(output) if output.status.success() && output.stdout.starts_with(b"true") => Vec::new(),
+        Ok(output) => vec![Diagnostic::error(
+            "git.not_worktree",
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        )],
+        Err(error) => vec![Diagnostic::error(
+            "git.unusable",
+            format!("cannot inspect worktree: {error}"),
+        )],
+    }
+}
+
+pub fn check_provider(provider: Provider) -> Vec<Diagnostic> {
+    let executable = provider.executable();
+    let help = match std::process::Command::new(executable)
+        .arg("--help")
+        .output()
+    {
+        Err(error) => {
+            return vec![Diagnostic::error(
+                "provider.missing",
+                format!("cannot execute {executable}: {error}"),
+            )];
+        }
+        Ok(output) if !output.status.success() => {
+            return vec![Diagnostic::error(
+                "provider.help_failed",
+                format!("{executable} --help exited with {}", output.status),
+            )];
+        }
+        Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
+    };
+    let required: &[&str] = match provider {
+        Provider::Claude => &["--plugin-dir", "--add-dir"],
+        Provider::Codex => &["--config", "--add-dir", "--cd"],
+    };
+    let mut diagnostics = Vec::new();
+    for flag in required {
+        if !help.contains(flag) {
+            diagnostics.push(Diagnostic::error(
+                "provider.capability_missing",
+                format!("{executable} --help does not advertise {flag}"),
+            ));
+        }
+    }
+    if provider == Provider::Codex {
+        match std::process::Command::new(executable)
+            .args(["features", "list"])
+            .output()
+        {
+            Ok(output)
+                if output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+                        let fields: Vec<_> = line.split_whitespace().collect();
+                        fields == ["hooks", "stable", "true"]
+                    }) => {}
+            Ok(_) => diagnostics.push(Diagnostic::error(
+                "codex.hooks_unstable",
+                "codex features list does not report `hooks stable true`",
+            )),
+            Err(error) => diagnostics.push(Diagnostic::error(
+                "codex.features_failed",
+                format!("cannot inspect Codex features: {error}"),
+            )),
+        }
+    }
+    diagnostics
+}
+
+pub fn check_integrations(layout: &StateLayout) -> Vec<Diagnostic> {
+    [Provider::Claude, Provider::Codex]
+        .into_iter()
+        .filter_map(|provider| {
+            adapter(provider)
+                .verify(&layout.integrations())
+                .err()
+                .map(|error| {
+                    Diagnostic::error(
+                        "integration.invalid",
+                        format!("{} integration: {error}", provider.executable()),
+                    )
+                })
+        })
+        .collect()
+}
+
+pub fn check_sessions(layout: &StateLayout) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let entries = match std::fs::read_dir(layout.sessions()) {
+        Ok(entries) => entries,
+        Err(error) => {
+            diagnostics.push(Diagnostic::error(
+                "sessions.unavailable",
+                format!("cannot list sessions: {error}"),
+            ));
+            return diagnostics;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            diagnostics.push(Diagnostic::error(
+                "session.invalid_name",
+                format!("invalid session path {}", path.display()),
+            ));
+            continue;
+        };
+        let Ok(id) = SessionId::parse(name) else {
+            diagnostics.push(Diagnostic::error(
+                "session.invalid_name",
+                format!("invalid session directory {name:?}"),
+            ));
+            continue;
+        };
+        let scan = scan_journal(&path.join("events.jsonl"), &id);
+        match scan {
+            Ok(scan) => {
+                if scan.partial_bytes > 0 {
+                    diagnostics.push(Diagnostic::warning(
+                        "journal.partial_tail",
+                        format!(
+                            "session {id} has {} uncommitted final journal bytes",
+                            scan.partial_bytes
+                        ),
+                        true,
+                    ));
+                }
+                check_handshake_timeout(&scan.envelopes, &mut diagnostics);
+                check_orphan_artifacts(&path, &scan.envelopes, &mut diagnostics);
+            }
+            Err(error) => diagnostics.push(Diagnostic::error(
+                "journal.corrupt",
+                format!("session {id}: {error}"),
+            )),
+        }
+        match LeaseStore::new(&path).read() {
+            Ok(Some(lease)) => {
+                if lease.host != host_name().unwrap_or_default() {
+                    diagnostics.push(Diagnostic::error(
+                        "lease.foreign_host",
+                        format!("run {} belongs to host {}", lease.run_id, lease.host),
+                    ));
+                } else {
+                    let supervisor_live = lease.supervisor.is_live().unwrap_or(false);
+                    let child_live = lease
+                        .child
+                        .as_ref()
+                        .and_then(|child| child.is_live().ok())
+                        .unwrap_or(false);
+                    let (code, severity) = match (supervisor_live, child_live) {
+                        (false, false) => ("lease.dead", "warning"),
+                        (false, true) => ("lease.live_orphan_child", "error"),
+                        _ => ("lease.live", "info"),
+                    };
+                    diagnostics.push(Diagnostic {
+                        code: code.into(),
+                        severity: severity.into(),
+                        message: format!("run {} lease is present", lease.run_id),
+                        repair_command: None,
+                    });
+                }
+            }
+            Ok(None) => {}
+            Err(error) => diagnostics.push(Diagnostic::error("lease.invalid", error.to_string())),
+        }
+    }
+    diagnostics
+}
+
+pub fn repair(layout: &StateLayout) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let Ok(entries) = std::fs::read_dir(layout.sessions()) else {
+        return diagnostics;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Ok(id) = SessionId::parse(name) else {
+            continue;
+        };
+        let Ok(_operation) = SessionOperationLock::acquire(&path) else {
+            continue;
+        };
+        let journal = path.join("events.jsonl");
+        if let Ok(scan) = scan_journal(&journal, &id) {
+            if scan.partial_bytes > 0 {
+                let committed = scan.committed_bytes;
+                let result = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&journal)
+                    .and_then(|file| {
+                        file.set_len(committed as u64)?;
+                        file.sync_all()
+                    });
+                match result {
+                    Ok(()) => diagnostics.push(Diagnostic::repaired(
+                        "journal.tail_repaired",
+                        format!(
+                            "removed {} final bytes from session {id}",
+                            scan.partial_bytes
+                        ),
+                    )),
+                    Err(error) => diagnostics.push(Diagnostic::error(
+                        "journal.repair_failed",
+                        format!("cannot repair session {id}: {error}"),
+                    )),
+                }
+            }
+        }
+        let scan = match scan_journal(&journal, &id) {
+            Ok(scan) => scan,
+            Err(_) => continue,
+        };
+        rebuild_checkpoint_refs(&path, &scan.envelopes, &mut diagnostics);
+        repair_capture_sentinels(&path, &mut diagnostics);
+    }
+    diagnostics
+}
+
+struct JournalScan {
+    envelopes: Vec<EventEnvelope>,
+    committed_bytes: usize,
+    partial_bytes: usize,
+}
+
+fn scan_journal(path: &Path, expected_session: &SessionId) -> Result<JournalScan> {
+    let bytes = read_private(path)?;
+    let committed_bytes = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let mut envelopes = Vec::new();
+    let mut offset = 0usize;
+    for line in bytes[..committed_bytes].split_inclusive(|byte| *byte == b'\n') {
+        let envelope: EventEnvelope = serde_json::from_slice(&line[..line.len() - 1])
+            .map_err(|error| Error::InvalidState(format!("invalid journal line: {error}")))?;
+        envelope.verify()?;
+        if envelope.event.session_id != *expected_session
+            || envelope.event.sequence != envelopes.len() as u64 + 1
+            || envelope.line()? != line
+        {
+            return Err(Error::InvalidState(
+                "journal contains a noncanonical or out-of-sequence event".into(),
+            ));
+        }
+        offset += line.len();
+        envelopes.push(envelope);
+    }
+    Ok(JournalScan {
+        envelopes,
+        committed_bytes: offset,
+        partial_bytes: bytes.len() - committed_bytes,
+    })
+}
+
+fn check_handshake_timeout(envelopes: &[EventEnvelope], diagnostics: &mut Vec<Diagnostic>) {
+    let Some(started) = envelopes
+        .iter()
+        .rev()
+        .find(|item| matches!(item.event.kind, EventKind::RunStarted { .. }))
+    else {
+        return;
+    };
+    let run_id = started.event.run_id.as_ref();
+    let handshook = envelopes.iter().any(|item| {
+        item.event.run_id.as_ref() == run_id
+            && matches!(item.event.kind, EventKind::RunHandshake { .. })
+    });
+    let stopped = envelopes.iter().any(|item| {
+        item.event.run_id.as_ref() == run_id
+            && matches!(item.event.kind, EventKind::RunStopped { .. })
+    });
+    if !handshook && stopped {
+        diagnostics.push(Diagnostic::error(
+            "run.session_start_timeout",
+            format!("run {:?} stopped without a SessionStart handshake", run_id),
+        ));
+    }
+}
+
+fn check_orphan_artifacts(
+    session_dir: &Path,
+    envelopes: &[EventEnvelope],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let committed: std::collections::BTreeSet<_> = envelopes
+        .iter()
+        .filter_map(|item| {
+            matches!(item.event.kind, EventKind::CheckpointCreated { .. })
+                .then_some(item.event.sequence)
+        })
+        .collect();
+    if let Ok(entries) = std::fs::read_dir(session_dir.join("checkpoints")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let sequence = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.parse::<u64>().ok());
+            if sequence.is_none_or(|sequence| !committed.contains(&sequence)) {
+                diagnostics.push(Diagnostic::warning(
+                    "checkpoint.orphan_artifact",
+                    format!("orphan checkpoint artifact {}", path.display()),
+                    false,
+                ));
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(session_dir.join("runs")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || name.ends_with(".tmp") {
+                diagnostics.push(Diagnostic::warning(
+                    "temporary.orphan",
+                    format!("orphan temporary path {}", entry.path().display()),
+                    false,
+                ));
+            }
+        }
+    }
+}
+
+fn rebuild_checkpoint_refs(
+    session_dir: &Path,
+    envelopes: &[EventEnvelope],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut latest = None;
+    let mut narrative = None;
+    for envelope in envelopes {
+        if let EventKind::CheckpointCreated {
+            checkpoint_kind, ..
+        } = &envelope.event.kind
+        {
+            if load_verified_checkpoint(session_dir, envelope.event.sequence).is_err() {
+                diagnostics.push(Diagnostic::error(
+                    "checkpoint.invalid",
+                    format!("checkpoint {} is invalid", envelope.event.sequence),
+                ));
+                return;
+            }
+            latest = Some(envelope.event.sequence);
+            if checkpoint_kind == &CheckpointKind::Narrative {
+                narrative = Some(envelope.event.sequence);
+            }
+        }
+    }
+    for (name, value) in [
+        ("latest-checkpoint", latest),
+        ("latest-narrative-checkpoint", narrative),
+    ] {
+        let path = session_dir.join("refs").join(name);
+        match value {
+            Some(value) => {
+                let current = crate::store::refs::read_json::<u64>(&path).ok();
+                if current != Some(value) {
+                    match write_json(&path, &value) {
+                        Ok(()) => diagnostics.push(Diagnostic::repaired(
+                            "checkpoint.ref_rebuilt",
+                            format!("rebuilt {name} as event {value}"),
+                        )),
+                        Err(error) => diagnostics.push(Diagnostic::error(
+                            "checkpoint.ref_repair_failed",
+                            format!("cannot rebuild {name}: {error}"),
+                        )),
+                    }
+                }
+            }
+            None if std::fs::symlink_metadata(&path).is_ok() => {
+                match std::fs::remove_file(&path)
+                    .map_err(|source| io(&path, source))
+                    .and_then(|()| sync_directory(&session_dir.join("refs")))
+                {
+                    Ok(()) => diagnostics.push(Diagnostic::repaired(
+                        "checkpoint.ref_removed",
+                        format!("removed stale {name}"),
+                    )),
+                    Err(error) => diagnostics.push(Diagnostic::error(
+                        "checkpoint.ref_repair_failed",
+                        format!("cannot remove {name}: {error}"),
+                    )),
+                }
+            }
+            None => {}
+        }
+    }
+}
+
+fn repair_capture_sentinels(session_dir: &Path, diagnostics: &mut Vec<Diagnostic>) {
+    let runs = session_dir.join("runs");
+    let Ok(entries) = std::fs::read_dir(&runs) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let run_dir = entry.path();
+        let sentinel = run_dir.join("capture-failed.json");
+        if std::fs::symlink_metadata(&sentinel).is_err() {
+            continue;
+        }
+        let probe = session_dir.join(format!(".doctor-probe-{}", uuid::Uuid::new_v4()));
+        let probed = create_private(&probe, b"probe\n")
+            .and_then(|()| std::fs::remove_file(&probe).map_err(|source| io(&probe, source)))
+            .and_then(|()| sync_directory(session_dir));
+        if probed.is_ok()
+            && std::fs::remove_file(&sentinel).is_ok()
+            && sync_directory(&run_dir).is_ok()
+        {
+            diagnostics.push(Diagnostic::repaired(
+                "capture.sentinel_removed",
+                format!(
+                    "removed {} after a successful private write probe",
+                    sentinel.display()
+                ),
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use tempfile::TempDir;
+
+    use super::check_sessions;
+    use crate::model::{EventKind, GitSnapshot, Provider, RunId, SessionId, WorktreeIdentity};
+    use crate::runtime::Runtime;
+    use crate::store::lease::{LeaseStore, ProcessIdentity, RunLease};
+    use crate::store::{SessionStore, StateLayout};
+
+    struct FixedRuntime;
+
+    impl Runtime for FixedRuntime {
+        fn now(&self) -> crate::error::Result<String> {
+            Ok("2026-07-19T10:00:00Z".into())
+        }
+
+        fn session_id(&self) -> SessionId {
+            SessionId::new()
+        }
+
+        fn run_id(&self) -> RunId {
+            RunId::new()
+        }
+    }
+
+    #[test]
+    fn sessions_distinguish_dead_foreign_and_live_orphan_leases_and_missing_handshake() {
+        let (_temp, layout, store) = fixture();
+        let run_id = RunId::new();
+        store
+            .append(
+                &FixedRuntime,
+                Some(run_id.clone()),
+                Some(Provider::Claude),
+                EventKind::RunStarted {
+                    cwd: "/repo".into(),
+                    args: Vec::new(),
+                    supervisor_pid: u32::MAX,
+                },
+            )
+            .unwrap();
+        store
+            .append(
+                &FixedRuntime,
+                Some(run_id),
+                Some(Provider::Claude),
+                EventKind::RunStopped {
+                    exit_code: None,
+                    signal: Some(libc::SIGKILL),
+                },
+            )
+            .unwrap();
+        assert!(
+            check_sessions(&layout)
+                .iter()
+                .any(|item| item.code == "run.session_start_timeout")
+        );
+
+        let leases = LeaseStore::new(&store.session_dir());
+        let dead = RunLease::new(
+            store.id().clone(),
+            RunId::new(),
+            Provider::Claude,
+            ProcessIdentity {
+                pid: u32::MAX,
+                start_token: "gone".into(),
+            },
+        )
+        .unwrap();
+        leases.create(&dead).unwrap();
+        assert!(
+            check_sessions(&layout)
+                .iter()
+                .any(|item| item.code == "lease.dead")
+        );
+        leases.clear(&dead.run_id).unwrap();
+
+        let mut foreign = dead.clone();
+        foreign.run_id = RunId::new();
+        foreign.host = "foreign-host".into();
+        leases.create(&foreign).unwrap();
+        assert!(
+            check_sessions(&layout)
+                .iter()
+                .any(|item| item.code == "lease.foreign_host")
+        );
+        leases.clear(&foreign.run_id).unwrap();
+
+        let mut orphan = dead;
+        orphan.run_id = RunId::new();
+        orphan.child = Some(ProcessIdentity::capture(std::process::id()).unwrap());
+        leases.create(&orphan).unwrap();
+        assert!(
+            check_sessions(&layout)
+                .iter()
+                .any(|item| item.code == "lease.live_orphan_child")
+        );
+    }
+
+    fn fixture() -> (TempDir, StateLayout, SessionStore) {
+        let temp = TempDir::new().unwrap();
+        let worktree = temp.path().join("repo");
+        let git_dir = worktree.join(".git");
+        let snapshot = GitSnapshot {
+            identity: WorktreeIdentity {
+                key: WorktreeIdentity::derive_key(&git_dir, &git_dir),
+                common_git_dir: git_dir.clone(),
+                git_dir,
+                worktree,
+                cwd_relative: PathBuf::new(),
+            },
+            branch: Some("main".into()),
+            head: "deadbeef".into(),
+            staged: Vec::new(),
+            unstaged: Vec::new(),
+            untracked: Vec::new(),
+            dirty_submodules: Vec::new(),
+        };
+        let layout = StateLayout::new(temp.path().join("state"));
+        let store = SessionStore::create(&layout, &FixedRuntime, snapshot).unwrap();
+        (temp, layout, store)
+    }
+}

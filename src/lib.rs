@@ -1,6 +1,7 @@
 pub mod app;
 pub mod checkpoint;
 pub mod cli;
+pub mod doctor;
 pub mod error;
 pub mod git;
 pub mod handoff;

@@ -13,6 +13,7 @@ use crate::checkpoint::{
     submit_provider_narrative,
 };
 use crate::cli::{CheckpointFormat, Cli, Command};
+use crate::doctor;
 use crate::error::{Error, Result, io};
 use crate::git::Git;
 use crate::handoff::{
@@ -77,7 +78,18 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
             let input_is_terminal = stdin.is_terminal();
             delete_command(yes, environment, stdin.lock(), input_is_terminal)
         }
+        Command::Setup { provider } => {
+            let stdin = std::io::stdin();
+            setup_command(provider, environment, stdin.is_terminal())
+        }
+        Command::Doctor { json, repair } => doctor_command(json, repair, environment),
         Command::Hook { provider } => {
+            if ["SESH_HOME", "SESH_SESSION_ID", "SESH_RUN_ID"]
+                .into_iter()
+                .all(|key| environment.get(key).is_none())
+            {
+                return Ok(0);
+            }
             let output = ingest_hook(provider, environment, runtime, std::io::stdin().lock())?;
             std::io::stdout()
                 .write_all(output.stdout.as_bytes())
@@ -98,6 +110,120 @@ fn provider_command_allowed(command: &Command) -> bool {
                 from_provider: true,
                 ..
             }
+    )
+}
+
+fn setup_command(
+    provider: Provider,
+    environment: &Environment,
+    input_is_terminal: bool,
+) -> Result<i32> {
+    let cwd = std::env::current_dir().map_err(|source| io(".", source))?;
+    let layout = resolve_layout(environment, &cwd)?;
+    let provider_adapter = adapter(provider);
+    provider_adapter.setup(&layout.integrations())?;
+    provider_adapter.verify(&layout.integrations())?;
+    let diagnostics = doctor::check_provider(provider);
+    if let Some(diagnostic) = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.severity == "error")
+    {
+        return Err(Error::Command(diagnostic.message.clone()));
+    }
+    let hook_bin = std::env::current_exe()
+        .map_err(|source| io("current executable", source))?
+        .canonicalize()
+        .map_err(|source| io("current executable", source))?;
+    let mut arguments = Vec::<OsString>::new();
+    match provider {
+        Provider::Claude => {
+            arguments.push("--plugin-dir".into());
+            arguments.push(layout.integrations().join("claude/1").into_os_string());
+        }
+        Provider::Codex => {
+            let overlays = std::fs::read_to_string(layout.integrations().join("codex/1/hooks.txt"))
+                .map_err(|source| io(layout.integrations().join("codex/1/hooks.txt"), source))?;
+            for overlay in overlays.lines() {
+                arguments.push("-c".into());
+                arguments.push(overlay.into());
+            }
+        }
+    }
+    let command = std::iter::once(OsString::from(provider.executable()))
+        .chain(arguments.iter().cloned())
+        .map(|argument| shell_words::quote(&argument.to_string_lossy()).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let equivalent = format!(
+        "SESH_HOOK_BIN={} {command}",
+        shell_words::quote(&hook_bin.to_string_lossy())
+    );
+    if !input_is_terminal {
+        println!("{equivalent}");
+        return Ok(2);
+    }
+    match provider {
+        Provider::Claude => println!(
+            "Review the Sesh plugin and hook commands, then exit without submitting a prompt."
+        ),
+        Provider::Codex => println!(
+            "Open /hooks, review commands equal to '\"$SESH_HOOK_BIN\" __hook codex', trust them, then exit."
+        ),
+    }
+    let status = std::process::Command::new(provider.executable())
+        .args(&arguments)
+        .env("SESH_HOOK_BIN", &hook_bin)
+        .env_remove("SESH_HOME")
+        .env_remove("SESH_SESSION_ID")
+        .env_remove("SESH_RUN_ID")
+        .env_remove("SESH_PROVIDER")
+        .env_remove("SESH_PROVIDER_VERSION")
+        .env_remove("SESH_HANDOFF_PATH")
+        .env_remove("SESH_CHECKPOINT_INBOX")
+        .status()
+        .map_err(|error| Error::Command(format!("cannot launch setup TUI: {error}")))?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn doctor_command(json: bool, repair: bool, environment: &Environment) -> Result<i32> {
+    let cwd = std::env::current_dir().map_err(|source| io(".", source))?;
+    let layout = StateLayout::from_environment_at(environment, &cwd)?;
+    let mut diagnostics = Vec::new();
+    diagnostics.extend(doctor::check_format(&layout));
+    diagnostics.extend(doctor::check_permissions(&layout));
+    diagnostics.extend(doctor::check_git(&cwd));
+    diagnostics.extend(doctor::check_provider(Provider::Claude));
+    diagnostics.extend(doctor::check_provider(Provider::Codex));
+    diagnostics.extend(doctor::check_integrations(&layout));
+    diagnostics.extend(doctor::check_sessions(&layout));
+    if repair {
+        diagnostics.extend(doctor::repair(&layout));
+    }
+    if json {
+        let value = serde_json::to_value(&diagnostics).map_err(|error| {
+            Error::InvalidState(format!("cannot encode doctor diagnostics: {error}"))
+        })?;
+        write_projection(&value, true)?;
+    } else {
+        let mut stdout = std::io::stdout().lock();
+        for diagnostic in &diagnostics {
+            writeln!(
+                stdout,
+                "{} {}: {}",
+                diagnostic.severity, diagnostic.code, diagnostic.message
+            )
+            .map_err(|source| io("stdout", source))?;
+        }
+    }
+    Ok(
+        if diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == "error")
+        {
+            1
+        } else {
+            0
+        },
     )
 }
 
@@ -238,7 +364,8 @@ pub fn switch_command(
         .ok_or_else(|| Error::InvalidState("this worktree has no Sesh session".into()))?;
     let operation = SessionOperationLock::acquire(&store.session_dir())?;
     let leases = LeaseStore::new(&store.session_dir());
-    recover_stale_lease(&store, &leases, runtime)?;
+    let locked_snapshot = Git::new().snapshot(&invocation_cwd)?;
+    recover_stale_lease(&store, &leases, runtime, &locked_snapshot)?;
 
     let saved_cwd_relative = store.saved_cwd_relative()?;
     let saved_cwd_path = store.meta().worktree.worktree.join(&saved_cwd_relative);
@@ -426,6 +553,7 @@ fn recover_stale_lease(
     store: &SessionStore,
     leases: &LeaseStore,
     runtime: &dyn Runtime,
+    recovery_snapshot: &GitSnapshot,
 ) -> Result<()> {
     let Some(lease) = leases.read()? else {
         return Ok(());
@@ -454,7 +582,20 @@ fn recover_stale_lease(
         Some(lease.run_id.clone()),
         Some(lease.provider),
         EventKind::RunRecovered {
+            supervisor_pid: lease.supervisor.pid,
+            supervisor_start_token: lease.supervisor.start_token.clone(),
+            child_pid: lease.child.as_ref().map(|child| child.pid),
+            child_start_token: lease.child.as_ref().map(|child| child.start_token.clone()),
+            host: lease.host.clone(),
             reason: "same-host supervisor and child processes are no longer live".into(),
+        },
+    )?;
+    store.append(
+        runtime,
+        Some(lease.run_id.clone()),
+        Some(lease.provider),
+        EventKind::GitSnapshot {
+            snapshot: recovery_snapshot.clone(),
         },
     )?;
     leases.clear(&lease.run_id)
@@ -1673,13 +1814,34 @@ mod tests {
         .unwrap();
         leases.create(&stale).unwrap();
 
-        recover_stale_lease(&store, &leases, &FixedRuntime).unwrap();
+        let recovery_snapshot = recorded_snapshot(&store);
+        recover_stale_lease(&store, &leases, &FixedRuntime, &recovery_snapshot).unwrap();
 
         assert!(leases.read().unwrap().is_none());
-        assert!(store.events().unwrap().iter().any(|event| {
-            event.run_id.as_ref() == Some(&stale_run)
-                && matches!(event.kind, EventKind::RunRecovered { .. })
-        }));
+        let events = store.events().unwrap();
+        let recovered_index = events
+            .iter()
+            .position(|event| {
+                event.run_id.as_ref() == Some(&stale_run)
+                    && matches!(
+                        &event.kind,
+                        EventKind::RunRecovered {
+                            supervisor_pid,
+                            supervisor_start_token,
+                            child_pid: None,
+                            child_start_token: None,
+                            host,
+                            ..
+                        } if *supervisor_pid == u32::MAX
+                            && supervisor_start_token == "gone"
+                            && host == &stale.host
+                    )
+            })
+            .unwrap();
+        assert!(matches!(
+            events[recovered_index + 1].kind,
+            EventKind::GitSnapshot { .. }
+        ));
 
         let mut foreign = RunLease::new(
             store.id().clone(),
@@ -1693,7 +1855,7 @@ mod tests {
         .unwrap();
         foreign.host = "different-host".into();
         leases.create(&foreign).unwrap();
-        assert!(recover_stale_lease(&store, &leases, &FixedRuntime).is_err());
+        assert!(recover_stale_lease(&store, &leases, &FixedRuntime, &recovery_snapshot).is_err());
         assert_eq!(leases.read().unwrap().unwrap().run_id, foreign.run_id);
         leases.clear(&foreign.run_id).unwrap();
 
@@ -1705,7 +1867,7 @@ mod tests {
         )
         .unwrap();
         leases.create(&live).unwrap();
-        assert!(recover_stale_lease(&store, &leases, &FixedRuntime).is_err());
+        assert!(recover_stale_lease(&store, &leases, &FixedRuntime, &recovery_snapshot).is_err());
         assert_eq!(leases.read().unwrap().unwrap().run_id, live.run_id);
     }
 
@@ -1790,5 +1952,17 @@ mod tests {
         )
         .unwrap();
         (temp, store)
+    }
+
+    fn recorded_snapshot(store: &SessionStore) -> GitSnapshot {
+        store
+            .events()
+            .unwrap()
+            .into_iter()
+            .find_map(|event| match event.kind {
+                EventKind::GitSnapshot { snapshot } => Some(snapshot),
+                _ => None,
+            })
+            .unwrap()
     }
 }
