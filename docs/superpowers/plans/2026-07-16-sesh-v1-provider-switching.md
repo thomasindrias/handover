@@ -4119,7 +4119,7 @@ rtk git commit -m "feat: capture explicit session checkpoints"
 - Modify: `tests/support/mod.rs`
 - Create: `tests/north_star.rs`
 
-- [ ] **Step 1: Write the complete failing acceptance test**
+- [x] **Step 1: Write the complete failing acceptance test**
 
 Create `tests/north_star.rs` that:
 
@@ -4162,13 +4162,13 @@ printf '%s' '{"session_id":"codex-native","turn_id":"turn-1","transcript_path":n
 exit 0
 ```
 
-- [ ] **Step 2: Run the acceptance test and verify switch is absent**
+- [x] **Step 2: Run the acceptance test and verify switch is absent**
 
 Run: `rtk cargo test --test north_star -- --nocapture`
 
 Expected: FAIL because `switch` is not implemented.
 
-- [ ] **Step 3: Add switch grammar and transaction orchestration**
+- [x] **Step 3: Add switch grammar and transaction orchestration**
 
 Add the same provider and trailing provider-flag fields as `run`:
 
@@ -4217,7 +4217,7 @@ Unrecognized commands remain commands. The renderer always includes the latest f
 
 When a completed command has an opaque provider response but no structured exit code, retain the response through `ContentRef`, render the status as `unknown`, and add a handoff capture-gap line naming that event sequence. Never parse text such as `Process exited with code ...` to manufacture a structured status.
 
-- [ ] **Step 4: Verify the North Star and repository separation**
+- [x] **Step 4: Verify the North Star and repository separation**
 
 Run:
 
@@ -4229,7 +4229,7 @@ rtk cargo clippy --all-targets --all-features -- -D warnings
 
 Expected: PASS. Run the acceptance test twice to expose stale lease or ref cleanup bugs.
 
-- [ ] **Step 5: Commit provider switching**
+- [x] **Step 5: Commit provider switching**
 
 ```bash
 rtk git add src tests
