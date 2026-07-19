@@ -45,6 +45,20 @@ sesh switch codex -- --model gpt-5
 
 Codex starts in the saved `apps/web` directory. Sesh uses the existing worktree by default: it does not clone, reset, stash, clean, or recreate it. The handoff contains the verified checkpoint, current Git facts, recent events, command statuses, failures, and explicit omissions.
 
+Use `fork` only when you intentionally want a separate line of work:
+
+```bash
+sesh run claude
+sesh switch codex
+sesh fork claude --branch sesh/oauth-experiment --worktree ../oauth-experiment
+```
+
+`switch` continues the existing session in its existing worktree and saved cwd. `fork` creates a new branch, a separate Git worktree, and a child Sesh session with explicit parent lineage. Without overrides, the branch is `sesh/<repository-name>-<operation-short-id>` and the sibling worktree is `<repository>-sesh-<operation-short-id>`.
+
+Forking duplicates tracked index state, staged and unstaged changes, untracked regular files and symlinks, binary content, executable bits, deletions, and renames. Ignored files are intentionally excluded. V1 refuses sparse checkout, unmerged entries, intent-to-add entries, staged gitlinks, dirty submodules, unsupported special files, conflicting branches, and existing or nested target paths. Clean initialized submodules are reconstructed only from proven local Git objects; Sesh never fetches during a fork.
+
+The source is observational: Sesh does not commit, stash, reset, clean, checkout, or secretly rewrite source-worktree files or index state. It adds only the requested Git branch/worktree registration in the repository's shared Git metadata.
+
 ## Human checkpoints
 
 Pipe the same JSON shape without `--from-provider`:
@@ -65,11 +79,13 @@ sesh inspect --json
 sesh doctor --json
 ```
 
-`status` combines verified session history with a fresh Git observation. `log --json` emits the original checksummed event envelopes. `inspect` reports paths, permissions, checkpoint files, blob hashes and sizes, and lease state without printing blob contents. `doctor` is observational unless `--repair` is supplied; repair is limited to incomplete journal tails, verified checkpoint refs, and capture-failure sentinels.
+`status` combines verified session history with a fresh Git observation. `log --json` emits the original checksummed event envelopes. `inspect` reports paths, permissions, checkpoint files, blob hashes and sizes, and lease state without printing blob contents. `doctor` is observational unless `--repair` is supplied. It reports interrupted forks with their operation ID, phase, source session, target, branch, and a shell-escaped Git inspection command. Repair can finish a byte-identical child binding after lineage has committed; it never deletes a crash-left worktree or branch.
 
 ## Local data and security
 
 Sesh stores private plaintext under `$SESH_HOME`, `$XDG_STATE_HOME/sesh`, or `~/.local/state/sesh`. Session data can contain prompts, decisions, stack traces, business context, and secrets accidentally supplied to a provider. Protect backups and machine access accordingly.
+
+Fork operation records, binary patches, untracked manifests and content-addressed blobs are also private plaintext under `$SESH_HOME/operations/<operation-id>`. The durable phases are `prepared`, `artifacts_captured`, `worktree_created`, `staged_applied`, `unstaged_applied`, `untracked_copied`, `verified`, `child_staged`, `lineage_committed`, `child_bound`, `run_leased`, and `complete`, with `rolled_back` and `needs_manual_recovery` terminal outcomes. Before the verified parent `session.forked` event, synchronous cleanup requires an exact recorded or live-only mutation proof. That parent event is the commit point: recovery is forward-only afterward.
 
 Mode `0700` directories and `0600` files prevent accidental sharing, but an unrestricted provider shell running as your Unix user is not an operating-system security boundary. Same-user processes can access anything that user can access.
 
@@ -83,7 +99,7 @@ sesh delete
 sesh delete --yes
 ```
 
-Deletion removes Sesh's session directory and binding, not repository files. It is complete logical deletion, not forensic erasure of storage media, snapshots, or backups.
+Deletion removes Sesh's session directory and binding, not repository files. A parent with child sessions must be deleted child-first. Deleting a child removes its inherited handoffs; deleting the parent then removes terminal fork operation patches and blobs that name it. Nonterminal fork operations block deletion. Application worktrees and Git branches are always left untouched. This is complete logical deletion, not forensic erasure of storage media, snapshots, or backups.
 
 ## Optional provider smoke tests
 

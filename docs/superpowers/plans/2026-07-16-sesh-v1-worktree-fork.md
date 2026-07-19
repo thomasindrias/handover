@@ -858,7 +858,7 @@ rtk git commit -m "feat: recover interrupted worktree forks safely"
 - Modify: `.github/workflows/ci.yml`
 - Modify: `docs/superpowers/specs/2026-07-16-sesh-v1-design.md`
 
-- [ ] **Step 1: Extend CLI and README contracts**
+- [x] **Step 1: Extend CLI and README contracts**
 
 Update the CLI help test so the exact public V1 command set includes `fork` once. Assert neither `switch --help` nor `run --help` advertises a clone flag.
 
@@ -886,7 +886,7 @@ sesh fork claude --branch sesh/oauth-experiment --worktree ../oauth-experiment
 
 State explicitly that no source commit, stash, reset, clean, or hidden source-worktree rewrite occurs.
 
-- [ ] **Step 2: Extend complete deletion across fork-owned copies**
+- [x] **Step 2: Extend complete deletion across fork-owned copies**
 
 Operation patches and untracked blobs can contain the same secrets as the source session, and a child run inbox contains an inherited parent handoff. Add deletion tests and rules:
 
@@ -898,11 +898,11 @@ Operation patches and untracked blobs can contain the same secrets as the source
 
 This preserves the meaning of complete Sesh-session deletion without selective journal rewriting or a new cascade feature.
 
-- [ ] **Step 3: Reconcile the design spec with implemented details**
+- [x] **Step 3: Reconcile the design spec with implemented details**
 
 Update only proven implementation details: operation phase names, the child-staging/parent-event commit point, clean-submodule local-only behavior, and the explicit UTF-8 V1 path boundary. Do not add V2/V3 features.
 
-- [ ] **Step 4: Run the complete cross-platform release gate**
+- [x] **Step 4: Run the complete cross-platform release gate**
 
 Run:
 
@@ -920,7 +920,7 @@ rtk git status --short
 
 Expected: all commands PASS on macOS and Linux. The CI matrix already runs both operating systems; do not add provider-authenticated jobs.
 
-- [ ] **Step 5: Audit final evidence manually**
+- [x] **Step 5: Audit final evidence manually**
 
 Retain one debug test directory and verify with ordinary tools:
 
@@ -934,7 +934,7 @@ rtk git worktree list --porcelain
 
 Confirm source and target status facts match, identities differ, source bytes are unchanged, refs point to distinct sessions, and no Sesh state exists in either application worktree.
 
-- [ ] **Step 6: Commit the full V1 fork contract**
+- [x] **Step 6: Commit the full V1 fork contract**
 
 ```bash
 rtk git add README.md .github docs tests
