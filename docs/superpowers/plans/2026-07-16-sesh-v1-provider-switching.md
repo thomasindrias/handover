@@ -4318,7 +4318,7 @@ rtk git commit -m "feat: inspect and delete local sessions"
 - Create: `tests/recovery.rs`
 - Create: `tests/doctor.rs`
 
-- [ ] **Step 1: Write failing diagnostic tests**
+- [x] **Step 1: Write failing diagnostic tests**
 
 Cover:
 
@@ -4337,7 +4337,7 @@ Cover:
 
 Every JSON diagnostic has `code`, `severity`, `message`, and optional `repair_command`. No diagnostic mutates state.
 
-- [ ] **Step 2: Add setup and doctor grammar**
+- [x] **Step 2: Add setup and doctor grammar**
 
 ```rust
 Setup { provider: Provider },
@@ -4351,7 +4351,7 @@ Doctor {
 
 `sesh setup codex` materializes the inspectable overlay, verifies `codex --help` contains `--config`, `--add-dir`, and `--cd`, and verifies `codex features list` reports `hooks stable true`. It then opens the Codex TUI with the exact static overlay and no prompt, with `SESH_HOOK_BIN` set to the canonical current executable. Before launch, print: `Open /hooks, review commands equal to '"$SESH_HOOK_BIN" __hook codex', trust them, then exit.` This spends no model turn. A non-interactive terminal prints the exact equivalent command and exits with code 2. Never add `--dangerously-bypass-hook-trust`.
 
-- [ ] **Step 3: Implement read-only doctor checks**
+- [x] **Step 3: Implement read-only doctor checks**
 
 Create `src/doctor.rs` with one function per diagnostic layer:
 
@@ -4368,7 +4368,7 @@ Plain `doctor` aggregates through a non-mutating journal scanner; it never opens
 
 `doctor --repair` is the only diagnostic mutation path. For each session, acquire `SessionOperationLock`, repair only an incomplete final journal line, rebuild checkpoint refs solely from committed `checkpoint.created` events whose immutable artifacts validate, and remove `capture-failed.json` only after a private create/sync/remove probe in the journal directory succeeds. Report orphan checkpoint artifacts and temporary files but do not delete them automatically. Emit one diagnostic per mutation. Add focused tests proving plain `doctor` leaves all bytes and mtimes unchanged and `--repair` performs only the listed changes.
 
-- [ ] **Step 4: Implement explicit stale-lease recovery on run/switch**
+- [x] **Step 4: Implement explicit stale-lease recovery on run/switch**
 
 Before launch, while holding `SessionOperationLock`, if the lease host equals the current host and both process identities are dead:
 
@@ -4379,11 +4379,11 @@ Before launch, while holding `SessionOperationLock`, if the lease host equals th
 
 If either process is live or the host differs, refuse. Never send a signal from recovery.
 
-- [ ] **Step 5: Add a fail-closed capture regression test**
+- [x] **Step 5: Add a fail-closed capture regression test**
 
 Change `events.jsonl` to mode `0400` after SessionStart. Invoke a fake PreToolUse hook and assert the hook process exits `0` with `permissionDecision: deny`; assert `capture-failed.json` is written and the fake provider does not execute its intended file write. Restore mode `0600` during cleanup, run `sesh doctor --repair`, and prove the next hook is accepted.
 
-- [ ] **Step 6: Verify recovery and diagnostics**
+- [x] **Step 6: Verify recovery and diagnostics**
 
 Run:
 
@@ -4396,7 +4396,7 @@ rtk cargo clippy --all-targets --all-features -- -D warnings
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit setup and recovery**
+- [x] **Step 7: Commit setup and recovery**
 
 ```bash
 rtk git add src tests
