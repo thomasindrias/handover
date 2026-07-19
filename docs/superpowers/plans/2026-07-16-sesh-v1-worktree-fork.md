@@ -50,7 +50,7 @@ Keep operation records under `$SESH_HOME/operations`, never in either worktree.
 - Modify: `src/git/mod.rs`
 - Create: `tests/fork_cli.rs`
 
-- [ ] **Step 1: Write failing CLI and deterministic naming tests**
+- [x] **Step 1: Write failing CLI and deterministic naming tests**
 
 Create `tests/fork_cli.rs` with a help test and unit-facing naming cases. The public grammar is:
 
@@ -98,13 +98,13 @@ fn repository_name_sanitization_never_creates_an_invalid_component() {
 
 The target worktree basename preserves the repository basename because it is a filesystem path; only the branch component is sanitized.
 
-- [ ] **Step 2: Run the focused test and verify fork is absent**
+- [x] **Step 2: Run the focused test and verify fork is absent**
 
 Run: `rtk cargo test --test fork_cli`
 
 Expected: FAIL because `fork`, `OperationId`, and target naming are not defined.
 
-- [ ] **Step 3: Add an operation ID to the injected runtime**
+- [x] **Step 3: Add an operation ID to the injected runtime**
 
 Extend the existing ID macro:
 
@@ -124,7 +124,7 @@ fn operation_id(&self) -> OperationId;
 
 Add `StateLayout::operations() -> PathBuf`, returning `<root>/operations`, and include it in the private-directory validation performed by `StateLayout::ensure`.
 
-- [ ] **Step 4: Add fork grammar without changing switch semantics**
+- [x] **Step 4: Add fork grammar without changing switch semantics**
 
 Add this `Command` variant:
 
@@ -142,7 +142,7 @@ Fork {
 
 Do not add `--clone` to `run` or `switch`. `fork` is the one discoverable operation, analogous to a distinct Git subcommand.
 
-- [ ] **Step 5: Implement target naming and read-only preflight**
+- [x] **Step 5: Implement target naming and read-only preflight**
 
 Create these types in `src/git/fork.rs`:
 
@@ -204,7 +204,7 @@ target branch or path already exists
 
 `git ls-files --others --exclude-standard -z` remains the only inclusion source for copied untracked files. Git does not enumerate FIFOs, sockets, or devices there, so fork preflight must also perform a read-only metadata walk rooted at the source worktree. Never follow symlinks; prune the root `.git` administration entry and recorded gitlink directories. Batch candidate directories and special nodes through `git check-ignore -z --stdin`: prune ignored directories, ignore an ignored special node, and refuse every unignored special node. This fork-only walk discovers unsupported state without adding ignored content to the copy manifest.
 
-- [ ] **Step 6: Add preflight refusal tests**
+- [x] **Step 6: Add preflight refusal tests**
 
 Using real temporary Git repositories, add one named test for each refusal above. For FIFO coverage on Unix:
 
@@ -218,7 +218,7 @@ assert!(status.success());
 
 After every refusal, assert the target path and target branch are absent, `$SESH_HOME/operations` contains no operation record, and no child worktree ref exists. The dirty-submodule test may use a local file-protocol submodule fixture; it must not contact a network.
 
-- [ ] **Step 7: Verify and commit preflight**
+- [x] **Step 7: Verify and commit preflight**
 
 Run:
 

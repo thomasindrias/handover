@@ -92,11 +92,16 @@ impl StateLayout {
         self.root.join("integrations")
     }
 
+    pub fn operations(&self) -> PathBuf {
+        self.root.join("operations")
+    }
+
     pub fn ensure(&self) -> Result<()> {
         let paths = [
             self.root.clone(),
             self.sessions(),
             self.integrations(),
+            self.operations(),
             self.root.join("refs"),
             self.worktree_refs(),
         ];
@@ -266,6 +271,7 @@ mod tests {
         for directory in [
             layout.sessions(),
             layout.integrations(),
+            layout.operations(),
             layout.root().join("refs"),
             layout.worktree_refs(),
         ] {

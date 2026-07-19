@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -24,6 +25,15 @@ pub enum Command {
     },
     Switch {
         provider: Provider,
+        #[arg(last = true, allow_hyphen_values = true)]
+        provider_args: Vec<OsString>,
+    },
+    Fork {
+        provider: Provider,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        worktree: Option<PathBuf>,
         #[arg(last = true, allow_hyphen_values = true)]
         provider_args: Vec<OsString>,
     },

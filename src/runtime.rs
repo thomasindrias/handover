@@ -2,12 +2,13 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::error::{Error, Result};
-use crate::model::{RunId, SessionId};
+use crate::model::{OperationId, RunId, SessionId};
 
 pub trait Runtime: Send + Sync {
     fn now(&self) -> Result<String>;
     fn session_id(&self) -> SessionId;
     fn run_id(&self) -> RunId;
+    fn operation_id(&self) -> OperationId;
 }
 
 #[derive(Debug, Default)]
@@ -26,5 +27,9 @@ impl Runtime for SystemRuntime {
 
     fn run_id(&self) -> RunId {
         RunId::new()
+    }
+
+    fn operation_id(&self) -> OperationId {
+        OperationId::new()
     }
 }
