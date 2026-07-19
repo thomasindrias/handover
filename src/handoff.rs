@@ -29,9 +29,17 @@ pub struct CaptureGap {
     pub message: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParentLineage {
+    pub session_id: SessionId,
+    pub transition_sequence: u64,
+    pub narrative_sequence: Option<u64>,
+}
+
 #[derive(Clone, Debug)]
 pub struct HandoffInput {
     pub session_id: SessionId,
+    pub parent_lineage: Option<ParentLineage>,
     pub from_provider: Option<Provider>,
     pub to_provider: Provider,
     pub transition_sequence: u64,
@@ -272,6 +280,17 @@ impl HandoffInput {
             None => {}
         }
         self.snapshot.identity.validate()?;
+        if let Some(parent) = self.parent_lineage.as_ref() {
+            if parent.session_id == self.session_id
+                || parent.transition_sequence != self.transition_sequence
+                || parent.narrative_sequence
+                    != self.narrative_checkpoint.as_ref().map(|item| item.0)
+            {
+                return Err(Error::InvalidState(
+                    "handoff parent lineage is inconsistent".into(),
+                ));
+            }
+        }
         validate_snapshot_paths(&self.snapshot)?;
         validate_sequence_pairs("recent events", &self.recent_events)?;
         validate_fact_sequences(
@@ -317,6 +336,7 @@ impl HandoffInput {
         };
         Self {
             session_id: SessionId::parse("11111111-1111-4111-8111-111111111111").unwrap(),
+            parent_lineage: None,
             from_provider: Some(Provider::Claude),
             to_provider: Provider::Codex,
             transition_sequence: 19,
@@ -390,26 +410,34 @@ fn render_sections(
     render_repository(snapshot, &mut output)?;
     render_checkpoint_boundaries(input, &mut output);
     render_git_facts(git, snapshot, &mut output)?;
-    render_events(events, &mut output);
-    render_commands(commands, &mut output);
+    let event_scope = if input.parent_lineage.is_some() {
+        "parent event"
+    } else {
+        "child event"
+    };
+    render_events(events, event_scope, &mut output);
+    render_commands(commands, event_scope, &mut output);
     render_required_command(
         "Latest recognized test",
         input.latest_test.as_ref(),
         false,
+        event_scope,
         &mut output,
     );
     render_required_command(
         "Latest failed command",
         input.latest_failure.as_ref(),
         true,
+        event_scope,
         &mut output,
     );
-    render_capture_gaps(gaps, &mut output);
+    render_capture_gaps(gaps, input.parent_lineage.is_some(), &mut output);
     render_omissions(
         omitted_events,
         omitted_commands,
         omitted_paths,
         omitted_gaps,
+        input.parent_lineage.is_some(),
         &mut output,
     );
     output.push_str("## Inspect the complete session\n\n- `sesh log --json`\n- `sesh inspect`\n");
@@ -426,6 +454,14 @@ fn render_transition(input: &HandoffInput, output: &mut String) {
         input.transition_sequence
     )
     .expect("writing to a string cannot fail");
+    if let Some(parent) = input.parent_lineage.as_ref() {
+        writeln!(
+            output,
+            "Forked from session `{}` at parent checkpoint {}.\n",
+            parent.session_id, parent.transition_sequence
+        )
+        .expect("writing to a string cannot fail");
+    }
 }
 
 fn render_repository(snapshot: &GitSnapshot, output: &mut String) -> Result<()> {
@@ -554,20 +590,24 @@ fn render_dirty_paths(heading: &str, paths: &[DirtyPath], output: &mut String) -
     Ok(())
 }
 
-fn render_events(events: &[(u64, String)], output: &mut String) {
+fn render_events(events: &[(u64, String)], scope: &str, output: &mut String) {
     output.push_str("## Recent normalized events\n\n");
     if events.is_empty() {
         output.push_str("- None selected.\n\n");
         return;
     }
     for (sequence, event) in events {
-        writeln!(output, "- {sequence}: {}", bounded_head(event, 2 * 1024))
-            .expect("writing to a string cannot fail");
+        writeln!(
+            output,
+            "- {scope} {sequence}: {}",
+            bounded_head(event, 2 * 1024)
+        )
+        .expect("writing to a string cannot fail");
     }
     output.push('\n');
 }
 
-fn render_commands(commands: &[CommandFact], output: &mut String) {
+fn render_commands(commands: &[CommandFact], scope: &str, output: &mut String) {
     output.push_str("## Recent commands\n\n");
     if commands.is_empty() {
         output.push_str("- None selected.\n\n");
@@ -576,7 +616,7 @@ fn render_commands(commands: &[CommandFact], output: &mut String) {
     for command in commands {
         writeln!(
             output,
-            "- {}: `{}` — status {}",
+            "- {scope} {}: `{}` — status {}",
             command.sequence,
             bounded_head(&command.command, 2 * 1024),
             status_text(command.exit_code)
@@ -590,6 +630,7 @@ fn render_required_command(
     heading: &str,
     command: Option<&CommandFact>,
     failure_excerpt: bool,
+    event_scope: &str,
     output: &mut String,
 ) {
     writeln!(output, "## {heading}\n").expect("writing to a string cannot fail");
@@ -599,7 +640,7 @@ fn render_required_command(
     };
     writeln!(
         output,
-        "- Event sequence: {}\n- Command: `{}`\n- Status: {}\n",
+        "- {event_scope}: {}\n- Command: `{}`\n- Status: {}\n",
         command.sequence,
         bounded_head(&command.command, 2 * 1024),
         status_text(command.exit_code)
@@ -619,16 +660,17 @@ fn render_required_command(
     output.push_str("```\n\n");
 }
 
-fn render_capture_gaps(gaps: &[CaptureGap], output: &mut String) {
+fn render_capture_gaps(gaps: &[CaptureGap], parent_scoped: bool, output: &mut String) {
     output.push_str("## Capture gaps\n\n");
     if gaps.is_empty() {
         output.push_str("- None recorded.\n\n");
         return;
     }
     for gap in gaps {
+        let scope = if parent_scoped { "parent event " } else { "" };
         writeln!(
             output,
-            "- {} [{}]: {}",
+            "- {scope}{} [{}]: {}",
             gap.sequence,
             bounded_head(&gap.phase, 256),
             bounded_head(&gap.message, 1024)
@@ -643,14 +685,16 @@ fn render_omissions(
     commands: &[u64],
     paths: OmittedPaths,
     gaps: &[u64],
+    parent_scoped: bool,
     output: &mut String,
 ) {
     output.push_str("## Omitted details\n\n");
     let mut any = false;
+    let scope = if parent_scoped { "parent " } else { "" };
     for (label, sequences) in [
-        ("Omitted event sequences", events),
-        ("Omitted command event sequences", commands),
-        ("Omitted capture-gap event sequences", gaps),
+        (format!("Omitted {scope}event sequences"), events),
+        (format!("Omitted {scope}command event sequences"), commands),
+        (format!("Omitted {scope}capture-gap event sequences"), gaps),
     ] {
         if !sequences.is_empty() {
             writeln!(output, "- {label}: {}", render_ranges(sequences))
@@ -892,8 +936,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        HandoffInput, head_tail_excerpt, is_recognized_test_command, render, render_ranges,
-        render_with_selection,
+        HandoffInput, ParentLineage, head_tail_excerpt, is_recognized_test_command, render,
+        render_ranges, render_with_selection,
     };
     use crate::model::{DirtyPath, Provider};
 
@@ -1048,6 +1092,25 @@ mod tests {
         input.to_provider = Provider::Claude;
         let output = render(input, 65_536).unwrap();
         assert!(output.contains("`codex` → `claude`"));
+    }
+
+    #[test]
+    fn fork_lineage_keeps_parent_facts_explicitly_scoped() {
+        let mut input = HandoffInput::fixture();
+        input.session_id =
+            crate::model::SessionId::parse("22222222-2222-4222-8222-222222222222").unwrap();
+        input.parent_lineage = Some(ParentLineage {
+            session_id: crate::model::SessionId::parse("11111111-1111-4111-8111-111111111111")
+                .unwrap(),
+            transition_sequence: input.transition_sequence,
+            narrative_sequence: Some(10),
+        });
+
+        let output = render(input, 65_536).unwrap();
+
+        assert!(output.contains("Forked from session"));
+        assert!(output.contains("parent event 16"));
+        assert!(output.contains("parent event: 18"));
     }
 
     #[test]

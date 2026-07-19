@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
-use crate::model::{CheckpointKind, GitSnapshot, Provider, RunId, SessionId, WorktreeIdentity};
+use crate::model::{
+    CheckpointKind, GitSnapshot, OperationId, Provider, RunId, SessionId, WorktreeIdentity,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "storage", rename_all = "snake_case")]
@@ -16,6 +18,14 @@ pub enum ContentRef {
 pub enum EventKind {
     #[serde(rename = "session.created")]
     SessionCreated { worktree: WorktreeIdentity },
+    #[serde(rename = "session.forked")]
+    SessionForked {
+        operation_id: OperationId,
+        child_session_id: SessionId,
+        parent_checkpoint_sequence: u64,
+        target_worktree: std::path::PathBuf,
+        target_branch: String,
+    },
     #[serde(rename = "switch.requested")]
     SwitchRequested {
         from: Option<Provider>,
