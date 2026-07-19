@@ -4411,7 +4411,7 @@ rtk git commit -m "feat: diagnose and recover session capture"
 - Create: `tests/provider_smoke.rs`
 - Modify: `tests/cli_contract.rs`
 
-- [ ] **Step 1: Extend the CLI contract test**
+- [x] **Step 1: Extend the CLI contract test**
 
 Assert help lists exactly these public core commands before fork lands:
 
@@ -4429,11 +4429,11 @@ doctor
 
 Assert `__hook` is absent from help.
 
-- [ ] **Step 2: Add ignored real-provider smoke tests**
+- [x] **Step 2: Add ignored real-provider smoke tests**
 
 `tests/provider_smoke.rs` must mark tests `#[ignore = "requires the provider CLI to be installed"]`. Claude smoke materializes the plugin and runs `claude plugin validate <plugin-dir>`. Codex smoke runs `codex --strict-config` with every static `-c` hook overlay and the `features list` subcommand. Neither opens an agent session, requires authentication, submits a prompt, or consumes model quota. Both use a temporary `SESH_HOME` and clean it on success or failure.
 
-- [ ] **Step 3: Write the user-facing README**
+- [x] **Step 3: Write the user-facing README**
 
 Document:
 
@@ -4452,7 +4452,7 @@ Document:
 
 Include one exact end-to-end example and no future feature promises.
 
-- [ ] **Step 4: Add macOS and Linux CI**
+- [x] **Step 4: Add macOS and Linux CI**
 
 Create `.github/workflows/ci.yml`:
 
@@ -4480,7 +4480,7 @@ jobs:
       - run: cargo doc --no-deps
 ```
 
-- [ ] **Step 5: Run the release gate**
+- [x] **Step 5: Run the release gate**
 
 Run:
 
@@ -4494,7 +4494,7 @@ rtk git status --short
 
 Expected: all commands PASS; status shows only the intended documentation/CI/test changes before commit.
 
-- [ ] **Step 6: Audit the acceptance evidence**
+- [x] **Step 6: Audit the acceptance evidence**
 
 Run:
 
@@ -4506,7 +4506,7 @@ rtk cargo test --test delete_session
 
 Expected: PASS. Open the temporary state from a retained debug run with `jq` and verify it is understandable without provider-native files.
 
-- [ ] **Step 7: Commit the core V1 foundation**
+- [x] **Step 7: Commit the core V1 foundation**
 
 ```bash
 rtk git add .github README.md tests src Cargo.toml Cargo.lock rust-toolchain.toml .gitignore
