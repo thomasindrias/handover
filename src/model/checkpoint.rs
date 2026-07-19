@@ -19,12 +19,14 @@ pub enum CheckpointAuthor {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Decision {
     pub statement: String,
     pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NarrativeInput {
     pub objective: String,
     pub summary: String,
