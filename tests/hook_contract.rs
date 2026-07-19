@@ -48,9 +48,10 @@ fn normalizes_claude_tool_result() {
         normalized.event,
         HookEvent::ToolCompleted {
             tool_name,
+            command: Some(command),
             exit_code: Some(101),
             ..
-        } if tool_name == "Bash"
+        } if tool_name == "Bash" && command == "cargo test oauth_callback"
     ));
 }
 

@@ -22,6 +22,11 @@ pub enum Command {
         #[arg(last = true, allow_hyphen_values = true)]
         provider_args: Vec<OsString>,
     },
+    Switch {
+        provider: Provider,
+        #[arg(last = true, allow_hyphen_values = true)]
+        provider_args: Vec<OsString>,
+    },
     Checkpoint {
         #[arg(long, value_enum, default_value = "json")]
         format: CheckpointFormat,
