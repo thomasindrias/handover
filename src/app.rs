@@ -16,6 +16,7 @@ use crate::cli::{CheckpointFormat, Cli, Command};
 use crate::doctor;
 use crate::error::{Error, Result, io};
 use crate::git::Git;
+use crate::git::fork::ForkRequest;
 use crate::handoff::{
     BOOTSTRAP, CaptureGap, CommandFact, HandoffInput, is_recognized_test_command,
     render_with_selection,
@@ -55,6 +56,21 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
             provider,
             provider_args,
         } => switch_command(provider, provider_args, environment, runtime),
+        Command::Fork {
+            provider,
+            branch,
+            worktree,
+            provider_args,
+        } => fork_command(
+            ForkRequest {
+                provider,
+                branch,
+                worktree,
+                provider_args,
+            },
+            environment,
+            runtime,
+        ),
         Command::Checkpoint {
             format,
             from_provider,
@@ -111,6 +127,34 @@ fn provider_command_allowed(command: &Command) -> bool {
                 ..
             }
     )
+}
+
+fn fork_command(
+    request: ForkRequest,
+    environment: &Environment,
+    runtime: &dyn Runtime,
+) -> Result<i32> {
+    let caller_cwd = std::env::current_dir().map_err(|source| io(".", source))?;
+    let (_layout, _snapshot, store) = current_session(environment)?;
+    let _operation_lock = SessionOperationLock::acquire(&store.session_dir())?;
+    if LeaseStore::new(&store.session_dir()).read()?.is_some() {
+        return Err(Error::InvalidState(
+            "fork refuses an active or unrecovered provider lease".into(),
+        ));
+    }
+
+    let saved_cwd_relative = store.saved_cwd_relative()?;
+    let source_cwd = store.meta().worktree.worktree.join(saved_cwd_relative);
+    let operation_id = runtime.operation_id();
+    let _preflight = Git::new().preflight_fork(
+        &source_cwd,
+        &caller_cwd,
+        &request,
+        &operation_id.to_string(),
+    )?;
+    Err(Error::InvalidState(
+        "fork preflight passed; materialization is not implemented yet".into(),
+    ))
 }
 
 fn setup_command(
@@ -1756,6 +1800,10 @@ mod tests {
 
         fn run_id(&self) -> RunId {
             RunId::new()
+        }
+
+        fn operation_id(&self) -> crate::model::OperationId {
+            crate::model::OperationId::parse("33333333-3333-4333-8333-333333333333").unwrap()
         }
     }
 
