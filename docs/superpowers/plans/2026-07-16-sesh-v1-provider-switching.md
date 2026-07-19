@@ -4034,7 +4034,7 @@ rtk git commit -m "feat: run providers inside a sesh session"
 - Modify: `src/checkpoint.rs`
 - Create: `tests/checkpoint_cli.rs`
 
-- [ ] **Step 1: Write failing provider-inbox and human-checkpoint tests**
+- [x] **Step 1: Write failing provider-inbox and human-checkpoint tests**
 
 The provider test sets `SESH_CHECKPOINT_INBOX`, sends valid `NarrativeInput` JSON to:
 
@@ -4046,13 +4046,13 @@ Assert the command creates one mode-`0600` atomic submission in the inbox and do
 
 The human test creates a session, pipes the same JSON without `--from-provider`, and asserts a narrative checkpoint event, JSON artifact, Markdown artifact, and both latest refs are committed.
 
-- [ ] **Step 2: Run the tests and verify checkpoint is not a CLI command**
+- [x] **Step 2: Run the tests and verify checkpoint is not a CLI command**
 
 Run: `rtk cargo test --test checkpoint_cli`
 
 Expected: FAIL with an unrecognized subcommand.
 
-- [ ] **Step 3: Add the checkpoint CLI grammar**
+- [x] **Step 3: Add the checkpoint CLI grammar**
 
 Add:
 
@@ -4076,7 +4076,7 @@ pub enum CheckpointFormat {
 
 Detect stdin with `std::io::IsTerminal`. The human no-stdin editor path is also required: write a complete JSON template to a private temporary file under `$SESH_HOME`, parse `$VISUAL` then `$EDITOR` with `shell_words::split`, invoke the resulting program and argument vector with the temporary path appended, parse on successful editor exit, and always remove the temporary file. If neither variable exists, report the exact pipe command accepted by the JSON path. If `SESH_RUN_ID` is present, refuse the human path and require `--from-provider`; an attached provider must not be able to select the canonical human-write path.
 
-- [ ] **Step 4: Implement inbox submission and promotion**
+- [x] **Step 4: Implement inbox submission and promotion**
 
 `--from-provider` must require `SESH_HOME`, `SESH_SESSION_ID`, `SESH_RUN_ID`, and `SESH_CHECKPOINT_INBOX`; derive `sessions/<session>/runs/<run>/inbox/checkpoints` from those IDs and require exact equality after canonicalizing the existing directory. Cap transport input at 64 KiB, then enforce the typed 32 KiB narrative limit. Create `<uuid>.json.tmp` with `create_new`, sync it, rename it to `<uuid>.json`, and sync the directory. It must not open `SessionStore` or trust an arbitrary inbox path.
 
@@ -4091,7 +4091,7 @@ Add `promote_inbox(store, runtime, run_id, provider, inbox)` to `src/checkpoint.
 
 Call `promote_inbox` at the beginning of every internal hook and again after child exit. Thus a provider Bash checkpoint is promoted by the following PostToolUse/Stop hook without adding the canonical store as an adapter writable root. Document that unrestricted same-user shell access is outside this boundary.
 
-- [ ] **Step 5: Verify both author paths and immutable refs**
+- [x] **Step 5: Verify both author paths and immutable refs**
 
 Run:
 
@@ -4103,7 +4103,7 @@ rtk cargo clippy --all-targets --all-features -- -D warnings
 
 Expected: PASS. The provider checkpoint author is the active provider; the human author is `human`. A symlink submission must be refused and retained for inspection.
 
-- [ ] **Step 6: Commit checkpoint commands**
+- [x] **Step 6: Commit checkpoint commands**
 
 ```bash
 rtk git add src tests
