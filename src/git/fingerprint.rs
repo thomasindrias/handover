@@ -24,11 +24,11 @@ pub(crate) struct CapturedForkState {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SubmoduleEntry {
-    path: PathBuf,
-    expected_object: String,
-    initialized: bool,
-    parent: Option<PathBuf>,
+pub(crate) struct SubmoduleEntry {
+    pub path: PathBuf,
+    pub expected_object: String,
+    pub initialized: bool,
+    pub parent: Option<PathBuf>,
 }
 
 struct CapturedUntracked {
@@ -37,14 +37,15 @@ struct CapturedUntracked {
 }
 
 pub(crate) fn capture(command: &GitCommand, cwd: &Path) -> Result<CapturedForkState> {
-    let head = command.text(cwd, ["rev-parse", "HEAD"])?;
+    let worktree = canonical_worktree(command, cwd)?;
+    let head = command.text(&worktree, ["rev-parse", "HEAD"])?;
     require_object_id(&head)?;
     let branch = command
-        .optional_text_exit_one(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"])?
+        .optional_text_exit_one(&worktree, ["symbolic-ref", "--quiet", "--short", "HEAD"])?
         .filter(|value| !value.is_empty());
-    let index_entries = command.output(cwd, ["ls-files", "--stage", "-z"])?;
+    let index_entries = command.output(&worktree, ["ls-files", "--stage", "-z"])?;
     let staged_patch = command.output(
-        cwd,
+        &worktree,
         [
             "diff",
             "--cached",
@@ -56,7 +57,7 @@ pub(crate) fn capture(command: &GitCommand, cwd: &Path) -> Result<CapturedForkSt
         ],
     )?;
     let unstaged_patch = command.output(
-        cwd,
+        &worktree,
         [
             "diff",
             "--binary",
@@ -66,9 +67,10 @@ pub(crate) fn capture(command: &GitCommand, cwd: &Path) -> Result<CapturedForkSt
             "--no-renames",
         ],
     )?;
-    let untracked_paths =
-        paths(command.output(cwd, ["ls-files", "--others", "--exclude-standard", "-z"])?)?;
-    let worktree = canonical_worktree(command, cwd)?;
+    let untracked_paths = paths(command.output(
+        &worktree,
+        ["ls-files", "--others", "--exclude-standard", "-z"],
+    )?)?;
     let untracked = untracked(&worktree, untracked_paths)?;
     let untracked_manifest = untracked.manifest;
     let untracked_blobs = untracked.blobs;
@@ -397,7 +399,7 @@ fn require_object_id(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn canonical_json(value: &impl Serialize) -> Result<Vec<u8>> {
+pub(crate) fn canonical_json(value: &impl Serialize) -> Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec_pretty(value).map_err(|error| {
         Error::InvalidState(format!("cannot encode fork artifact JSON: {error}"))
     })?;

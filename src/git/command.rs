@@ -5,7 +5,7 @@ use std::process::{Command, ExitStatus, Stdio};
 
 use crate::error::{Error, Result};
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct GitOutput {
     pub status: ExitStatus,
     pub stdout: Vec<u8>,
@@ -22,12 +22,21 @@ impl GitCommand {
         S: AsRef<OsStr>,
     {
         let args = collect_args(args);
-        let output = self.run(cwd, &args)?;
+        let output = self.output_status(cwd, &args)?;
         if output.status.success() {
             Ok(output.stdout)
         } else {
             Err(command_failed(&args, &output))
         }
+    }
+
+    pub fn output_status<I, S>(&self, cwd: &Path, args: I) -> Result<GitOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let args = collect_args(args);
+        self.run(cwd, &args)
     }
 
     pub fn text<I, S>(&self, cwd: &Path, args: I) -> Result<String>
@@ -157,4 +166,42 @@ fn command_failed(args: &[OsString], output: &GitOutput) -> Error {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&output.stderr).trim_end()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::GitCommand;
+
+    #[test]
+    fn output_status_preserves_an_expected_nonzero_status() {
+        let temp = TempDir::new().unwrap();
+        let initialized = std::process::Command::new("git")
+            .arg("-C")
+            .arg(temp.path())
+            .args(["init", "-b", "main"])
+            .output()
+            .unwrap();
+        assert!(initialized.status.success());
+        let command = GitCommand;
+
+        let output = command
+            .output_status(
+                temp.path(),
+                ["show-ref", "--verify", "--quiet", "refs/heads/missing"],
+            )
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(
+            command
+                .output(
+                    temp.path(),
+                    ["show-ref", "--verify", "--quiet", "refs/heads/missing"],
+                )
+                .is_err()
+        );
+    }
 }
