@@ -15,7 +15,10 @@ use crate::checkpoint::{
 use crate::cli::{CheckpointFormat, Cli, Command};
 use crate::doctor;
 use crate::error::{Error, Result, io};
-use crate::fork::{ForkOperationStore, capture_fork_artifacts};
+use crate::fork::{
+    ForkOperationStore, StagedChildProof, capture_fork_artifacts,
+    recover_fork_failure_with_live_child,
+};
 use crate::git::Git;
 use crate::git::fork::{ForkRequest, materialize};
 use crate::handoff::{
@@ -181,172 +184,199 @@ fn fork_command(
         updated_at: runtime.now()?,
     };
     let fork_store = ForkOperationStore::create(&layout, &operation)?;
-    capture_fork_artifacts(&fork_store, &source_cwd, || Ok(()))?;
-    materialize(&fork_store, &source_cwd, |_| Ok(()))?;
-    let captured_source = fork_store
-        .operation()?
-        .source_fingerprint
-        .ok_or_else(|| Error::InvalidState("fork lost its source fingerprint".into()))?;
-    if Git::new().fingerprint(&source_cwd)? != captured_source {
-        return Err(Error::InvalidState(
-            "source changed before child lineage commit".into(),
-        ));
-    }
-
-    let parent_events_before_transition = parent.events()?;
-    let previous_provider = previous_provider(&parent_events_before_transition)?;
-    let narrative_checkpoint =
-        latest_narrative_checkpoint(&parent, &parent_events_before_transition)?;
-    let narrative_sequence = narrative_checkpoint.as_ref().map(|item| item.0);
-    let (transition_event, transition_stored) =
-        parent.create_transition_checkpoint(runtime, None, None, narrative_sequence)?;
-    let child_id = runtime.session_id();
-    let target_cwd_path = target_worktree.join(&saved_cwd_relative);
-    let target_cwd = target_cwd_path
-        .canonicalize()
-        .map_err(|source| io(&target_cwd_path, source))?;
-    let child_snapshot = Git::new().snapshot(&target_cwd)?;
-    let child = SessionStore::stage_child(
-        &layout,
-        runtime,
-        child_snapshot.clone(),
-        parent.id().clone(),
-        transition_event.sequence,
-        child_id.clone(),
-    )?;
-    let child_operation_lock = SessionOperationLock::acquire(&child.session_dir())?;
-    fork_store.transition(ForkPhase::Verified, ForkPhase::ChildStaged, |record| {
-        record.child_session_id = Some(child_id.clone());
-        record.source_checkpoint_sequence = Some(transition_event.sequence);
-    })?;
-    parent.append(
-        runtime,
-        None,
-        None,
-        EventKind::SessionForked {
-            operation_id: operation_id.clone(),
-            child_session_id: child_id.clone(),
-            parent_checkpoint_sequence: transition_event.sequence,
-            target_worktree: target_worktree.clone(),
-            target_branch: target_branch.clone(),
-        },
-    )?;
-    fork_store.transition(ForkPhase::ChildStaged, ForkPhase::LineageCommitted, |_| {})?;
-    child.bind_worktree()?;
-    fork_store.transition(ForkPhase::LineageCommitted, ForkPhase::ChildBound, |_| {})?;
-
-    let envelopes = parent.envelopes()?;
-    let recent_boundary = narrative_sequence.unwrap_or(0);
-    let mut recent_events = Vec::new();
-    for envelope in envelopes
-        .iter()
-        .filter(|item| item.event.sequence > recent_boundary)
-    {
-        let mut line = envelope.line()?;
-        if line.last() == Some(&b'\n') {
-            line.pop();
+    let mut live_child_proof = None;
+    let prepared = (|| -> Result<_> {
+        capture_fork_artifacts(&fork_store, &source_cwd, || Ok(()))?;
+        materialize(&fork_store, &source_cwd, |_| Ok(()))?;
+        let captured_source = fork_store
+            .operation()?
+            .source_fingerprint
+            .ok_or_else(|| Error::InvalidState("fork lost its source fingerprint".into()))?;
+        if Git::new().fingerprint(&source_cwd)? != captured_source {
+            return Err(Error::InvalidState(
+                "source changed before child lineage commit".into(),
+            ));
         }
-        recent_events.push((
-            envelope.event.sequence,
-            String::from_utf8(line).map_err(|_| {
-                Error::InvalidState("canonical parent event envelope is not UTF-8".into())
-            })?,
-        ));
-    }
-    let parent_events = envelopes
-        .iter()
-        .map(|item| item.event.clone())
-        .collect::<Vec<_>>();
-    let (recent_commands, latest_test, latest_failure, capture_gaps) =
-        command_facts(&parent, &parent_events)?;
-    let rendered = render_with_selection(
-        HandoffInput {
-            session_id: child_id.clone(),
-            parent_lineage: Some(ParentLineage {
-                session_id: parent.id().clone(),
-                transition_sequence: transition_event.sequence,
-                narrative_sequence,
-            }),
-            from_provider: previous_provider,
-            to_provider: request.provider,
-            transition_sequence: transition_event.sequence,
-            transition_checkpoint: transition_stored.checkpoint,
-            narrative_checkpoint,
-            snapshot: child_snapshot,
-            recent_events,
-            recent_commands,
-            latest_test,
-            latest_failure,
-            capture_gaps,
-        },
-        MAX_HANDOFF_BYTES,
-    )?;
-    let recent_events_jsonl = selected_event_lines(&envelopes, &rendered.recent_event_sequences)?;
-    if recent_events_jsonl.len() > MAX_HANDOFF_BYTES {
-        return Err(Error::InvalidState(
-            "selected parent events exceed 64 KiB".into(),
-        ));
-    }
 
-    let run_id = runtime.run_id();
-    let run_paths = prepare_run_directory(
-        &child,
-        &run_id,
-        rendered.markdown.as_bytes(),
-        &recent_events_jsonl,
-    )?;
-    let provider_adapter = adapter(request.provider);
-    provider_adapter.setup(&layout.integrations())?;
-    let provider_version = provider_adapter.probe()?;
-    let hook_bin = std::env::current_exe()
-        .map_err(|source| io("current executable", source))?
-        .canonicalize()
-        .map_err(|source| io("current executable", source))?;
-    child.append(
-        runtime,
-        Some(run_id.clone()),
-        Some(request.provider),
-        EventKind::RunStarted {
-            cwd: target_cwd
-                .to_str()
-                .ok_or_else(|| Error::InvalidState("child cwd must be valid UTF-8".into()))?
-                .to_owned(),
-            args: request
-                .provider_args
-                .iter()
-                .map(|arg| encode_arg(arg))
-                .collect(),
-            supervisor_pid: std::process::id(),
-        },
-    )?;
+        let parent_events_before_transition = parent.events()?;
+        let previous_provider = previous_provider(&parent_events_before_transition)?;
+        let narrative_checkpoint =
+            latest_narrative_checkpoint(&parent, &parent_events_before_transition)?;
+        let narrative_sequence = narrative_checkpoint.as_ref().map(|item| item.0);
+        let (transition_event, transition_stored) =
+            parent.create_transition_checkpoint(runtime, None, None, narrative_sequence)?;
+        let child_id = runtime.session_id();
+        let target_cwd_path = target_worktree.join(&saved_cwd_relative);
+        let target_cwd = target_cwd_path
+            .canonicalize()
+            .map_err(|source| io(&target_cwd_path, source))?;
+        let child_snapshot = Git::new().snapshot(&target_cwd)?;
+        let child = SessionStore::stage_child(
+            &layout,
+            runtime,
+            child_snapshot.clone(),
+            parent.id().clone(),
+            transition_event.sequence,
+            child_id.clone(),
+        )?;
+        live_child_proof = Some(StagedChildProof {
+            child_session_id: child_id.clone(),
+            source_checkpoint_sequence: transition_event.sequence,
+        });
+        let child_operation_lock = SessionOperationLock::acquire(&child.session_dir())?;
+        fork_store.transition(ForkPhase::Verified, ForkPhase::ChildStaged, |record| {
+            record.child_session_id = Some(child_id.clone());
+            record.source_checkpoint_sequence = Some(transition_event.sequence);
+        })?;
+        parent.append(
+            runtime,
+            None,
+            None,
+            EventKind::SessionForked {
+                operation_id: operation_id.clone(),
+                child_session_id: child_id.clone(),
+                parent_checkpoint_sequence: transition_event.sequence,
+                target_worktree: target_worktree.clone(),
+                target_branch: target_branch.clone(),
+            },
+        )?;
+        fork_store.transition(ForkPhase::ChildStaged, ForkPhase::LineageCommitted, |_| {})?;
+        child.bind_worktree()?;
+        fork_store.transition(ForkPhase::LineageCommitted, ForkPhase::ChildBound, |_| {})?;
+
+        let envelopes = parent.envelopes()?;
+        let recent_boundary = narrative_sequence.unwrap_or(0);
+        let mut recent_events = Vec::new();
+        for envelope in envelopes
+            .iter()
+            .filter(|item| item.event.sequence > recent_boundary)
+        {
+            let mut line = envelope.line()?;
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            recent_events.push((
+                envelope.event.sequence,
+                String::from_utf8(line).map_err(|_| {
+                    Error::InvalidState("canonical parent event envelope is not UTF-8".into())
+                })?,
+            ));
+        }
+        let parent_events = envelopes
+            .iter()
+            .map(|item| item.event.clone())
+            .collect::<Vec<_>>();
+        let (recent_commands, latest_test, latest_failure, capture_gaps) =
+            command_facts(&parent, &parent_events)?;
+        let rendered = render_with_selection(
+            HandoffInput {
+                session_id: child_id.clone(),
+                parent_lineage: Some(ParentLineage {
+                    session_id: parent.id().clone(),
+                    transition_sequence: transition_event.sequence,
+                    narrative_sequence,
+                }),
+                from_provider: previous_provider,
+                to_provider: request.provider,
+                transition_sequence: transition_event.sequence,
+                transition_checkpoint: transition_stored.checkpoint,
+                narrative_checkpoint,
+                snapshot: child_snapshot,
+                recent_events,
+                recent_commands,
+                latest_test,
+                latest_failure,
+                capture_gaps,
+            },
+            MAX_HANDOFF_BYTES,
+        )?;
+        let recent_events_jsonl =
+            selected_event_lines(&envelopes, &rendered.recent_event_sequences)?;
+        if recent_events_jsonl.len() > MAX_HANDOFF_BYTES {
+            return Err(Error::InvalidState(
+                "selected parent events exceed 64 KiB".into(),
+            ));
+        }
+
+        let run_id = runtime.run_id();
+        let run_paths = prepare_run_directory(
+            &child,
+            &run_id,
+            rendered.markdown.as_bytes(),
+            &recent_events_jsonl,
+        )?;
+        let provider_adapter = adapter(request.provider);
+        provider_adapter.setup(&layout.integrations())?;
+        let provider_version = provider_adapter.probe()?;
+        let hook_bin = std::env::current_exe()
+            .map_err(|source| io("current executable", source))?
+            .canonicalize()
+            .map_err(|source| io("current executable", source))?;
+        child.append(
+            runtime,
+            Some(run_id.clone()),
+            Some(request.provider),
+            EventKind::RunStarted {
+                cwd: target_cwd
+                    .to_str()
+                    .ok_or_else(|| Error::InvalidState("child cwd must be valid UTF-8".into()))?
+                    .to_owned(),
+                args: request
+                    .provider_args
+                    .iter()
+                    .map(|arg| encode_arg(arg))
+                    .collect(),
+                supervisor_pid: std::process::id(),
+            },
+        )?;
+        let child_leases = LeaseStore::new(&child.session_dir());
+        child_leases.create(&RunLease::new(
+            child.id().clone(),
+            run_id.clone(),
+            request.provider,
+            ProcessIdentity::capture(std::process::id())?,
+        )?)?;
+        let mut spec = provider_adapter.launch_spec(LaunchContext {
+            cwd: &target_cwd,
+            inbox: &run_paths.inbox,
+            integration_root: &layout.integrations(),
+            hook_bin: &hook_bin,
+            provider_args: &request.provider_args,
+            bootstrap: Some(BOOTSTRAP),
+        })?;
+        add_run_environment(
+            &mut spec.env,
+            &layout,
+            &child,
+            &run_id,
+            request.provider,
+            &provider_version,
+            &hook_bin,
+            &run_paths,
+        );
+        fork_store.transition(ForkPhase::ChildBound, ForkPhase::RunLeased, |_| {})?;
+        fork_store.transition(ForkPhase::RunLeased, ForkPhase::Complete, |_| {})?;
+        drop(child_operation_lock);
+        Ok((child, run_id, run_paths, spec, target_cwd))
+    })();
+    let (child, run_id, run_paths, spec, target_cwd) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let message = error.to_string();
+            return match recover_fork_failure_with_live_child(
+                &fork_store,
+                &message,
+                None,
+                live_child_proof.as_ref(),
+            ) {
+                Ok(_) => Err(error),
+                Err(recovery_error) => Err(Error::InvalidState(format!(
+                    "{message}; fork recovery failed: {recovery_error}"
+                ))),
+            };
+        }
+    };
     let child_leases = LeaseStore::new(&child.session_dir());
-    child_leases.create(&RunLease::new(
-        child.id().clone(),
-        run_id.clone(),
-        request.provider,
-        ProcessIdentity::capture(std::process::id())?,
-    )?)?;
-    let mut spec = provider_adapter.launch_spec(LaunchContext {
-        cwd: &target_cwd,
-        inbox: &run_paths.inbox,
-        integration_root: &layout.integrations(),
-        hook_bin: &hook_bin,
-        provider_args: &request.provider_args,
-        bootstrap: Some(BOOTSTRAP),
-    })?;
-    add_run_environment(
-        &mut spec.env,
-        &layout,
-        &child,
-        &run_id,
-        request.provider,
-        &provider_version,
-        &hook_bin,
-        &run_paths,
-    );
-    fork_store.transition(ForkPhase::ChildBound, ForkPhase::RunLeased, |_| {})?;
-    fork_store.transition(ForkPhase::RunLeased, ForkPhase::Complete, |_| {})?;
-    drop(child_operation_lock);
     drop(parent_operation_lock);
 
     let supervised = Supervisor::launch(spec, &child, &run_id, Duration::from_secs(60));
@@ -479,6 +509,7 @@ fn doctor_command(json: bool, repair: bool, environment: &Environment) -> Result
     diagnostics.extend(doctor::check_provider(Provider::Codex));
     diagnostics.extend(doctor::check_integrations(&layout));
     diagnostics.extend(doctor::check_sessions(&layout));
+    diagnostics.extend(doctor::check_forks(&layout));
     if repair {
         diagnostics.extend(doctor::repair(&layout));
     }

@@ -739,7 +739,7 @@ rtk git commit -m "feat: continue forked work in a child session"
 - Modify: `tests/fork_transaction.rs`
 - Modify: `tests/doctor.rs`
 
-- [ ] **Step 1: Write failing phase-injection tests**
+- [x] **Step 1: Write failing phase-injection tests**
 
 Define a test-only `ForkBoundary` implementation that returns an injected error after a selected durable phase. Run one table case after each pre-commit phase:
 
@@ -771,13 +771,13 @@ Inject a synchronous operation-record write failure immediately after each Git m
 
 Add post-commit cases after `lineage_committed`, `child_bound`, and `run_leased`. They must recover forward and must never call target or branch removal.
 
-- [ ] **Step 2: Run transaction tests and verify cleanup rules are missing**
+- [x] **Step 2: Run transaction tests and verify cleanup rules are missing**
 
 Run: `rtk cargo test --test fork_transaction rollback -- --nocapture`
 
 Expected: FAIL because rollback and forward recovery are not implemented.
 
-- [ ] **Step 3: Implement fingerprint-gated synchronous rollback**
+- [x] **Step 3: Implement fingerprint-gated synchronous rollback**
 
 On an error before a durable parent `session.forked` event, inspect the operation record and use this order:
 
@@ -792,7 +792,7 @@ If any proof fails, perform no destructive Git command, transition to `NeedsManu
 
 `--force` is safe only after the exact target fingerprint comparison; do not weaken that prerequisite because `git worktree remove` otherwise destroys untracked files.
 
-- [ ] **Step 4: Detect the lineage commit point from canonical evidence**
+- [x] **Step 4: Detect the lineage commit point from canonical evidence**
 
 Do not trust only `ForkPhase`: a crash can happen after the parent event fsync and before the operation record update. Treat the transaction as committed when the verified parent journal contains `session.forked` with the same operation ID and child session ID.
 
@@ -809,7 +809,7 @@ leave provider launch to the caller after durable state is complete
 
 A conflicting worktree ref or changed target becomes `NeedsManualRecovery`; it is never overwritten.
 
-- [ ] **Step 5: Add operation diagnostics to doctor**
+- [x] **Step 5: Add operation diagnostics to doctor**
 
 Plain `sesh doctor` scans `$SESH_HOME/operations/*/operation.json` securely and emits:
 
@@ -825,11 +825,11 @@ Diagnostics include operation ID, phase, source session, target path, target bra
 
 `sesh doctor --repair` may complete a post-commit byte-identical child binding and repair its operation phase. After a crash it never removes a target worktree or branch, including a pristine pre-commit target; it reports the exact command for the developer to inspect and run manually. This matches the approved crash boundary.
 
-- [ ] **Step 6: Prove doctor is non-mutating by default**
+- [x] **Step 6: Prove doctor is non-mutating by default**
 
 For every interrupted phase, snapshot state files, operation files, Git refs, and worktree paths before and after plain `sesh doctor --json`. Assert bytes and mtimes are unchanged. Then run `doctor --repair` for a post-commit missing-binding case and assert it performs only the forward binding and phase update.
 
-- [ ] **Step 7: Verify and commit recovery**
+- [x] **Step 7: Verify and commit recovery**
 
 Run:
 

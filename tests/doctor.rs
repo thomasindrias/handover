@@ -5,12 +5,16 @@ use std::os::unix::fs::PermissionsExt;
 
 use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
-use sesh::model::Provider;
+use sesh::fork::{ForkOperationStore, capture_fork_artifacts};
+use sesh::git::Git;
+use sesh::git::fork::materialize;
+use sesh::model::{EventKind, ForkOperation, ForkPhase, OperationId, Provider, RunId, SessionId};
 use sesh::provider::adapter;
-use sesh::store::StateLayout;
+use sesh::runtime::Runtime;
+use sesh::store::{SessionStore, StateLayout};
 use tempfile::TempDir;
 
-use support::{init_repo, path_with, write_executable};
+use support::{git, init_repo, path_with, write_executable};
 
 #[test]
 fn setup_is_inspectable_noninteractive_and_refuses_asset_drift() {
@@ -285,6 +289,265 @@ exit 0
             .iter()
             .any(|item| item["code"] == "journal.corrupt" && item["severity"] == "error")
     );
+}
+
+#[test]
+fn doctor_reports_precommit_forks_without_mutating_or_deleting_them() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    std::fs::write(repo.join("README.md"), "staged\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    std::fs::write(repo.join("README.md"), "unstaged\n").unwrap();
+    std::fs::write(repo.join("untracked.txt"), "untracked\n").unwrap();
+    let state = temp.path().join("state");
+    let layout = StateLayout::new(state.clone());
+    layout.ensure().unwrap();
+    adapter(Provider::Claude)
+        .setup(&layout.integrations())
+        .unwrap();
+    adapter(Provider::Codex)
+        .setup(&layout.integrations())
+        .unwrap();
+    let target = temp
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("target with spaces");
+    let operation = prepared_operation(&repo, target.clone());
+    let store = ForkOperationStore::create(&layout, &operation).unwrap();
+    capture_fork_artifacts(&store, &repo, || Ok(())).unwrap();
+    materialize(&store, &repo, |_| Ok(())).unwrap();
+    let record = store.operation_dir().join("operation.json");
+    let before_bytes = std::fs::read(&record).unwrap();
+    let before_mtime = std::fs::metadata(&record).unwrap().modified().unwrap();
+    let branch_before = git_output(
+        &repo,
+        &["rev-parse", "--verify", "refs/heads/sesh/doctor-test"],
+    );
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    install_capable_providers(&bin);
+
+    let plain = cargo_bin_cmd!("sesh")
+        .current_dir(&repo)
+        .env("SESH_HOME", &state)
+        .env("PATH", path_with(&bin))
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let diagnostics: Vec<serde_json::Value> = serde_json::from_slice(&plain.stdout).unwrap();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|item| item["code"] == "fork_precommit_crash")
+        .unwrap();
+    assert_eq!(diagnostic["command_argv"][0], "git");
+    assert_eq!(diagnostic["command_argv"][2], target.to_str().unwrap());
+    let display = diagnostic["command"].as_str().unwrap();
+    assert!(display.contains("target with spaces"));
+    assert!(display.contains('\''));
+    assert!(
+        diagnostic["message"]
+            .as_str()
+            .unwrap()
+            .contains("sesh/doctor-test")
+    );
+    assert_eq!(std::fs::read(&record).unwrap(), before_bytes);
+    assert_eq!(
+        std::fs::metadata(&record).unwrap().modified().unwrap(),
+        before_mtime
+    );
+
+    cargo_bin_cmd!("sesh")
+        .current_dir(&repo)
+        .env("SESH_HOME", &state)
+        .env("PATH", path_with(&bin))
+        .args(["doctor", "--json", "--repair"])
+        .assert()
+        .success();
+    assert!(target.exists());
+    assert_eq!(store.operation().unwrap().phase, ForkPhase::Verified);
+    assert_eq!(
+        git_output(
+            &repo,
+            &["rev-parse", "--verify", "refs/heads/sesh/doctor-test"]
+        ),
+        branch_before
+    );
+
+    std::fs::write(target.join("changed-after-crash.txt"), "preserve me\n").unwrap();
+    let changed = cargo_bin_cmd!("sesh")
+        .current_dir(&repo)
+        .env("SESH_HOME", &state)
+        .env("PATH", path_with(&bin))
+        .args(["doctor", "--json", "--repair"])
+        .output()
+        .unwrap();
+    let diagnostics: Vec<serde_json::Value> = serde_json::from_slice(&changed.stdout).unwrap();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|item| item["code"] == "fork_target_changed")
+    );
+    assert!(target.join("changed-after-crash.txt").exists());
+    assert_eq!(store.operation().unwrap().phase, ForkPhase::Verified);
+}
+
+#[test]
+fn doctor_repairs_only_the_missing_binding_after_lineage_commit() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    let state = temp.path().join("state");
+    let layout = StateLayout::new(state.clone());
+    let runtime = FixedRuntime;
+    let parent =
+        SessionStore::create(&layout, &runtime, Git::new().snapshot(&repo).unwrap()).unwrap();
+    adapter(Provider::Claude)
+        .setup(&layout.integrations())
+        .unwrap();
+    adapter(Provider::Codex)
+        .setup(&layout.integrations())
+        .unwrap();
+    let target = temp.path().canonicalize().unwrap().join("target");
+    let operation = prepared_operation(&repo, target.clone());
+    let store = ForkOperationStore::create(&layout, &operation).unwrap();
+    capture_fork_artifacts(&store, &repo, || Ok(())).unwrap();
+    materialize(&store, &repo, |_| Ok(())).unwrap();
+    let (transition, _) = parent
+        .create_transition_checkpoint(&runtime, None, None, None)
+        .unwrap();
+    let child_id = SessionId::parse("22222222-2222-4222-8222-222222222222").unwrap();
+    let child = SessionStore::stage_child(
+        &layout,
+        &runtime,
+        Git::new().snapshot(&target).unwrap(),
+        parent.id().clone(),
+        transition.sequence,
+        child_id.clone(),
+    )
+    .unwrap();
+    store
+        .transition(ForkPhase::Verified, ForkPhase::ChildStaged, |record| {
+            record.child_session_id = Some(child_id.clone());
+            record.source_checkpoint_sequence = Some(transition.sequence);
+        })
+        .unwrap();
+    parent
+        .append(
+            &runtime,
+            None,
+            None,
+            EventKind::SessionForked {
+                operation_id: operation.id,
+                child_session_id: child_id,
+                parent_checkpoint_sequence: transition.sequence,
+                target_worktree: target.clone(),
+                target_branch: "sesh/doctor-test".into(),
+            },
+        )
+        .unwrap();
+    assert!(
+        SessionStore::find_for_worktree(&layout, &child.meta().worktree)
+            .unwrap()
+            .is_none()
+    );
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    install_capable_providers(&bin);
+
+    let plain = cargo_bin_cmd!("sesh")
+        .current_dir(&repo)
+        .env("SESH_HOME", &state)
+        .env("PATH", path_with(&bin))
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let plain: Vec<serde_json::Value> = serde_json::from_slice(&plain.stdout).unwrap();
+    assert!(
+        plain
+            .iter()
+            .any(|item| item["code"] == "fork_postcommit_incomplete")
+    );
+    assert_eq!(store.operation().unwrap().phase, ForkPhase::ChildStaged);
+    assert!(target.exists());
+
+    let repaired = cargo_bin_cmd!("sesh")
+        .current_dir(&repo)
+        .env("SESH_HOME", &state)
+        .env("PATH", path_with(&bin))
+        .args(["doctor", "--json", "--repair"])
+        .output()
+        .unwrap();
+    let repaired: Vec<serde_json::Value> = serde_json::from_slice(&repaired.stdout).unwrap();
+    assert!(
+        repaired
+            .iter()
+            .any(|item| item["code"] == "fork.forward_repaired")
+    );
+    assert_eq!(store.operation().unwrap().phase, ForkPhase::ChildBound);
+    assert_eq!(
+        SessionStore::find_for_worktree(&layout, &child.meta().worktree)
+            .unwrap()
+            .unwrap()
+            .id(),
+        child.id()
+    );
+    assert!(target.exists());
+}
+
+fn prepared_operation(repo: &std::path::Path, target: std::path::PathBuf) -> ForkOperation {
+    let source = Git::new().snapshot(repo).unwrap();
+    ForkOperation {
+        schema_version: 1,
+        id: OperationId::parse("99999999-9999-4999-8999-999999999999").unwrap(),
+        phase: ForkPhase::Prepared,
+        source_session_id: SessionId::parse("11111111-1111-4111-8111-111111111111").unwrap(),
+        source_worktree: source.identity,
+        source_checkpoint_sequence: None,
+        source_fingerprint: None,
+        target_branch: "sesh/doctor-test".into(),
+        target_worktree: target,
+        target_head: source.head,
+        child_session_id: None,
+        target_fingerprint: None,
+        target_cleanup_inventory_sha256: None,
+        branch_created: false,
+        target_created: false,
+        error: None,
+        updated_at: "2026-07-19T10:00:00Z".into(),
+    }
+}
+
+fn git_output(cwd: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().into()
+}
+
+struct FixedRuntime;
+
+impl Runtime for FixedRuntime {
+    fn now(&self) -> sesh::error::Result<String> {
+        Ok("2026-07-19T10:00:00Z".into())
+    }
+
+    fn session_id(&self) -> SessionId {
+        SessionId::parse("11111111-1111-4111-8111-111111111111").unwrap()
+    }
+
+    fn run_id(&self) -> RunId {
+        RunId::parse("33333333-3333-4333-8333-333333333333").unwrap()
+    }
+
+    fn operation_id(&self) -> OperationId {
+        OperationId::parse("99999999-9999-4999-8999-999999999999").unwrap()
+    }
 }
 
 fn install_capable_providers(bin: &std::path::Path) {
