@@ -15,15 +15,16 @@ use crate::checkpoint::{
 use crate::cli::{CheckpointFormat, Cli, Command};
 use crate::doctor;
 use crate::error::{Error, Result, io};
+use crate::fork::{ForkOperationStore, capture_fork_artifacts};
 use crate::git::Git;
-use crate::git::fork::ForkRequest;
+use crate::git::fork::{ForkRequest, materialize};
 use crate::handoff::{
-    BOOTSTRAP, CaptureGap, CommandFact, HandoffInput, is_recognized_test_command,
+    BOOTSTRAP, CaptureGap, CommandFact, HandoffInput, ParentLineage, is_recognized_test_command,
     render_with_selection,
 };
 use crate::model::{
     Checkpoint, CheckpointAuthor, CheckpointKind, ContentRef, Event, EventEnvelope, EventKind,
-    GitSnapshot, Provider, RunId, SessionId,
+    ForkOperation, ForkPhase, GitSnapshot, Provider, RunId, SessionId,
 };
 use crate::provider::hook::{
     HookEvent, HookOutput, NormalizedHook, capture_failure_output, normalize, session_start_output,
@@ -135,26 +136,264 @@ fn fork_command(
     runtime: &dyn Runtime,
 ) -> Result<i32> {
     let caller_cwd = std::env::current_dir().map_err(|source| io(".", source))?;
-    let (_layout, _snapshot, store) = current_session(environment)?;
-    let _operation_lock = SessionOperationLock::acquire(&store.session_dir())?;
-    if LeaseStore::new(&store.session_dir()).read()?.is_some() {
+    let (layout, _snapshot, parent) = current_session(environment)?;
+    let parent_operation_lock = SessionOperationLock::acquire(&parent.session_dir())?;
+    let saved_cwd_relative = parent.saved_cwd_relative()?;
+    let source_cwd_path = parent.meta().worktree.worktree.join(&saved_cwd_relative);
+    let source_cwd = source_cwd_path
+        .canonicalize()
+        .map_err(|source| io(&source_cwd_path, source))?;
+    if !source_cwd.is_dir() || !source_cwd.starts_with(&parent.meta().worktree.worktree) {
         return Err(Error::InvalidState(
-            "fork refuses an active or unrecovered provider lease".into(),
+            "saved cwd is not a real directory in the parent worktree".into(),
         ));
     }
+    let locked_snapshot = Git::new().snapshot(&source_cwd)?;
+    let parent_leases = LeaseStore::new(&parent.session_dir());
+    recover_stale_lease(&parent, &parent_leases, runtime, &locked_snapshot)?;
 
-    let saved_cwd_relative = store.saved_cwd_relative()?;
-    let source_cwd = store.meta().worktree.worktree.join(saved_cwd_relative);
     let operation_id = runtime.operation_id();
-    let _preflight = Git::new().preflight_fork(
+    let preflight = Git::new().preflight_fork(
         &source_cwd,
         &caller_cwd,
         &request,
         &operation_id.to_string(),
     )?;
-    Err(Error::InvalidState(
-        "fork preflight passed; materialization is not implemented yet".into(),
-    ))
+    let target_branch = preflight.target.branch.clone();
+    let target_worktree = preflight.target.worktree.clone();
+    let operation = ForkOperation {
+        schema_version: 1,
+        id: operation_id.clone(),
+        phase: ForkPhase::Prepared,
+        source_session_id: parent.id().clone(),
+        source_worktree: preflight.source.identity.clone(),
+        source_checkpoint_sequence: None,
+        source_fingerprint: None,
+        target_branch: target_branch.clone(),
+        target_worktree: target_worktree.clone(),
+        target_head: preflight.source_head,
+        child_session_id: None,
+        target_fingerprint: None,
+        target_cleanup_inventory_sha256: None,
+        branch_created: false,
+        target_created: false,
+        error: None,
+        updated_at: runtime.now()?,
+    };
+    let fork_store = ForkOperationStore::create(&layout, &operation)?;
+    capture_fork_artifacts(&fork_store, &source_cwd, || Ok(()))?;
+    materialize(&fork_store, &source_cwd, |_| Ok(()))?;
+    let captured_source = fork_store
+        .operation()?
+        .source_fingerprint
+        .ok_or_else(|| Error::InvalidState("fork lost its source fingerprint".into()))?;
+    if Git::new().fingerprint(&source_cwd)? != captured_source {
+        return Err(Error::InvalidState(
+            "source changed before child lineage commit".into(),
+        ));
+    }
+
+    let parent_events_before_transition = parent.events()?;
+    let previous_provider = previous_provider(&parent_events_before_transition)?;
+    let narrative_checkpoint =
+        latest_narrative_checkpoint(&parent, &parent_events_before_transition)?;
+    let narrative_sequence = narrative_checkpoint.as_ref().map(|item| item.0);
+    let (transition_event, transition_stored) =
+        parent.create_transition_checkpoint(runtime, None, None, narrative_sequence)?;
+    let child_id = runtime.session_id();
+    let target_cwd_path = target_worktree.join(&saved_cwd_relative);
+    let target_cwd = target_cwd_path
+        .canonicalize()
+        .map_err(|source| io(&target_cwd_path, source))?;
+    let child_snapshot = Git::new().snapshot(&target_cwd)?;
+    let child = SessionStore::stage_child(
+        &layout,
+        runtime,
+        child_snapshot.clone(),
+        parent.id().clone(),
+        transition_event.sequence,
+        child_id.clone(),
+    )?;
+    let child_operation_lock = SessionOperationLock::acquire(&child.session_dir())?;
+    fork_store.transition(ForkPhase::Verified, ForkPhase::ChildStaged, |record| {
+        record.child_session_id = Some(child_id.clone());
+        record.source_checkpoint_sequence = Some(transition_event.sequence);
+    })?;
+    parent.append(
+        runtime,
+        None,
+        None,
+        EventKind::SessionForked {
+            operation_id: operation_id.clone(),
+            child_session_id: child_id.clone(),
+            parent_checkpoint_sequence: transition_event.sequence,
+            target_worktree: target_worktree.clone(),
+            target_branch: target_branch.clone(),
+        },
+    )?;
+    fork_store.transition(ForkPhase::ChildStaged, ForkPhase::LineageCommitted, |_| {})?;
+    child.bind_worktree()?;
+    fork_store.transition(ForkPhase::LineageCommitted, ForkPhase::ChildBound, |_| {})?;
+
+    let envelopes = parent.envelopes()?;
+    let recent_boundary = narrative_sequence.unwrap_or(0);
+    let mut recent_events = Vec::new();
+    for envelope in envelopes
+        .iter()
+        .filter(|item| item.event.sequence > recent_boundary)
+    {
+        let mut line = envelope.line()?;
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        recent_events.push((
+            envelope.event.sequence,
+            String::from_utf8(line).map_err(|_| {
+                Error::InvalidState("canonical parent event envelope is not UTF-8".into())
+            })?,
+        ));
+    }
+    let parent_events = envelopes
+        .iter()
+        .map(|item| item.event.clone())
+        .collect::<Vec<_>>();
+    let (recent_commands, latest_test, latest_failure, capture_gaps) =
+        command_facts(&parent, &parent_events)?;
+    let rendered = render_with_selection(
+        HandoffInput {
+            session_id: child_id.clone(),
+            parent_lineage: Some(ParentLineage {
+                session_id: parent.id().clone(),
+                transition_sequence: transition_event.sequence,
+                narrative_sequence,
+            }),
+            from_provider: previous_provider,
+            to_provider: request.provider,
+            transition_sequence: transition_event.sequence,
+            transition_checkpoint: transition_stored.checkpoint,
+            narrative_checkpoint,
+            snapshot: child_snapshot,
+            recent_events,
+            recent_commands,
+            latest_test,
+            latest_failure,
+            capture_gaps,
+        },
+        MAX_HANDOFF_BYTES,
+    )?;
+    let recent_events_jsonl = selected_event_lines(&envelopes, &rendered.recent_event_sequences)?;
+    if recent_events_jsonl.len() > MAX_HANDOFF_BYTES {
+        return Err(Error::InvalidState(
+            "selected parent events exceed 64 KiB".into(),
+        ));
+    }
+
+    let run_id = runtime.run_id();
+    let run_paths = prepare_run_directory(
+        &child,
+        &run_id,
+        rendered.markdown.as_bytes(),
+        &recent_events_jsonl,
+    )?;
+    let provider_adapter = adapter(request.provider);
+    provider_adapter.setup(&layout.integrations())?;
+    let provider_version = provider_adapter.probe()?;
+    let hook_bin = std::env::current_exe()
+        .map_err(|source| io("current executable", source))?
+        .canonicalize()
+        .map_err(|source| io("current executable", source))?;
+    child.append(
+        runtime,
+        Some(run_id.clone()),
+        Some(request.provider),
+        EventKind::RunStarted {
+            cwd: target_cwd
+                .to_str()
+                .ok_or_else(|| Error::InvalidState("child cwd must be valid UTF-8".into()))?
+                .to_owned(),
+            args: request
+                .provider_args
+                .iter()
+                .map(|arg| encode_arg(arg))
+                .collect(),
+            supervisor_pid: std::process::id(),
+        },
+    )?;
+    let child_leases = LeaseStore::new(&child.session_dir());
+    child_leases.create(&RunLease::new(
+        child.id().clone(),
+        run_id.clone(),
+        request.provider,
+        ProcessIdentity::capture(std::process::id())?,
+    )?)?;
+    let mut spec = provider_adapter.launch_spec(LaunchContext {
+        cwd: &target_cwd,
+        inbox: &run_paths.inbox,
+        integration_root: &layout.integrations(),
+        hook_bin: &hook_bin,
+        provider_args: &request.provider_args,
+        bootstrap: Some(BOOTSTRAP),
+    })?;
+    add_run_environment(
+        &mut spec.env,
+        &layout,
+        &child,
+        &run_id,
+        request.provider,
+        &provider_version,
+        &hook_bin,
+        &run_paths,
+    );
+    fork_store.transition(ForkPhase::ChildBound, ForkPhase::RunLeased, |_| {})?;
+    fork_store.transition(ForkPhase::RunLeased, ForkPhase::Complete, |_| {})?;
+    drop(child_operation_lock);
+    drop(parent_operation_lock);
+
+    let supervised = Supervisor::launch(spec, &child, &run_id, Duration::from_secs(60));
+    let child_operation_lock = SessionOperationLock::acquire(&child.session_dir())?;
+    let (facts, supervision_error) = match supervised {
+        Ok(outcome) => (outcome.facts.clone(), outcome.startup_failure.clone()),
+        Err(error) => (
+            ExitFacts {
+                exit_code: None,
+                signal: None,
+            },
+            Some(error.to_string()),
+        ),
+    };
+    promote_inbox(
+        &child,
+        runtime,
+        &run_id,
+        request.provider,
+        &run_paths.checkpoints,
+    )?;
+    child.append(
+        runtime,
+        Some(run_id.clone()),
+        Some(request.provider),
+        EventKind::RunStopped {
+            exit_code: facts.exit_code,
+            signal: facts.signal,
+        },
+    )?;
+    child.append(
+        runtime,
+        Some(run_id.clone()),
+        Some(request.provider),
+        EventKind::GitSnapshot {
+            snapshot: Git::new().snapshot(&target_cwd)?,
+        },
+    )?;
+    child_leases.clear(&run_id)?;
+    drop(child_operation_lock);
+
+    if let Some(message) = supervision_error {
+        return Err(Error::Command(message));
+    }
+    Ok(facts
+        .exit_code
+        .unwrap_or_else(|| 128 + facts.signal.unwrap_or(1)))
 }
 
 fn setup_command(
@@ -478,6 +717,7 @@ pub fn switch_command(
     let rendered = render_with_selection(
         HandoffInput {
             session_id: store.id().clone(),
+            parent_lineage: None,
             from_provider: previous_provider,
             to_provider: provider,
             transition_sequence: transition_event.sequence,

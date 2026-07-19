@@ -606,7 +606,7 @@ rtk git commit -m "feat: duplicate git worktree state exactly"
 - Modify: `src/app.rs`
 - Create: `tests/fork_north_star.rs`
 
-- [ ] **Step 1: Write the failing fork-to-provider acceptance test**
+- [x] **Step 1: Write the failing fork-to-provider acceptance test**
 
 Create `tests/fork_north_star.rs`:
 
@@ -621,13 +621,13 @@ Create `tests/fork_north_star.rs`:
 
 The fake providers use the same hook fixtures and `--version` handling as `tests/north_star.rs`; no real model is called.
 
-- [ ] **Step 2: Run the acceptance test and verify orchestration is absent**
+- [x] **Step 2: Run the acceptance test and verify orchestration is absent**
 
 Run: `rtk cargo test --test fork_north_star -- --nocapture`
 
 Expected: FAIL because app dispatch and child-session lineage are not implemented.
 
-- [ ] **Step 3: Add explicit parent/child event facts**
+- [x] **Step 3: Add explicit parent/child event facts**
 
 Extend `EventKind`:
 
@@ -644,7 +644,7 @@ SessionForked {
 
 Keep the child's `SessionMeta.parent_session_id` and `parent_checkpoint_sequence` fields. Do not copy parent events into the child journal or create child refs that point to parent checkpoint sequences; cross-session lineage is explicit metadata, not fake local history.
 
-- [ ] **Step 4: Split child staging from worktree-ref activation**
+- [x] **Step 4: Split child staging from worktree-ref activation**
 
 Add these `SessionStore` operations:
 
@@ -670,7 +670,7 @@ before parent session.forked is durable -> rollback may be attempted
 after parent session.forked is durable  -> recover forward; never delete target
 ```
 
-- [ ] **Step 5: Implement the full fork transaction**
+- [x] **Step 5: Implement the full fork transaction**
 
 Add `fork_command` to app dispatch. While holding the parent `SessionOperationLock`:
 
@@ -694,7 +694,7 @@ The target provider launch is part of the child session. A provider startup fail
 
 Fork and recovery always acquire parent operation lock before child operation lock; no code path may take them in the reverse order. Holding the child lock before global worktree binding prevents a racing `switch` from attaching between child activation and lease creation.
 
-- [ ] **Step 6: Render lineage without pretending parent events are child events**
+- [x] **Step 6: Render lineage without pretending parent events are child events**
 
 Extend `HandoffInput` with:
 
@@ -710,7 +710,7 @@ pub parent_lineage: Option<ParentLineage>,
 
 The handoff heading says `Forked from session <id> at parent checkpoint <sequence>`. Parent post-narrative events retain labels such as `parent event 42`; child events use `child event 1`. Omitted ranges are scoped by session. Current repository/worktree/branch/cwd and dirty facts always come from the child snapshot.
 
-- [ ] **Step 7: Verify lineage, worktree bindings, and launch**
+- [x] **Step 7: Verify lineage, worktree bindings, and launch**
 
 Run:
 
@@ -723,7 +723,7 @@ rtk cargo clippy --all-targets --all-features -- -D warnings
 
 Expected: PASS. The original switch test proves the default still uses the existing worktree; the fork test proves duplication is opt-in.
 
-- [ ] **Step 8: Commit child-session fork orchestration**
+- [x] **Step 8: Commit child-session fork orchestration**
 
 ```bash
 rtk git add src tests/fork_north_star.rs

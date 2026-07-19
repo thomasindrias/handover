@@ -66,7 +66,7 @@ fn repository_name_sanitization_never_creates_an_invalid_component() {
 #[test]
 fn clean_source_reaches_the_materialization_boundary_without_mutation() {
     let fixture = ForkFixture::new();
-    fixture.assert_refusal("fork preflight passed");
+    fixture.assert_success_at(&fixture.target);
 }
 
 #[test]
@@ -74,7 +74,7 @@ fn active_or_unrecovered_lease_is_refused_before_preflight() {
     for host in ["local-test-host", "foreign-test-host"] {
         let fixture = ForkFixture::new();
         fixture.write_lease(host);
-        fixture.assert_refusal("fork refuses an active or unrecovered provider lease");
+        fixture.assert_refusal("explicit recovery is required");
     }
 }
 
@@ -171,7 +171,7 @@ fn unignored_special_nodes_are_refused_but_ignored_nodes_are_pruned() {
     let ignored_fifo = fixture.repo.join("ignored/agent.pipe");
     let status = Command::new("mkfifo").arg(&ignored_fifo).status().unwrap();
     assert!(status.success());
-    fixture.assert_refusal("fork preflight passed");
+    fixture.assert_success_at(&fixture.target);
 }
 
 #[test]
@@ -230,6 +230,7 @@ fn relative_targets_resolve_from_the_callers_cwd() {
     cargo_bin_cmd!("sesh")
         .current_dir(&fixture.repo)
         .env("SESH_HOME", &fixture.state)
+        .env("PATH", &fixture.path)
         .args([
             "fork",
             "codex",
@@ -239,10 +240,9 @@ fn relative_targets_resolve_from_the_callers_cwd() {
             "../relative-target",
         ])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("fork preflight passed"));
-    assert!(!resolved.exists());
-    fixture.assert_private_state_unchanged();
+        .success();
+    assert!(resolved.is_dir());
+    fixture.assert_successful_fork_state(&resolved);
 }
 
 #[test]
@@ -277,6 +277,7 @@ struct ForkFixture {
     target: PathBuf,
     branch: String,
     source_ref_count: usize,
+    path: OsString,
 }
 
 impl ForkFixture {
@@ -297,10 +298,21 @@ printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"Ses
 exit 0
 "#,
         );
+        write_executable(
+            &bin.join("codex"),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-codex 1.0'; exit 0; fi
+cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
+printf '%s' '{"session_id":"native","turn_id":"turn-1","cwd":"'"$cwd_json"'","model":"test","hook_event_name":"SessionStart"}' | "$SESH_HOOK_BIN" __hook codex >/dev/null
+exit 0
+"#,
+        );
+        let path = path_with(&bin);
         cargo_bin_cmd!("sesh")
             .current_dir(&repo)
             .env("SESH_HOME", &state)
-            .env("PATH", path_with(&bin))
+            .env("PATH", &path)
             .args(["run", "claude"])
             .assert()
             .success();
@@ -315,6 +327,7 @@ exit 0
             repo,
             state,
             source_ref_count,
+            path,
         }
     }
 
@@ -326,6 +339,7 @@ exit 0
         cargo_bin_cmd!("sesh")
             .current_dir(&self.repo)
             .env("SESH_HOME", &self.state)
+            .env("PATH", &self.path)
             .arg("fork")
             .arg("codex")
             .arg("--branch")
@@ -352,6 +366,7 @@ exit 0
         cargo_bin_cmd!("sesh")
             .current_dir(&self.repo)
             .env("SESH_HOME", &self.state)
+            .env("PATH", &self.path)
             .args(["fork", "codex", "--branch", &self.branch, "--worktree"])
             .arg(&self.target)
             .assert()
@@ -376,6 +391,39 @@ exit 0
                 .unwrap()
                 .count(),
             self.source_ref_count
+        );
+    }
+
+    fn assert_success_at(&self, target: &Path) {
+        cargo_bin_cmd!("sesh")
+            .current_dir(&self.repo)
+            .env("SESH_HOME", &self.state)
+            .env("PATH", &self.path)
+            .arg("fork")
+            .arg("codex")
+            .arg("--branch")
+            .arg(&self.branch)
+            .arg("--worktree")
+            .arg(target)
+            .assert()
+            .success();
+        assert!(target.is_dir());
+        self.assert_successful_fork_state(target);
+    }
+
+    fn assert_successful_fork_state(&self, target: &Path) {
+        assert!(target.is_dir());
+        assert_eq!(
+            std::fs::read_dir(self.state.join("operations"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_dir(self.state.join("refs/worktrees"))
+                .unwrap()
+                .count(),
+            self.source_ref_count + 1
         );
     }
 

@@ -68,23 +68,74 @@ impl SessionStore {
             },
         )?;
         store.append(runtime, None, None, EventKind::GitSnapshot { snapshot })?;
+        store.bind_worktree()?;
+        Ok(store)
+    }
+
+    pub fn stage_child(
+        layout: &StateLayout,
+        runtime: &dyn Runtime,
+        snapshot: GitSnapshot,
+        parent_session_id: SessionId,
+        parent_checkpoint_sequence: u64,
+        child_session_id: SessionId,
+    ) -> Result<Self> {
+        snapshot.identity.validate()?;
+        if parent_checkpoint_sequence == 0 || parent_session_id == child_session_id {
+            return Err(Error::InvalidState(
+                "child session lineage is incomplete or recursive".into(),
+            ));
+        }
+        layout.ensure()?;
+        let layout = layout.canonicalized()?;
+        let meta = SessionMeta {
+            schema_version: 1,
+            id: child_session_id,
+            created_at: runtime.now()?,
+            worktree: snapshot.identity.clone(),
+            parent_session_id: Some(parent_session_id),
+            parent_checkpoint_sequence: Some(parent_checkpoint_sequence),
+        };
+        validate_session_meta(&meta, &meta.id)?;
+        let store = Self { layout, meta };
+        store.ensure_directories()?;
+        write_json_create(&store.session_dir().join("meta.json"), &store.meta)?;
+        store.append(
+            runtime,
+            None,
+            None,
+            EventKind::SessionCreated {
+                worktree: snapshot.identity.clone(),
+            },
+        )?;
+        store.append(runtime, None, None, EventKind::GitSnapshot { snapshot })?;
+        Ok(store)
+    }
+
+    pub fn bind_worktree(&self) -> Result<()> {
+        let reference_path = self
+            .layout
+            .worktree_refs()
+            .join(format!("{}.json", self.meta.worktree.key));
         let reference = WorktreeRef {
             schema_version: 1,
-            key: store.meta.worktree.key.clone(),
-            session_id: store.meta.id.clone(),
-            identity: store.meta.worktree.clone(),
+            key: self.meta.worktree.key.clone(),
+            session_id: self.meta.id.clone(),
+            identity: self.meta.worktree.clone(),
         };
-        if let Err(error) = write_json_create(&reference_path, &reference) {
-            if let Ok(existing) = read_json::<WorktreeRef>(&reference_path) {
-                if validate_worktree_ref(&existing).is_ok()
-                    && existing.identity.same_worktree_as(&store.meta.worktree)
-                {
-                    return Err(already_bound(&existing));
+        match write_json_create(&reference_path, &reference) {
+            Ok(()) => Ok(()),
+            Err(error) => match read_json::<WorktreeRef>(&reference_path) {
+                Ok(existing) if existing == reference => Ok(()),
+                Ok(existing) if existing.identity.same_worktree_as(&self.meta.worktree) => {
+                    Err(already_bound(&existing))
                 }
-            }
-            return Err(error);
+                Ok(_) => Err(Error::InvalidState(
+                    "worktree ref key collision or identity mismatch".into(),
+                )),
+                Err(_) => Err(error),
+            },
         }
-        Ok(store)
     }
 
     pub fn open(layout: &StateLayout, id: SessionId) -> Result<Self> {
@@ -628,6 +679,48 @@ mod tests {
         crate::store::refs::write_json(&path, &reference).unwrap();
 
         assert!(SessionStore::find_for_worktree(&layout, &snapshot().identity).is_err());
+    }
+
+    #[test]
+    fn child_staging_is_unbound_until_idempotent_activation() {
+        let temp = TempDir::new().unwrap();
+        let layout = StateLayout::new(temp.path().join("state"));
+        let parent = SessionId::parse("11111111-1111-4111-8111-111111111111").unwrap();
+        let child = SessionId::parse("22222222-2222-4222-8222-222222222222").unwrap();
+
+        let store = SessionStore::stage_child(
+            &layout,
+            &FixedRuntime,
+            snapshot(),
+            parent.clone(),
+            17,
+            child.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(store.id(), &child);
+        assert_eq!(store.meta().parent_session_id.as_ref(), Some(&parent));
+        assert_eq!(store.meta().parent_checkpoint_sequence, Some(17));
+        assert_eq!(store.events().unwrap().len(), 2);
+        assert_eq!(
+            std::fs::read_dir(layout.worktree_refs()).unwrap().count(),
+            0
+        );
+        assert!(
+            SessionStore::find_for_worktree(&layout, &snapshot().identity)
+                .unwrap()
+                .is_none()
+        );
+
+        store.bind_worktree().unwrap();
+        store.bind_worktree().unwrap();
+        assert_eq!(
+            SessionStore::find_for_worktree(&layout, &snapshot().identity)
+                .unwrap()
+                .unwrap()
+                .id(),
+            &child
+        );
     }
 
     struct RuntimeWithId(SessionId);
