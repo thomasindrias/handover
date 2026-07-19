@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{IsTerminal, Read, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -39,6 +40,11 @@ const MAX_HOOK_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_HANDOFF_BYTES: usize = 65_536;
 
 pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result<i32> {
+    if environment.get("SESH_RUN_ID").is_some() && !provider_command_allowed(&cli.command) {
+        return Err(Error::InvalidState(
+            "an attached provider may only invoke Sesh hooks or submit provider checkpoints".into(),
+        ));
+    }
     match cli.command {
         Command::Run {
             provider,
@@ -63,6 +69,14 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
                 input_is_terminal,
             )
         }
+        Command::Status { json } => status_command(json, environment),
+        Command::Log { from, json } => log_command(from, json, environment),
+        Command::Inspect { json } => inspect_command(json, environment),
+        Command::Delete { yes } => {
+            let stdin = std::io::stdin();
+            let input_is_terminal = stdin.is_terminal();
+            delete_command(yes, environment, stdin.lock(), input_is_terminal)
+        }
         Command::Hook { provider } => {
             let output = ingest_hook(provider, environment, runtime, std::io::stdin().lock())?;
             std::io::stdout()
@@ -74,6 +88,17 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
             Ok(output.exit_code)
         }
     }
+}
+
+fn provider_command_allowed(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Hook { .. }
+            | Command::Checkpoint {
+                from_provider: true,
+                ..
+            }
+    )
 }
 
 pub fn run_command(
@@ -688,6 +713,393 @@ fn add_run_environment(
     ] {
         target.insert(OsString::from(key), value.to_owned());
     }
+}
+
+fn status_command(json: bool, environment: &Environment) -> Result<i32> {
+    let (_layout, snapshot, store) = current_session(environment)?;
+    let events = store.events()?;
+    let provider = previous_provider(&events)?;
+    let saved_cwd_path = store
+        .meta()
+        .worktree
+        .worktree
+        .join(store.saved_cwd_relative()?);
+    let saved_cwd = saved_cwd_path
+        .canonicalize()
+        .map_err(|source| io(&saved_cwd_path, source))?;
+    let (_, _, _, gaps) = command_facts(&store, &events)?;
+    let value = serde_json::json!({
+        "schema_version": 1,
+        "session_id": store.id(),
+        "provider": provider,
+        "worktree": snapshot.identity.worktree,
+        "branch": snapshot.branch,
+        "head": snapshot.head,
+        "cwd": saved_cwd,
+        "dirty": {
+            "staged": snapshot.staged,
+            "unstaged": snapshot.unstaged,
+            "untracked": snapshot.untracked,
+            "dirty_submodules": snapshot.dirty_submodules,
+        },
+        "latest_checkpoint": latest_checkpoint_value(&store, &events)?,
+        "capture_gaps": gaps.into_iter().map(|gap| serde_json::json!({
+            "sequence": gap.sequence,
+            "phase": gap.phase,
+            "message": gap.message,
+        })).collect::<Vec<_>>(),
+    });
+    write_projection(&value, json)?;
+    Ok(0)
+}
+
+fn log_command(from: Option<u64>, json: bool, environment: &Environment) -> Result<i32> {
+    let (_layout, _snapshot, store) = current_session(environment)?;
+    let mut stdout = std::io::stdout().lock();
+    for envelope in store
+        .envelopes()?
+        .into_iter()
+        .filter(|envelope| from.is_none_or(|sequence| envelope.event.sequence >= sequence))
+    {
+        if json {
+            stdout
+                .write_all(&envelope.line()?)
+                .map_err(|source| io("stdout", source))?;
+        } else {
+            let event_value = serde_json::to_value(&envelope.event).map_err(|error| {
+                Error::InvalidState(format!("cannot encode event projection: {error}"))
+            })?;
+            let kind = event_value["type"]
+                .as_str()
+                .ok_or_else(|| Error::InvalidState("event projection has no type field".into()))?;
+            writeln!(stdout, "{} {kind}", envelope.event.sequence)
+                .map_err(|source| io("stdout", source))?;
+        }
+    }
+    Ok(0)
+}
+
+fn inspect_command(json: bool, environment: &Environment) -> Result<i32> {
+    let (layout, _snapshot, store) = current_session(environment)?;
+    let envelopes = store.envelopes()?;
+    let mut checkpoint_files = Vec::new();
+    let checkpoints = store.session_dir().join("checkpoints");
+    for entry in std::fs::read_dir(&checkpoints).map_err(|source| io(&checkpoints, source))? {
+        let path = entry.map_err(|source| io(&checkpoints, source))?.path();
+        checkpoint_files.push(private_file_value(&path)?);
+    }
+    checkpoint_files.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+
+    let mut blob_references = BTreeMap::new();
+    let blobs = BlobStore::new(&store.session_dir());
+    for envelope in &envelopes {
+        match &envelope.event.kind {
+            EventKind::ProviderPromptSubmitted { prompt } => {
+                collect_blob_reference(prompt, &mut blob_references, &blobs)?;
+            }
+            EventKind::ProviderToolCompleted {
+                response,
+                stdout,
+                stderr,
+                ..
+            } => {
+                for content in [response, stdout, stderr].into_iter().flatten() {
+                    collect_blob_reference(content, &mut blob_references, &blobs)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut permissions = Vec::new();
+    for path in [
+        layout.root().to_path_buf(),
+        store.session_dir(),
+        store.session_dir().join("events.jsonl"),
+        store.session_dir().join("lock"),
+        store.session_dir().join("refs"),
+        store.session_dir().join("checkpoints"),
+        store.session_dir().join("blobs"),
+        store.session_dir().join("runs"),
+    ] {
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => permissions.push(permission_value(&path)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io(&path, source)),
+        }
+    }
+    let active_lease = LeaseStore::new(&store.session_dir()).read()?;
+    let value = serde_json::json!({
+        "schema_version": 1,
+        "state_root": layout.root(),
+        "session_dir": store.session_dir(),
+        "event_count": envelopes.len(),
+        "checkpoint_files": checkpoint_files,
+        "blob_references": blob_references.into_iter().map(|(sha256, bytes)| {
+            serde_json::json!({"sha256": sha256, "bytes": bytes})
+        }).collect::<Vec<_>>(),
+        "permissions": permissions,
+        "active_lease": active_lease,
+    });
+    write_projection(&value, json)?;
+    Ok(0)
+}
+
+fn delete_command(
+    yes: bool,
+    environment: &Environment,
+    mut input: impl Read,
+    input_is_terminal: bool,
+) -> Result<i32> {
+    let (layout, _snapshot, store) = current_session(environment)?;
+    let operation = SessionOperationLock::acquire(&store.session_dir())?;
+    if let Some(lease) = LeaseStore::new(&store.session_dir()).read()? {
+        if lease.host != host_name()? {
+            return Err(Error::InvalidState(format!(
+                "session lease {} belongs to host {}; explicit recovery is required",
+                lease.run_id, lease.host
+            )));
+        }
+        let supervisor_live = lease.supervisor.is_live()?;
+        let child_live = lease
+            .child
+            .as_ref()
+            .map(ProcessIdentity::is_live)
+            .transpose()?
+            .unwrap_or(false);
+        if supervisor_live || child_live {
+            return Err(Error::InvalidState(format!(
+                "cannot delete session with live run {}",
+                lease.run_id
+            )));
+        }
+    }
+    if !yes {
+        if !input_is_terminal {
+            return Err(Error::InvalidState(
+                "deletion requires a terminal confirmation or `sesh delete --yes`".into(),
+            ));
+        }
+        let short_id = store.id().to_string()[..8].to_owned();
+        eprintln!("Type `delete session {short_id}` to confirm:");
+        let mut bytes = Vec::new();
+        input
+            .by_ref()
+            .take(4097)
+            .read_to_end(&mut bytes)
+            .map_err(|source| io("stdin", source))?;
+        if bytes.len() > 4096 {
+            return Err(Error::InvalidState(
+                "deletion confirmation is too long".into(),
+            ));
+        }
+        let confirmation = std::str::from_utf8(&bytes)
+            .map_err(|_| Error::InvalidState("deletion confirmation is not UTF-8".into()))?
+            .trim();
+        if confirmation != format!("delete session {short_id}") {
+            return Err(Error::InvalidState(
+                "deletion confirmation did not match".into(),
+            ));
+        }
+    }
+
+    let session_dir = store.session_dir();
+    validate_owned_private_directory(&session_dir)?;
+    let deleting = layout.root().join(format!(".deleting-{}", store.id()));
+    match std::fs::symlink_metadata(&deleting) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => return Err(io(&deleting, source)),
+        Ok(_) => {
+            return Err(Error::InvalidState(format!(
+                "deletion staging path {} already exists",
+                deleting.display()
+            )));
+        }
+    }
+    std::fs::rename(&session_dir, &deleting).map_err(|source| io(&deleting, source))?;
+    sync_directory(&layout.sessions())?;
+    sync_directory(layout.root())?;
+    if let Err(error) = store.remove_binding() {
+        let rollback = std::fs::rename(&deleting, &session_dir)
+            .map_err(|source| io(&session_dir, source))
+            .and_then(|()| sync_directory(&layout.sessions()));
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(Error::InvalidState(format!(
+                "cannot remove worktree binding ({error}); rollback also failed ({rollback_error})"
+            ))),
+        };
+    }
+    remove_tree_without_following(&deleting)?;
+    sync_directory(layout.root())?;
+    drop(operation);
+    Ok(0)
+}
+
+fn current_session(environment: &Environment) -> Result<(StateLayout, GitSnapshot, SessionStore)> {
+    let cwd = std::env::current_dir().map_err(|source| io(".", source))?;
+    let layout = resolve_layout(environment, &cwd)?;
+    let snapshot = Git::new().snapshot(&cwd)?;
+    let store = SessionStore::find_for_worktree(&layout, &snapshot.identity)?
+        .ok_or_else(|| Error::InvalidState("this worktree has no Sesh session".into()))?;
+    Ok((layout, snapshot, store))
+}
+
+fn latest_checkpoint_value(store: &SessionStore, events: &[Event]) -> Result<serde_json::Value> {
+    let newest = events.iter().rev().find_map(|event| {
+        matches!(event.kind, EventKind::CheckpointCreated { .. }).then_some(event.sequence)
+    });
+    let reference = store.session_dir().join("refs/latest-checkpoint");
+    let sequence = match std::fs::symlink_metadata(&reference) {
+        Ok(_) => read_json::<u64>(&reference)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && newest.is_none() => {
+            return Ok(serde_json::Value::Null);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Error::InvalidState(
+                "latest checkpoint ref is missing".into(),
+            ));
+        }
+        Err(source) => return Err(io(&reference, source)),
+    };
+    if newest != Some(sequence) {
+        return Err(Error::InvalidState(format!(
+            "latest checkpoint ref is stale; expected {newest:?}, found {sequence}"
+        )));
+    }
+    let event = events
+        .iter()
+        .find(|event| event.sequence == sequence)
+        .ok_or_else(|| Error::InvalidState("latest checkpoint event is missing".into()))?;
+    let checkpoint = load_verified_checkpoint(&store.session_dir(), sequence)?;
+    let expected_path = format!("checkpoints/{sequence:012}.json");
+    match &event.kind {
+        EventKind::CheckpointCreated {
+            checkpoint_kind,
+            through_sequence,
+            path,
+        } if checkpoint_kind == &checkpoint.checkpoint_kind
+            && *through_sequence == checkpoint.through_sequence
+            && path == &expected_path => {}
+        _ => {
+            return Err(Error::InvalidState(
+                "latest checkpoint event and artifacts do not match".into(),
+            ));
+        }
+    }
+    Ok(serde_json::json!({
+        "sequence": sequence,
+        "kind": checkpoint.checkpoint_kind,
+        "through_sequence": checkpoint.through_sequence,
+        "path": expected_path,
+    }))
+}
+
+fn collect_blob_reference(
+    content: &ContentRef,
+    references: &mut BTreeMap<String, usize>,
+    blobs: &BlobStore,
+) -> Result<()> {
+    if let ContentRef::Blob { sha256, bytes } = content {
+        blobs.resolve(content)?;
+        if let Some(previous) = references.insert(sha256.clone(), *bytes) {
+            if previous != *bytes {
+                return Err(Error::InvalidState(format!(
+                    "blob {sha256} has conflicting recorded sizes"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn private_file_value(path: &Path) -> Result<serde_json::Value> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| io(path, source))?;
+    // SAFETY: geteuid has no preconditions and does not dereference pointers.
+    let effective_uid = unsafe { libc::geteuid() };
+    let mode = metadata.permissions().mode() & 0o777;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != effective_uid
+        || mode != 0o600
+    {
+        return Err(Error::InvalidState(format!(
+            "refusing insecure private file {}",
+            path.display()
+        )));
+    }
+    Ok(serde_json::json!({
+        "path": path,
+        "bytes": metadata.len(),
+        "mode": mode,
+        "uid": metadata.uid(),
+    }))
+}
+
+fn permission_value(path: &Path) -> Result<serde_json::Value> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| io(path, source))?;
+    if metadata.file_type().is_symlink() {
+        return Err(Error::InvalidState(format!(
+            "refusing symlinked state path {}",
+            path.display()
+        )));
+    }
+    // SAFETY: geteuid has no preconditions and does not dereference pointers.
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_uid {
+        return Err(Error::InvalidState(format!(
+            "state path {} has unexpected owner {}",
+            path.display(),
+            metadata.uid()
+        )));
+    }
+    Ok(serde_json::json!({
+        "path": path,
+        "kind": if metadata.is_dir() { "directory" } else { "file" },
+        "mode": metadata.permissions().mode() & 0o777,
+        "uid": metadata.uid(),
+    }))
+}
+
+fn validate_owned_private_directory(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| io(path, source))?;
+    // SAFETY: geteuid has no preconditions and does not dereference pointers.
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != effective_uid
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(Error::InvalidState(format!(
+            "refusing insecure session directory {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn remove_tree_without_following(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| io(path, source))?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        for entry in std::fs::read_dir(path).map_err(|source| io(path, source))? {
+            remove_tree_without_following(&entry.map_err(|source| io(path, source))?.path())?;
+        }
+        std::fs::remove_dir(path).map_err(|source| io(path, source))
+    } else {
+        std::fs::remove_file(path).map_err(|source| io(path, source))
+    }
+}
+
+fn write_projection(value: &serde_json::Value, compact: bool) -> Result<()> {
+    let mut bytes = if compact {
+        serde_json::to_vec(value)
+    } else {
+        serde_json::to_vec_pretty(value)
+    }
+    .map_err(|error| Error::InvalidState(format!("cannot encode JSON projection: {error}")))?;
+    bytes.push(b'\n');
+    std::io::stdout()
+        .write_all(&bytes)
+        .map_err(|source| io("stdout", source))
 }
 
 fn checkpoint_command(
