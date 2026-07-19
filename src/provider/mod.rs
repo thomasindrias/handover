@@ -34,6 +34,7 @@ pub trait ProviderAdapter: Send + Sync {
     fn provider(&self) -> Provider;
     fn launch_spec(&self, context: LaunchContext<'_>) -> Result<LaunchSpec>;
     fn setup(&self, integration_root: &Path) -> Result<()>;
+    fn verify(&self, integration_root: &Path) -> Result<()>;
     fn probe(&self) -> Result<String>;
 }
 
@@ -68,6 +69,18 @@ fn materialize_immutable(path: &Path, expected: &[u8]) -> Result<()> {
             }
         }
         Err(error) => Err(error),
+    }
+}
+
+fn verify_materialized(path: &Path, expected: &[u8]) -> Result<()> {
+    let actual = read_private(path)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(Error::InvalidState(format!(
+            "integration asset {} does not match this Sesh version",
+            path.display()
+        )))
     }
 }
 

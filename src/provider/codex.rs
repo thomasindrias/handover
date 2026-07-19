@@ -5,7 +5,7 @@ use crate::error::Result;
 use crate::model::Provider;
 use crate::provider::{
     LaunchContext, LaunchSpec, ProviderAdapter, base_environment, materialize_immutable,
-    probe_version,
+    probe_version, verify_materialized,
 };
 
 const OVERLAYS: [&str; 5] = [
@@ -50,6 +50,12 @@ impl ProviderAdapter for CodexAdapter {
         let mut contents = OVERLAYS.join("\n").into_bytes();
         contents.push(b'\n');
         materialize_immutable(&integration_root.join("codex/1/hooks.txt"), &contents)
+    }
+
+    fn verify(&self, integration_root: &Path) -> Result<()> {
+        let mut contents = OVERLAYS.join("\n").into_bytes();
+        contents.push(b'\n');
+        verify_materialized(&integration_root.join("codex/1/hooks.txt"), &contents)
     }
 
     fn probe(&self) -> Result<String> {

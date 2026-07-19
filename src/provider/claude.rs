@@ -5,7 +5,7 @@ use crate::error::Result;
 use crate::model::Provider;
 use crate::provider::{
     LaunchContext, LaunchSpec, ProviderAdapter, base_environment, materialize_immutable,
-    probe_version,
+    probe_version, verify_materialized,
 };
 
 const PLUGIN_JSON: &[u8] = include_bytes!("assets/claude-plugin.json");
@@ -43,6 +43,12 @@ impl ProviderAdapter for ClaudeAdapter {
         let version = integration_root.join("claude/1");
         materialize_immutable(&version.join(".claude-plugin/plugin.json"), PLUGIN_JSON)?;
         materialize_immutable(&version.join("hooks/hooks.json"), HOOKS_JSON)
+    }
+
+    fn verify(&self, integration_root: &Path) -> Result<()> {
+        let version = integration_root.join("claude/1");
+        verify_materialized(&version.join(".claude-plugin/plugin.json"), PLUGIN_JSON)?;
+        verify_materialized(&version.join("hooks/hooks.json"), HOOKS_JSON)
     }
 
     fn probe(&self) -> Result<String> {

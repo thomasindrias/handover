@@ -51,8 +51,19 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
+    Setup {
+        provider: Provider,
+    },
+    Doctor {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        repair: bool,
+    },
     #[command(name = "__hook", hide = true)]
-    Hook { provider: Provider },
+    Hook {
+        provider: Provider,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]

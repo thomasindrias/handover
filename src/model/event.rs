@@ -38,7 +38,14 @@ pub enum EventKind {
         signal: Option<i32>,
     },
     #[serde(rename = "run.recovered")]
-    RunRecovered { reason: String },
+    RunRecovered {
+        supervisor_pid: u32,
+        supervisor_start_token: String,
+        child_pid: Option<u32>,
+        child_start_token: Option<String>,
+        host: String,
+        reason: String,
+    },
     #[serde(rename = "cwd.changed")]
     CwdChanged { cwd_relative: std::path::PathBuf },
     #[serde(rename = "provider.prompt.submitted")]
