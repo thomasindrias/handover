@@ -4244,7 +4244,7 @@ rtk git commit -m "feat: switch providers without losing session state"
 - Create: `tests/read_commands.rs`
 - Create: `tests/delete_session.rs`
 
-- [ ] **Step 1: Write failing JSON contracts for status, log, and inspect**
+- [x] **Step 1: Write failing JSON contracts for status, log, and inspect**
 
 The tests create a session through the fake provider and assert:
 
@@ -4257,11 +4257,11 @@ sesh inspect --json  -> state root, session dir, event count, checkpoint files, 
 
 Use `serde_json::Value` assertions rather than complete string snapshots so paths remain portable.
 
-- [ ] **Step 2: Write a failing deletion safety test**
+- [x] **Step 2: Write a failing deletion safety test**
 
 Assert `sesh delete` without a TTY or `--yes` refuses, `sesh delete --yes` refuses a live lease, and successful deletion removes the worktree ref and entire session directory but leaves every repository/worktree byte unchanged.
 
-- [ ] **Step 3: Add CLI grammar and read-only projections**
+- [x] **Step 3: Add CLI grammar and read-only projections**
 
 Add:
 
@@ -4276,7 +4276,7 @@ At the top of app dispatch, if `SESH_RUN_ID` is present, allow only the hidden h
 
 Build each output only from verified events, current Git observation, refs, and lease state. Add `SessionStore::envelopes()` so JSON log output preserves checksums rather than reconstructing envelopes from bare events. Human output may be formatted, but JSON field names are a stable V1 contract. `inspect` must never print blob contents unless the user separately asks `log`; it reports hashes and sizes.
 
-- [ ] **Step 4: Implement complete-session deletion**
+- [x] **Step 4: Implement complete-session deletion**
 
 Deletion order:
 
@@ -4290,7 +4290,7 @@ Deletion order:
 
 If step 5 fails, rename the session directory back. Document that deletion is not forensic erasure.
 
-- [ ] **Step 5: Verify read and delete behavior**
+- [x] **Step 5: Verify read and delete behavior**
 
 Run:
 
@@ -4302,7 +4302,7 @@ rtk cargo clippy --all-targets --all-features -- -D warnings
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit inspection and deletion**
+- [x] **Step 6: Commit inspection and deletion**
 
 ```bash
 rtk git add src tests
