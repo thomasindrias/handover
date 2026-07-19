@@ -101,14 +101,14 @@ The public V1 commands are:
 ```text
 sesh run <claude|codex> [-- <provider flags>]
 sesh switch <claude|codex> [-- <provider flags>]
-sesh fork <claude|codex> [--branch <name>] [--path <path>] [-- <provider flags>]
+sesh fork <claude|codex> [--branch <name>] [--worktree <path>] [-- <provider flags>]
 sesh checkpoint [--format json] [--from-provider]
 sesh status [--json]
 sesh log [--from <sequence>] [--json]
 sesh inspect [--json]
 sesh delete [--yes]
 sesh setup <claude|codex>
-sesh doctor [--json]
+sesh doctor [--json] [--repair]
 ```
 
 `sesh run` creates a session bound to the current Git worktree, then launches
@@ -202,7 +202,14 @@ $SESH_HOME/
 ├── refs/
 │   └── worktrees/<sha256>.json
 ├── operations/
-│   └── <operation-id>.json
+│   └── <operation-id>/
+│       ├── operation.json
+│       ├── staged.patch
+│       ├── unstaged.patch
+│       ├── submodules.json
+│       └── untracked/
+│           ├── manifest.json
+│           └── blobs/sha256/<first-two>/<remaining-hash>
 └── sessions/
     └── <session-id>/
         ├── meta.json
@@ -236,9 +243,10 @@ Canonical V1 JSON requires repository, worktree, cwd, dirty, and symlink-target
 paths to be valid UTF-8. Sesh refuses an unsupported path before session or fork
 activation and never records a lossy replacement string.
 
-Blobs are scoped to a session rather than globally deduplicated. This makes
-complete session deletion understandable: deleting one session removes every
-blob owned by that session without a cross-session reference count.
+Canonical session blobs are scoped to a session rather than globally
+deduplicated. Fork-capture blobs are deduplicated only within their operation
+directory. This keeps complete deletion understandable without a cross-session
+or cross-operation reference count.
 
 The worktree ref key is a SHA-256 hash of the canonical Git common directory and
 worktree-specific Git directory. The ref value repeats both identities and the
@@ -543,27 +551,45 @@ the lease. The live lease prevents a second provider attachment.
 7. Apply the staged diff with index state.
 8. Apply the working-tree-versus-index diff unstaged.
 9. Copy untracked regular files and symlinks, preserving executable bits.
-10. Snapshot the source again; abort if it changed during duplication.
-11. Snapshot the target and compare staged, unstaged, untracked, type, mode, and
-    content hashes.
-12. Create a transition checkpoint in the parent, append `session.forked` to
-    the parent, create the child session with parent session and checkpoint
-    lineage, and atomically bind the target worktree ref to the child.
-13. Mark the operation complete and launch the requested provider through the
-    normal switch path.
+10. Reconstruct initialized clean submodules from proven local object stores,
+    with protocols disabled and no fetch; leave recorded uninitialized
+    submodules uninitialized.
+11. Snapshot the source again; abort if it changed during duplication.
+12. Snapshot the target and compare staged, unstaged, untracked, submodule,
+    type, mode, content hashes, and the complete cleanup inventory.
+13. Create a transition checkpoint in the parent, then stage an unbound child
+    session containing only child creation facts and explicit parent lineage.
+14. Append `session.forked` to the parent. This verified parent event is the
+    transaction commit point; the operation then enters `lineage_committed`.
+15. Bind the target worktree ref byte-identically to the child, prepare the
+    inherited handoff and run lease, mark the operation complete, and launch the
+    requested provider.
+
+The durable phases are `prepared`, `artifacts_captured`, `worktree_created`,
+`staged_applied`, `unstaged_applied`, `untracked_copied`, `verified`,
+`child_staged`, `lineage_committed`, `child_bound`, `run_leased`, and
+`complete`. `rolled_back` and `needs_manual_recovery` are terminal outcomes.
 
 The default branch is `sesh/<repository-name>-<short-id>`. Repository names are
 sanitized and validated with Git's ref rules. The default worktree is
 a sibling named `<repository>-sesh-<short-id>`. Both are overrideable.
 
-Ignored files are excluded. A dirty submodule, sparse-checkout state that cannot
-be reproduced, FIFO, socket, device, or other unsupported file type causes a
-clear refusal before child-session activation.
+Ignored files are excluded. A dirty submodule, sparse checkout, unmerged entry,
+intent-to-add entry, staged gitlink, FIFO, socket, device, non-UTF-8 required
+path, or other unsupported file type causes a clear refusal before
+child-session activation. Clean initialized submodules are local-only in V1:
+the target is seeded from the exact source object directory and no network
+transport is permitted.
 
-On a synchronous failure, Sesh rolls back only artifacts whose fingerprints
-prove they are unchanged Sesh-created intermediates. After a crash, it never
-silently deletes a target worktree. `sesh doctor` reports the operation journal
-and an exact cleanup command.
+Before the parent commit event, a synchronous failure rolls back only artifacts
+whose durable fingerprint or same-process mutation proof establishes that they
+are unchanged Sesh-created intermediates. Ephemeral proof is never reconstructed
+after a crash. Once the parent event exists, recovery is forward-only: Sesh
+never removes the target, branch, or staged child. `sesh doctor` reports the
+operation ID, phase, source session, target and branch plus a shell-escaped Git
+inspection command. `doctor --repair` may finish only a byte-identical
+post-commit child binding and operation phase; it never deletes a crash-left
+worktree or branch.
 
 ## Concurrency and Failure Model
 
@@ -608,9 +634,11 @@ append-only integrity and can leave secret copies in checkpoint or blob history.
 
 Fork artifacts and child run handoffs can contain parent-session content. Sesh
 therefore refuses parent deletion while child sessions remain, deletes children
-first, and removes terminal operation artifacts with the parent session. Git
-worktrees and branches remain source-code state and are never deleted by session
-deletion.
+first, refuses deletion while an operation naming the session is nonterminal,
+and removes terminal source-operation artifacts with the parent session. The
+session and matching operation directories are renamed as one deletion staging
+set; a staging or ref-removal failure restores every rename. Git worktrees and
+branches remain source-code state and are never deleted by session deletion.
 
 Adapters add only the per-run checkpoint inbox to provider writable roots;
 canonical storage is not added as a workspace. Hook subprocesses perform

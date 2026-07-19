@@ -1358,37 +1358,181 @@ fn delete_command(
         }
     }
 
+    let child_ids = child_sessions(&layout, store.id())?;
+    if !child_ids.is_empty() {
+        return Err(Error::InvalidState(format!(
+            "cannot delete parent session {} while child sessions remain; delete children first: {}",
+            store.id(),
+            child_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    let terminal_operations = terminal_operations_for_deletion(&layout, store.id())?;
     let session_dir = store.session_dir();
     validate_owned_private_directory(&session_dir)?;
-    let deleting = layout.root().join(format!(".deleting-{}", store.id()));
-    match std::fs::symlink_metadata(&deleting) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(source) => return Err(io(&deleting, source)),
-        Ok(_) => {
-            return Err(Error::InvalidState(format!(
-                "deletion staging path {} already exists",
-                deleting.display()
-            )));
+    let deletion_id = uuid::Uuid::new_v4();
+    let mut renames = vec![(
+        session_dir.clone(),
+        layout
+            .sessions()
+            .join(format!(".deleting-{}-{deletion_id}", store.id())),
+    )];
+    for operation_dir in terminal_operations {
+        let name = operation_dir
+            .file_name()
+            .expect("operation directory has a basename")
+            .to_string_lossy()
+            .into_owned();
+        renames.push((
+            operation_dir,
+            layout
+                .operations()
+                .join(format!(".deleting-{name}-{deletion_id}")),
+        ));
+    }
+    for (_, deleting) in &renames {
+        match std::fs::symlink_metadata(deleting) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io(deleting, source)),
+            Ok(_) => {
+                return Err(Error::InvalidState(format!(
+                    "deletion staging path {} already exists",
+                    deleting.display()
+                )));
+            }
         }
     }
-    std::fs::rename(&session_dir, &deleting).map_err(|source| io(&deleting, source))?;
-    sync_directory(&layout.sessions())?;
-    sync_directory(layout.root())?;
-    if let Err(error) = store.remove_binding() {
-        let rollback = std::fs::rename(&deleting, &session_dir)
-            .map_err(|source| io(&session_dir, source))
-            .and_then(|()| sync_directory(&layout.sessions()));
-        return match rollback {
-            Ok(()) => Err(error),
-            Err(rollback_error) => Err(Error::InvalidState(format!(
-                "cannot remove worktree binding ({error}); rollback also failed ({rollback_error})"
-            ))),
-        };
+    let mut renamed = Vec::new();
+    for (original, deleting) in &renames {
+        if let Err(source) = std::fs::rename(original, deleting) {
+            let error = io(deleting, source);
+            return Err(with_rename_rollback(error, &renamed));
+        }
+        renamed.push((original.clone(), deleting.clone()));
+        if let Some(parent) = original.parent()
+            && let Err(error) = sync_directory(parent)
+        {
+            return Err(with_rename_rollback(error, &renamed));
+        }
     }
-    remove_tree_without_following(&deleting)?;
-    sync_directory(layout.root())?;
+    if let Err(error) = store.remove_binding() {
+        return Err(with_rename_rollback(error, &renamed));
+    }
+    for (_, deleting) in &renamed {
+        remove_tree_without_following(deleting)?;
+        sync_directory(
+            deleting
+                .parent()
+                .expect("deletion staging path has a parent"),
+        )?;
+    }
     drop(operation);
     Ok(0)
+}
+
+fn child_sessions(layout: &StateLayout, parent_id: &SessionId) -> Result<Vec<SessionId>> {
+    let mut children = Vec::new();
+    let entries =
+        std::fs::read_dir(layout.sessions()).map_err(|source| io(layout.sessions(), source))?;
+    for entry in entries {
+        let entry = entry.map_err(|source| io(layout.sessions(), source))?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            Error::InvalidState(format!(
+                "session directory name at {} is not UTF-8",
+                entry.path().display()
+            ))
+        })?;
+        let id = SessionId::parse(name).map_err(|error| {
+            Error::InvalidState(format!("invalid session directory {name:?}: {error}"))
+        })?;
+        let session = SessionStore::open(layout, id.clone())?;
+        if session.meta().parent_session_id.as_ref() == Some(parent_id) {
+            children.push(id);
+        }
+    }
+    children.sort_by_key(ToString::to_string);
+    Ok(children)
+}
+
+fn terminal_operations_for_deletion(
+    layout: &StateLayout,
+    session_id: &SessionId,
+) -> Result<Vec<PathBuf>> {
+    let mut terminal = Vec::new();
+    let mut blocking = Vec::new();
+    let entries =
+        std::fs::read_dir(layout.operations()).map_err(|source| io(layout.operations(), source))?;
+    for entry in entries {
+        let entry = entry.map_err(|source| io(layout.operations(), source))?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            Error::InvalidState(format!(
+                "fork operation directory name at {} is not UTF-8",
+                entry.path().display()
+            ))
+        })?;
+        let id = crate::model::OperationId::parse(name).map_err(|error| {
+            Error::InvalidState(format!(
+                "invalid fork operation directory {name:?}: {error}"
+            ))
+        })?;
+        let fork_store = ForkOperationStore::open(layout, id.clone())?;
+        let fork = fork_store.operation()?;
+        let names_session = &fork.source_session_id == session_id
+            || fork.child_session_id.as_ref() == Some(session_id);
+        let complete = matches!(
+            fork.phase,
+            ForkPhase::Complete | ForkPhase::RolledBack | ForkPhase::NeedsManualRecovery
+        );
+        if names_session && !complete {
+            blocking.push(id);
+        } else if &fork.source_session_id == session_id && complete {
+            terminal.push(fork_store.operation_dir());
+        }
+    }
+    if !blocking.is_empty() {
+        blocking.sort_by_key(ToString::to_string);
+        return Err(Error::InvalidState(format!(
+            "cannot delete session {session_id} while fork operations are nonterminal: {}",
+            blocking
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    terminal.sort();
+    Ok(terminal)
+}
+
+fn with_rename_rollback(error: Error, renamed: &[(PathBuf, PathBuf)]) -> Error {
+    let mut failures = Vec::new();
+    for (original, deleting) in renamed.iter().rev() {
+        if let Err(source) = std::fs::rename(deleting, original) {
+            failures.push(io(original, source).to_string());
+        }
+    }
+    for parent in renamed
+        .iter()
+        .filter_map(|(original, _)| original.parent())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        if let Err(sync_error) = sync_directory(parent) {
+            failures.push(sync_error.to_string());
+        }
+    }
+    if failures.is_empty() {
+        error
+    } else {
+        Error::InvalidState(format!(
+            "deletion failed ({error}); rename rollback also failed ({})",
+            failures.join("; ")
+        ))
+    }
 }
 
 fn current_session(environment: &Environment) -> Result<(StateLayout, GitSnapshot, SessionStore)> {
@@ -2047,7 +2191,10 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{command_facts, latest_narrative_checkpoint, recover_stale_lease};
+    use super::{
+        command_facts, latest_narrative_checkpoint, recover_stale_lease, with_rename_rollback,
+    };
+    use crate::error::Error;
     use crate::model::{
         CheckpointAuthor, ContentRef, EventKind, GitSnapshot, NarrativeInput, Provider, RunId,
         SessionId, WorktreeIdentity,
@@ -2243,6 +2390,43 @@ mod tests {
         );
         assert_eq!(gaps.len(), 1);
         assert_eq!(gaps[0].sequence, commands[0].sequence);
+    }
+
+    #[test]
+    fn deletion_rename_rollback_restores_every_staged_directory() {
+        let temp = TempDir::new().unwrap();
+        let sessions = temp.path().join("sessions");
+        let operations = temp.path().join("operations");
+        std::fs::create_dir(&sessions).unwrap();
+        std::fs::create_dir(&operations).unwrap();
+        let originals = [
+            sessions.join("session"),
+            operations.join("one"),
+            operations.join("two"),
+        ];
+        let renamed = originals
+            .iter()
+            .enumerate()
+            .map(|(index, original)| {
+                std::fs::create_dir(original).unwrap();
+                let deleting = original
+                    .parent()
+                    .unwrap()
+                    .join(format!(".deleting-{index}"));
+                std::fs::rename(original, &deleting).unwrap();
+                (original.clone(), deleting)
+            })
+            .collect::<Vec<_>>();
+
+        let error =
+            with_rename_rollback(Error::InvalidState("injected ref failure".into()), &renamed);
+
+        assert!(error.to_string().contains("injected ref failure"));
+        assert!(
+            renamed
+                .iter()
+                .all(|(original, deleting)| original.exists() && !deleting.exists())
+        );
     }
 
     fn store_fixture() -> (TempDir, SessionStore) {

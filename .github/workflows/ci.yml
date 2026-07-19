@@ -18,4 +18,6 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets --all-features
+      - run: cargo test --test north_star -- --nocapture
+      - run: cargo test --test fork_north_star -- --nocapture
       - run: cargo doc --no-deps

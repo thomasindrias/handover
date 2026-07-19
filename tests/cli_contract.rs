@@ -52,3 +52,18 @@ fn implemented_commands_are_visible_and_internal_hooks_are_hidden() {
     );
     assert!(!help.contains("__hook"));
 }
+
+#[test]
+fn switch_and_run_never_advertise_an_implicit_copy_flag() {
+    for command in ["run", "switch"] {
+        let output = cargo_bin_cmd!("sesh")
+            .args([command, "--help"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let help = String::from_utf8(output.stdout).unwrap();
+        assert!(!help.contains("--clone"), "{command} help:\n{help}");
+        assert!(!help.contains("--worktree"), "{command} help:\n{help}");
+        assert!(!help.contains("--branch"), "{command} help:\n{help}");
+    }
+}
