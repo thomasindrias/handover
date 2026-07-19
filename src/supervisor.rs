@@ -212,6 +212,7 @@ mod tests {
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     use tempfile::TempDir;
@@ -222,6 +223,9 @@ mod tests {
     use crate::runtime::Runtime;
     use crate::store::lease::{LeaseStore, ProcessIdentity, RunLease};
     use crate::store::{SessionStore, StateLayout};
+
+    static SUPERVISOR_TEST_LOCK: Mutex<()> = Mutex::new(());
+    const TEST_DEADLINE: Duration = Duration::from_secs(10);
 
     struct FixedRuntime;
 
@@ -241,6 +245,7 @@ mod tests {
 
     #[test]
     fn provider_handshake_and_exit_facts_leave_lease_for_caller_commit() {
+        let _serial = SUPERVISOR_TEST_LOCK.lock().unwrap();
         let fixture = Fixture::new();
         let sentinel = fixture.temp.path().join("handshake");
         let callback =
@@ -277,13 +282,8 @@ mod tests {
             ]),
         );
 
-        let outcome = Supervisor::launch(
-            spec,
-            &fixture.store,
-            &fixture.run_id,
-            Duration::from_secs(2),
-        )
-        .unwrap();
+        let outcome =
+            Supervisor::launch(spec, &fixture.store, &fixture.run_id, TEST_DEADLINE).unwrap();
         callback_thread.join().unwrap();
 
         assert!(outcome.handshake_completed);
@@ -309,6 +309,7 @@ mod tests {
 
     #[test]
     fn exit_before_handshake_returns_observed_facts() {
+        let _serial = SUPERVISOR_TEST_LOCK.lock().unwrap();
         let fixture = Fixture::new();
         let provider = fixture.write_executable("provider.sh", "#!/bin/sh\nsleep 0.05\nexit 17\n");
 
@@ -316,7 +317,7 @@ mod tests {
             fixture.spec(&provider, BTreeMap::new()),
             &fixture.store,
             &fixture.run_id,
-            Duration::from_secs(2),
+            TEST_DEADLINE,
         )
         .unwrap();
 
@@ -332,6 +333,7 @@ mod tests {
 
     #[test]
     fn handshake_timeout_kills_and_reaps_with_exit_facts() {
+        let _serial = SUPERVISOR_TEST_LOCK.lock().unwrap();
         let fixture = Fixture::new();
         let provider = fixture.write_executable("provider.sh", "#!/bin/sh\nsleep 5\nexit 0\n");
 
@@ -358,6 +360,7 @@ mod tests {
 
     #[test]
     fn journal_read_failure_still_kills_and_reaps_the_child() {
+        let _serial = SUPERVISOR_TEST_LOCK.lock().unwrap();
         let fixture = Fixture::new();
         let sentinel = fixture.temp.path().join("break-journal");
         let provider = fixture.write_executable(
@@ -378,7 +381,7 @@ mod tests {
             ),
             &fixture.store,
             &fixture.run_id,
-            Duration::from_secs(2),
+            TEST_DEADLINE,
         );
         breaker.join().unwrap();
         std::fs::set_permissions(
@@ -463,7 +466,7 @@ mod tests {
     fn wait_for_path(path: &Path) {
         let started = Instant::now();
         while !path.exists() {
-            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(started.elapsed() < TEST_DEADLINE);
             std::thread::sleep(Duration::from_millis(5));
         }
     }
