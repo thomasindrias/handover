@@ -248,7 +248,7 @@ rtk git commit -m "feat: add safe worktree fork preflight"
 - Modify: `src/lib.rs`
 - Create: `tests/fork_transaction.rs`
 
-- [ ] **Step 1: Write failing operation-schema and mutation-detection tests**
+- [x] **Step 1: Write failing operation-schema and mutation-detection tests**
 
 Add serialization tests proving an operation record round-trips and rejects an unknown schema version. Add a capture test with a test-only boundary callback that changes a staged-and-unstaged file after artifacts are written but before the second fingerprint. Assert capture returns `source changed during fork capture`, no target exists, and the operation phase is `rolled_back` with `target_created: false`; retained operation artifacts are diagnostic data outside the repository.
 
@@ -275,13 +275,13 @@ pub enum ForkPhase {
 }
 ```
 
-- [ ] **Step 2: Run tests and verify operation types are absent**
+- [x] **Step 2: Run tests and verify operation types are absent**
 
 Run: `rtk cargo test --test fork_transaction operation`
 
 Expected: FAIL with unresolved operation and fingerprint types.
 
-- [ ] **Step 3: Define the inspectable operation model**
+- [x] **Step 3: Define the inspectable operation model**
 
 Create `src/model/fork.rs`:
 
@@ -339,7 +339,7 @@ pub struct ForkOperation {
 
 Paths in JSON are repository-relative where possible and validated as UTF-8 by core V1. The untracked manifest is a separate sorted `Vec<UntrackedEntry>` at `operations/<id>/untracked/manifest.json`.
 
-- [ ] **Step 4: Implement atomic operation transitions**
+- [x] **Step 4: Implement atomic operation transitions**
 
 Create `ForkOperationStore` in `src/fork.rs` with:
 
@@ -370,7 +370,7 @@ target_cleanup_inventory_sha256 is present whenever target_created is true
 
 Sync the operation directory after every transition. Never infer a phase from which files happen to exist.
 
-- [ ] **Step 5: Implement semantic fingerprints and immutable capture**
+- [x] **Step 5: Implement semantic fingerprints and immutable capture**
 
 In `src/git/fingerprint.rs`, use these exact argument-vector commands:
 
@@ -399,7 +399,7 @@ Every artifact uses immutable private create and is fsynced. Regular untracked c
 
 Do not hash the raw `.git/index` file: Git may legitimately refresh stat-cache bytes without changing staged content. `git ls-files --stage -z` is the stable index semantic fingerprint.
 
-- [ ] **Step 6: Verify capture determinism and source invariance**
+- [x] **Step 6: Verify capture determinism and source invariance**
 
 Add tests that capture twice from equivalent repositories at different absolute paths and assert patch hashes plus relative manifests match. Include binary bytes, an executable, a symlink, a nested untracked file, staged-and-unstaged edits to the same path, a deletion, and a rename. Fingerprint the source working files and `git ls-files --stage -z` before and after capture and assert equality.
 
@@ -413,7 +413,7 @@ rtk cargo clippy --all-targets --all-features -- -D warnings
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit operation capture**
+- [x] **Step 7: Commit operation capture**
 
 ```bash
 rtk git add src tests/fork_transaction.rs

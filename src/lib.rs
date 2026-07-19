@@ -3,6 +3,7 @@ pub mod checkpoint;
 pub mod cli;
 pub mod doctor;
 pub mod error;
+pub mod fork;
 pub mod git;
 pub mod handoff;
 pub mod model;
