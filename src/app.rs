@@ -1,15 +1,18 @@
 use std::ffi::{OsStr, OsString};
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::cli::{Cli, Command};
+use crate::checkpoint::{
+    edit_narrative, promote_inbox, read_narrative_json, submit_provider_narrative,
+};
+use crate::cli::{CheckpointFormat, Cli, Command};
 use crate::error::{Error, Result, io};
 use crate::git::Git;
-use crate::model::{ContentRef, EventKind, Provider, RunId, SessionId};
+use crate::model::{CheckpointAuthor, ContentRef, EventKind, Provider, RunId, SessionId};
 use crate::provider::hook::{
     HookEvent, HookOutput, NormalizedHook, capture_failure_output, normalize, session_start_output,
 };
@@ -31,6 +34,21 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
             provider,
             provider_args,
         } => run_command(provider, provider_args, environment, runtime),
+        Command::Checkpoint {
+            format,
+            from_provider,
+        } => {
+            let stdin = std::io::stdin();
+            let input_is_terminal = stdin.is_terminal();
+            checkpoint_command(
+                format,
+                from_provider,
+                environment,
+                runtime,
+                stdin.lock(),
+                input_is_terminal,
+            )
+        }
         Command::Hook { provider } => {
             let output = ingest_hook(provider, environment, runtime, std::io::stdin().lock())?;
             std::io::stdout()
@@ -135,6 +153,7 @@ pub fn run_command(
             Some(error.to_string()),
         ),
     };
+    promote_inbox(&store, runtime, &run_id, provider, &run_paths.checkpoints)?;
     store.append(
         runtime,
         Some(run_id.clone()),
@@ -160,6 +179,39 @@ pub fn run_command(
     Ok(facts
         .exit_code
         .unwrap_or_else(|| 128 + facts.signal.unwrap_or(1)))
+}
+
+fn checkpoint_command(
+    _format: CheckpointFormat,
+    from_provider: bool,
+    environment: &Environment,
+    runtime: &dyn Runtime,
+    input: impl Read,
+    input_is_terminal: bool,
+) -> Result<i32> {
+    if from_provider {
+        let narrative = read_narrative_json(input)?;
+        submit_provider_narrative(environment, &narrative)?;
+        return Ok(0);
+    }
+    if environment.get("SESH_RUN_ID").is_some() {
+        return Err(Error::InvalidState(
+            "an attached provider must use `sesh checkpoint --format json --from-provider`".into(),
+        ));
+    }
+    let cwd = std::env::current_dir().map_err(|source| io(".", source))?;
+    let layout = resolve_layout(environment, &cwd)?;
+    let snapshot = Git::new().snapshot(&cwd)?;
+    let store = SessionStore::find_for_worktree(&layout, &snapshot.identity)?
+        .ok_or_else(|| Error::InvalidState("this worktree has no Sesh session".into()))?;
+    let _operation = SessionOperationLock::acquire(&store.session_dir())?;
+    let narrative = if input_is_terminal {
+        edit_narrative(layout.root(), environment)?
+    } else {
+        read_narrative_json(input)?
+    };
+    store.create_narrative_checkpoint(runtime, None, None, CheckpointAuthor::Human, narrative)?;
+    Ok(0)
 }
 
 pub fn ingest_hook(
@@ -222,6 +274,12 @@ fn ingest_hook_inner(
             "provider hook does not match the active run lease".into(),
         ));
     }
+    let checkpoint_inbox = store
+        .session_dir()
+        .join(format!("runs/{run_id}/inbox/checkpoints"));
+    let checkpoint_operation = SessionOperationLock::acquire(&store.session_dir())?;
+    promote_inbox(&store, runtime, &run_id, provider, &checkpoint_inbox)?;
+    drop(checkpoint_operation);
     let cwd_relative = cwd
         .strip_prefix(&store.meta().worktree.worktree)
         .map_err(|_| Error::InvalidState("provider hook cwd is outside the bound worktree".into()))?
