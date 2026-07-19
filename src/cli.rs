@@ -33,6 +33,24 @@ pub enum Command {
         #[arg(long)]
         from_provider: bool,
     },
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Log {
+        #[arg(long)]
+        from: Option<u64>,
+        #[arg(long)]
+        json: bool,
+    },
+    Inspect {
+        #[arg(long)]
+        json: bool,
+    },
+    Delete {
+        #[arg(long)]
+        yes: bool,
+    },
     #[command(name = "__hook", hide = true)]
     Hook { provider: Provider },
 }

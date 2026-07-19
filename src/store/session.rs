@@ -6,8 +6,8 @@ use time::format_description::well_known::Rfc3339;
 use crate::checkpoint::{CheckpointService, StoredCheckpoint};
 use crate::error::{Error, Result, io};
 use crate::model::{
-    CheckpointAuthor, CheckpointKind, Event, EventKind, GitSnapshot, NarrativeInput, Provider,
-    RunId, SessionId, SessionMeta, WorktreeIdentity, WorktreeRef,
+    CheckpointAuthor, CheckpointKind, Event, EventEnvelope, EventKind, GitSnapshot, NarrativeInput,
+    Provider, RunId, SessionId, SessionMeta, WorktreeIdentity, WorktreeRef,
 };
 use crate::runtime::Runtime;
 use crate::store::StateLayout;
@@ -157,9 +157,12 @@ impl SessionStore {
     }
 
     pub fn events(&self) -> Result<Vec<Event>> {
-        EventJournal::new(&self.session_dir(), self.meta.id.clone())
-            .read_repair()
+        self.envelopes()
             .map(|items| items.into_iter().map(|item| item.event).collect())
+    }
+
+    pub fn envelopes(&self) -> Result<Vec<EventEnvelope>> {
+        EventJournal::new(&self.session_dir(), self.meta.id.clone()).read_repair()
     }
 
     pub fn saved_cwd_relative(&self) -> Result<PathBuf> {
