@@ -90,6 +90,10 @@ impl ForkOperationStore {
         &self.id
     }
 
+    pub fn operation(&self) -> Result<ForkOperation> {
+        self.read_current()
+    }
+
     fn read_current(&self) -> Result<ForkOperation> {
         validate_private_operation_dir(&self.operation_dir(), &self.id)?;
         let operation: ForkOperation = read_json(&self.operation_dir().join("operation.json"))?;

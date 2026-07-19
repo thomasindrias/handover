@@ -1,11 +1,20 @@
+use std::collections::BTreeSet;
 use std::ffi::OsString;
+use std::io::Write;
 use std::os::unix::ffi::OsStringExt;
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt, symlink};
+use std::path::{Component, Path, PathBuf};
 
-use crate::error::{Error, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::error::{Error, Result, io};
+use crate::fork::ForkOperationStore;
 use crate::git::command::GitCommand;
+use crate::git::fingerprint::{SubmoduleEntry, canonical_json, capture};
 use crate::git::observe;
-use crate::model::{GitSnapshot, Provider};
+use crate::model::{ForkPhase, GitSnapshot, Provider, UntrackedEntry, UntrackedKind};
+use crate::store::atomic::{read_private, sync_directory};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ForkRequest {
@@ -402,4 +411,860 @@ fn sanitize_branch_component(value: &str) -> String {
     } else {
         sanitized
     }
+}
+
+pub fn materialize(
+    store: &ForkOperationStore,
+    source_cwd: &Path,
+    mut boundary: impl FnMut(ForkPhase) -> Result<()>,
+) -> Result<crate::model::ForkOperation> {
+    let command = GitCommand;
+    let operation = store.operation()?;
+    if operation.phase != ForkPhase::ArtifactsCaptured {
+        return Err(Error::InvalidState(format!(
+            "fork materialization requires artifacts_captured, found {:?}",
+            operation.phase
+        )));
+    }
+    let source_fingerprint = operation.source_fingerprint.as_ref().ok_or_else(|| {
+        Error::InvalidState("fork operation is missing its source fingerprint".into())
+    })?;
+    let current_source = capture(&command, source_cwd)?;
+    if &current_source.fingerprint != source_fingerprint {
+        return Err(Error::InvalidState(
+            "source changed before fork materialization".into(),
+        ));
+    }
+    let expected_source = observe::snapshot(&command, source_cwd)?;
+    if !expected_source
+        .identity
+        .same_worktree_as(&operation.source_worktree)
+    {
+        return Err(Error::InvalidState(
+            "fork materialization source does not match its operation".into(),
+        ));
+    }
+    let (staged_patch, unstaged_patch) = verified_patches(store, source_fingerprint)?;
+    let untracked = verified_untracked_manifest(store, source_fingerprint)?;
+    let submodules = verified_submodule_manifest(store, source_fingerprint)?;
+
+    command.output(
+        &expected_source.identity.worktree,
+        [
+            OsString::from("worktree"),
+            OsString::from("add"),
+            OsString::from("-b"),
+            OsString::from(&operation.target_branch),
+            operation.target_worktree.as_os_str().to_os_string(),
+            OsString::from(&operation.target_head),
+        ],
+    )?;
+    let target_root = operation.target_worktree.canonicalize().map_err(|source| {
+        Error::InvalidState(format!(
+            "cannot canonicalize target worktree {}: {source}",
+            operation.target_worktree.display()
+        ))
+    })?;
+    verify_target_identity(&command, &expected_source, &operation, &target_root)?;
+    let mut inventory = capture_inventory(&target_root)?;
+    verify_allowed_inventory(&command, &target_root, &inventory, None, &[], &[])?;
+    let mut target_fingerprint = capture(&command, &target_root)?.fingerprint;
+    verify_semantic_layer(
+        &command,
+        &target_root,
+        &operation.target_branch,
+        &expected_source,
+        SemanticLayer::Clean,
+    )?;
+    store.transition(
+        ForkPhase::ArtifactsCaptured,
+        ForkPhase::WorktreeCreated,
+        |record| {
+            record.branch_created = true;
+            record.target_created = true;
+            record.target_fingerprint = Some(target_fingerprint.clone());
+            record.target_cleanup_inventory_sha256 = Some(inventory.sha256.clone());
+        },
+    )?;
+    boundary(ForkPhase::WorktreeCreated)?;
+
+    require_unchanged_target(&command, &target_root, &target_fingerprint, &inventory)?;
+    apply_patch(
+        &command,
+        &target_root,
+        &staged_patch,
+        &source_fingerprint.staged_patch_sha256,
+        true,
+    )?;
+    let next_inventory = capture_inventory(&target_root)?;
+    verify_allowed_inventory(
+        &command,
+        &target_root,
+        &next_inventory,
+        Some(&inventory),
+        &[],
+        &[],
+    )?;
+    inventory = next_inventory;
+    target_fingerprint = capture(&command, &target_root)?.fingerprint;
+    verify_semantic_layer(
+        &command,
+        &target_root,
+        &operation.target_branch,
+        &expected_source,
+        SemanticLayer::Staged,
+    )?;
+    store.transition(
+        ForkPhase::WorktreeCreated,
+        ForkPhase::StagedApplied,
+        |record| {
+            record.target_fingerprint = Some(target_fingerprint.clone());
+            record.target_cleanup_inventory_sha256 = Some(inventory.sha256.clone());
+        },
+    )?;
+    boundary(ForkPhase::StagedApplied)?;
+
+    require_unchanged_target(&command, &target_root, &target_fingerprint, &inventory)?;
+    apply_patch(
+        &command,
+        &target_root,
+        &unstaged_patch,
+        &source_fingerprint.unstaged_patch_sha256,
+        false,
+    )?;
+    let next_inventory = capture_inventory(&target_root)?;
+    verify_allowed_inventory(
+        &command,
+        &target_root,
+        &next_inventory,
+        Some(&inventory),
+        &[],
+        &[],
+    )?;
+    inventory = next_inventory;
+    target_fingerprint = capture(&command, &target_root)?.fingerprint;
+    verify_semantic_layer(
+        &command,
+        &target_root,
+        &operation.target_branch,
+        &expected_source,
+        SemanticLayer::Unstaged,
+    )?;
+    store.transition(
+        ForkPhase::StagedApplied,
+        ForkPhase::UnstagedApplied,
+        |record| {
+            record.target_fingerprint = Some(target_fingerprint.clone());
+            record.target_cleanup_inventory_sha256 = Some(inventory.sha256.clone());
+        },
+    )?;
+    boundary(ForkPhase::UnstagedApplied)?;
+
+    require_unchanged_target(&command, &target_root, &target_fingerprint, &inventory)?;
+    restore_untracked(store, &target_root, &untracked)?;
+    restore_submodules(
+        &command,
+        &expected_source.identity.worktree,
+        &target_root,
+        &submodules,
+    )?;
+    let next_inventory = capture_inventory(&target_root)?;
+    verify_allowed_inventory(
+        &command,
+        &target_root,
+        &next_inventory,
+        Some(&inventory),
+        &untracked,
+        &submodules,
+    )?;
+    inventory = next_inventory;
+    target_fingerprint = capture(&command, &target_root)?.fingerprint;
+    verify_semantic_layer(
+        &command,
+        &target_root,
+        &operation.target_branch,
+        &expected_source,
+        SemanticLayer::Complete,
+    )?;
+    store.transition(
+        ForkPhase::UnstagedApplied,
+        ForkPhase::UntrackedCopied,
+        |record| {
+            record.target_fingerprint = Some(target_fingerprint.clone());
+            record.target_cleanup_inventory_sha256 = Some(inventory.sha256.clone());
+        },
+    )?;
+    boundary(ForkPhase::UntrackedCopied)?;
+
+    let fresh_source = capture(&command, source_cwd)?;
+    if &fresh_source.fingerprint != source_fingerprint {
+        return Err(Error::InvalidState(
+            "source changed during fork materialization".into(),
+        ));
+    }
+    verify_saved_cwd(&target_root, &operation.source_worktree.cwd_relative)?;
+    let fresh_target = capture(&command, &target_root)?.fingerprint;
+    let final_inventory = capture_inventory(&target_root)?;
+    if fresh_target != target_fingerprint || final_inventory != inventory {
+        return Err(Error::InvalidState(
+            "target changed during fork verification".into(),
+        ));
+    }
+    let verified = store.transition(ForkPhase::UntrackedCopied, ForkPhase::Verified, |record| {
+        record.target_fingerprint = Some(fresh_target);
+        record.target_cleanup_inventory_sha256 = Some(final_inventory.sha256);
+    })?;
+    boundary(ForkPhase::Verified)?;
+    Ok(verified)
+}
+
+fn verified_patches(
+    store: &ForkOperationStore,
+    fingerprint: &crate::model::ForkFingerprint,
+) -> Result<(PathBuf, PathBuf)> {
+    let staged = store.operation_dir().join("staged.patch");
+    let unstaged = store.operation_dir().join("unstaged.patch");
+    let staged_bytes = read_private(&staged)?;
+    let unstaged_bytes = read_private(&unstaged)?;
+    if sha256(&staged_bytes) != fingerprint.staged_patch_sha256
+        || sha256(&unstaged_bytes) != fingerprint.unstaged_patch_sha256
+    {
+        return Err(Error::InvalidState(
+            "immutable fork patch does not match its fingerprint".into(),
+        ));
+    }
+    Ok((staged, unstaged))
+}
+
+fn verified_untracked_manifest(
+    store: &ForkOperationStore,
+    fingerprint: &crate::model::ForkFingerprint,
+) -> Result<Vec<UntrackedEntry>> {
+    let bytes = read_private(&store.operation_dir().join("untracked/manifest.json"))?;
+    if sha256(&bytes) != fingerprint.untracked_manifest_sha256 {
+        return Err(Error::InvalidState(
+            "untracked manifest does not match its fingerprint".into(),
+        ));
+    }
+    let entries: Vec<UntrackedEntry> = decode_canonical_json(&bytes, "untracked manifest")?;
+    let mut previous: Option<&Path> = None;
+    for entry in &entries {
+        entry.validate()?;
+        if previous.is_some_and(|path| path >= entry.path.as_path()) {
+            return Err(Error::InvalidState(
+                "untracked manifest is not strictly path-sorted".into(),
+            ));
+        }
+        previous = Some(&entry.path);
+    }
+    Ok(entries)
+}
+
+fn verified_submodule_manifest(
+    store: &ForkOperationStore,
+    fingerprint: &crate::model::ForkFingerprint,
+) -> Result<Vec<SubmoduleEntry>> {
+    let bytes = read_private(&store.operation_dir().join("submodules.json"))?;
+    if sha256(&bytes) != fingerprint.submodule_manifest_sha256 {
+        return Err(Error::InvalidState(
+            "submodule manifest does not match its fingerprint".into(),
+        ));
+    }
+    let entries: Vec<SubmoduleEntry> = decode_canonical_json(&bytes, "submodule manifest")?;
+    let mut previous: Option<&Path> = None;
+    let mut initialized = BTreeSet::new();
+    for entry in &entries {
+        require_relative_path(&entry.path, "submodule path")?;
+        require_object_id(&entry.expected_object)?;
+        if previous.is_some_and(|path| path >= entry.path.as_path()) {
+            return Err(Error::InvalidState(
+                "submodule manifest is not strictly path-sorted".into(),
+            ));
+        }
+        if let Some(parent) = entry.parent.as_ref() {
+            require_relative_path(parent, "submodule parent")?;
+            let suffix = entry.path.strip_prefix(parent).map_err(|_| {
+                Error::InvalidState("nested submodule does not descend from its parent".into())
+            })?;
+            require_relative_path(suffix, "nested submodule path")?;
+            if !initialized.contains(parent) {
+                return Err(Error::InvalidState(
+                    "nested submodule parent is not an earlier initialized entry".into(),
+                ));
+            }
+        }
+        if entry.initialized {
+            initialized.insert(entry.path.clone());
+        }
+        previous = Some(&entry.path);
+    }
+    Ok(entries)
+}
+
+fn require_unchanged_target(
+    command: &GitCommand,
+    target_root: &Path,
+    expected_fingerprint: &crate::model::ForkFingerprint,
+    expected_inventory: &Inventory,
+) -> Result<()> {
+    let fingerprint = capture(command, target_root)?.fingerprint;
+    let inventory = capture_inventory(target_root)?;
+    if &fingerprint != expected_fingerprint || &inventory != expected_inventory {
+        return Err(Error::InvalidState(
+            "target changed after its last durable fork phase".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn apply_patch(
+    command: &GitCommand,
+    target: &Path,
+    patch: &Path,
+    expected_sha256: &str,
+    staged: bool,
+) -> Result<()> {
+    let bytes = read_private(patch)?;
+    if sha256(&bytes) != expected_sha256 {
+        return Err(Error::InvalidState(format!(
+            "immutable fork patch changed at {}",
+            patch.display()
+        )));
+    }
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec![OsString::from("apply")];
+    if staged {
+        args.push(OsString::from("--index"));
+    }
+    args.extend([
+        OsString::from("--binary"),
+        OsString::from("--whitespace=nowarn"),
+        OsString::from("--"),
+        patch.as_os_str().to_os_string(),
+    ]);
+    command.output(target, args)?;
+    Ok(())
+}
+
+fn verify_target_identity(
+    command: &GitCommand,
+    source: &GitSnapshot,
+    operation: &crate::model::ForkOperation,
+    target_root: &Path,
+) -> Result<()> {
+    let target = observe::snapshot(command, target_root)?;
+    if target.head != operation.target_head
+        || target.branch.as_deref() != Some(operation.target_branch.as_str())
+        || target.identity.common_git_dir != source.identity.common_git_dir
+        || target.identity.worktree != target_root
+    {
+        return Err(Error::InvalidState(
+            "created target worktree identity does not match the fork operation".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SemanticLayer {
+    Clean,
+    Staged,
+    Unstaged,
+    Complete,
+}
+
+fn verify_semantic_layer(
+    command: &GitCommand,
+    target_root: &Path,
+    target_branch: &str,
+    source: &GitSnapshot,
+    layer: SemanticLayer,
+) -> Result<()> {
+    let target = observe::snapshot(command, target_root)?;
+    let (staged, unstaged, untracked) = match layer {
+        SemanticLayer::Clean => (&[][..], &[][..], &[][..]),
+        SemanticLayer::Staged => (&source.staged[..], &[][..], &[][..]),
+        SemanticLayer::Unstaged => (&source.staged[..], &source.unstaged[..], &[][..]),
+        SemanticLayer::Complete => (
+            &source.staged[..],
+            &source.unstaged[..],
+            &source.untracked[..],
+        ),
+    };
+    if target.head != source.head
+        || target.branch.as_deref() != Some(target_branch)
+        || target.staged != staged
+        || target.unstaged != unstaged
+        || target.untracked != untracked
+        || !target.dirty_submodules.is_empty()
+    {
+        return Err(Error::InvalidState(format!(
+            "target semantic state does not match the allowed fork layer {layer:?}: staged {:?} expected {:?}; unstaged {:?} expected {:?}; untracked {:?} expected {:?}",
+            target.staged, staged, target.unstaged, unstaged, target.untracked, untracked
+        )));
+    }
+    Ok(())
+}
+
+fn restore_untracked(
+    store: &ForkOperationStore,
+    target_root: &Path,
+    entries: &[UntrackedEntry],
+) -> Result<()> {
+    for entry in entries {
+        entry.validate()?;
+        let destination = secure_destination(target_root, &entry.path)?;
+        match entry.kind {
+            UntrackedKind::Regular => {
+                let artifact = entry.artifact.as_ref().expect("validated regular artifact");
+                let bytes = read_private(&store.operation_dir().join(artifact))?;
+                if bytes.len() as u64 != entry.bytes || sha256(&bytes) != entry.sha256 {
+                    return Err(Error::InvalidState(format!(
+                        "untracked blob does not match manifest at {}",
+                        entry.path.display()
+                    )));
+                }
+                let mode = if entry.executable { 0o755 } else { 0o644 };
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(mode)
+                    .open(&destination)
+                    .map_err(|source| io(&destination, source))?;
+                file.set_permissions(std::fs::Permissions::from_mode(mode))
+                    .map_err(|source| io(&destination, source))?;
+                file.write_all(&bytes)
+                    .map_err(|source| io(&destination, source))?;
+                file.sync_all().map_err(|source| io(&destination, source))?;
+            }
+            UntrackedKind::Symlink => {
+                let link_target = entry
+                    .symlink_target
+                    .as_ref()
+                    .expect("validated symlink target");
+                if sha256(link_target.as_os_str().as_encoded_bytes()) != entry.sha256 {
+                    return Err(Error::InvalidState(format!(
+                        "untracked symlink target does not match manifest at {}",
+                        entry.path.display()
+                    )));
+                }
+                symlink(link_target, &destination).map_err(|source| io(&destination, source))?;
+            }
+        }
+        sync_directory(destination.parent().expect("destination has parent"))?;
+    }
+    Ok(())
+}
+
+fn secure_destination(root: &Path, relative: &Path) -> Result<PathBuf> {
+    require_relative_path(relative, "untracked destination")?;
+    let parent = relative
+        .parent()
+        .ok_or_else(|| Error::InvalidState("untracked path has no parent".into()))?;
+    let mut current = root.to_path_buf();
+    for component in parent.components() {
+        let Component::Normal(component) = component else {
+            return Err(Error::InvalidState(
+                "untracked parent path is not normalized".into(),
+            ));
+        };
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(Error::InvalidState(format!(
+                    "untracked parent {} is not a real directory",
+                    current.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut builder = std::fs::DirBuilder::new();
+                builder.mode(0o755);
+                builder
+                    .create(&current)
+                    .map_err(|source| io(&current, source))?;
+                std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o755))
+                    .map_err(|source| io(&current, source))?;
+                sync_directory(&current)?;
+                sync_directory(current.parent().expect("created directory has parent"))?;
+            }
+            Err(source) => return Err(io(&current, source)),
+        }
+    }
+    let destination = root.join(relative);
+    if !destination.starts_with(root) {
+        return Err(Error::InvalidState(
+            "untracked destination escapes target worktree".into(),
+        ));
+    }
+    match std::fs::symlink_metadata(&destination) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(destination),
+        Err(source) => Err(io(&destination, source)),
+        Ok(_) => Err(Error::InvalidState(format!(
+            "untracked destination {} already exists",
+            destination.display()
+        ))),
+    }
+}
+
+fn restore_submodules(
+    command: &GitCommand,
+    source_root: &Path,
+    target_root: &Path,
+    entries: &[SubmoduleEntry],
+) -> Result<()> {
+    for entry in entries.iter().filter(|entry| entry.initialized) {
+        let source_submodule = source_root.join(&entry.path);
+        let source_head = command.text(&source_submodule, ["rev-parse", "HEAD"])?;
+        if source_head != entry.expected_object {
+            return Err(Error::InvalidState(format!(
+                "source submodule HEAD changed at {}",
+                entry.path.display()
+            )));
+        }
+        let (parent_repository, local_path) = match entry.parent.as_ref() {
+            Some(parent) => (
+                target_root.join(parent),
+                entry.path.strip_prefix(parent).map_err(|_| {
+                    Error::InvalidState("submodule path escaped its recorded parent".into())
+                })?,
+            ),
+            None => (target_root.to_path_buf(), entry.path.as_path()),
+        };
+        seed_submodule_repository(command, &source_submodule, &parent_repository, local_path)?;
+        command.output(
+            &parent_repository,
+            [
+                OsString::from("-c"),
+                OsString::from("protocol.allow=never"),
+                OsString::from("submodule"),
+                OsString::from("update"),
+                OsString::from("--init"),
+                OsString::from("--no-fetch"),
+                OsString::from("--"),
+                local_path.as_os_str().to_os_string(),
+            ],
+        )?;
+        let target_submodule = target_root.join(&entry.path);
+        let head = command.text(&target_submodule, ["rev-parse", "HEAD"])?;
+        if head != entry.expected_object {
+            return Err(Error::InvalidState(format!(
+                "restored submodule HEAD differs at {}",
+                entry.path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn seed_submodule_repository(
+    command: &GitCommand,
+    source_submodule: &Path,
+    target_parent_repository: &Path,
+    local_path: &Path,
+) -> Result<()> {
+    let source_objects = PathBuf::from(command.text(
+        source_submodule,
+        [
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ],
+    )?)
+    .canonicalize()
+    .map_err(|source| io(source_submodule, source))?;
+    require_utf8_path(&source_objects, "source submodule object directory")?;
+    let module_path = PathBuf::from("modules").join(local_path);
+    let module_git_dir = PathBuf::from(command.text(
+        target_parent_repository,
+        [
+            OsString::from("rev-parse"),
+            OsString::from("--path-format=absolute"),
+            OsString::from("--git-path"),
+            module_path.into_os_string(),
+        ],
+    )?);
+    match std::fs::symlink_metadata(&module_git_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => return Err(io(&module_git_dir, source)),
+        Ok(_) => {
+            return Err(Error::InvalidState(format!(
+                "target submodule repository {} already exists",
+                module_git_dir.display()
+            )));
+        }
+    }
+    command.output(
+        target_parent_repository,
+        [
+            OsString::from("init"),
+            OsString::from("--bare"),
+            module_git_dir.as_os_str().to_os_string(),
+        ],
+    )?;
+    let target_worktree = target_parent_repository.join(local_path);
+    for (key, value) in [
+        (OsString::from("core.bare"), OsString::from("false")),
+        (
+            OsString::from("core.worktree"),
+            target_worktree.as_os_str().to_os_string(),
+        ),
+    ] {
+        command.output(
+            target_parent_repository,
+            [
+                OsString::from("--git-dir"),
+                module_git_dir.as_os_str().to_os_string(),
+                OsString::from("config"),
+                key,
+                value,
+            ],
+        )?;
+    }
+    let alternates = module_git_dir.join("objects/info/alternates");
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o644)
+        .open(&alternates)
+        .map_err(|source| io(&alternates, source))?;
+    file.write_all(source_objects.as_os_str().as_encoded_bytes())
+        .and_then(|()| file.write_all(b"\n"))
+        .map_err(|source| io(&alternates, source))?;
+    file.sync_all().map_err(|source| io(&alternates, source))?;
+    sync_directory(alternates.parent().expect("alternates has parent"))?;
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum InventoryKind {
+    Directory,
+    Regular,
+    Symlink,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InventoryEntry {
+    path: PathBuf,
+    kind: InventoryKind,
+    sha256: Option<String>,
+    executable: bool,
+    symlink_target: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Inventory {
+    entries: Vec<InventoryEntry>,
+    sha256: String,
+}
+
+fn capture_inventory(root: &Path) -> Result<Inventory> {
+    let mut entries = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let children = std::fs::read_dir(&directory).map_err(|source| io(&directory, source))?;
+        for child in children {
+            let child = child.map_err(|source| io(&directory, source))?;
+            let absolute = child.path();
+            let relative = absolute
+                .strip_prefix(root)
+                .map_err(|_| Error::InvalidState("target inventory escaped worktree".into()))?
+                .to_path_buf();
+            require_relative_path(&relative, "target inventory path")?;
+            if relative == Path::new(".git") {
+                continue;
+            }
+            let metadata =
+                std::fs::symlink_metadata(&absolute).map_err(|source| io(&absolute, source))?;
+            let executable = metadata.permissions().mode() & 0o111 != 0;
+            let (kind, digest, link_target) = if metadata.file_type().is_symlink() {
+                let target =
+                    std::fs::read_link(&absolute).map_err(|source| io(&absolute, source))?;
+                require_utf8_path(&target, "inventory symlink target")?;
+                (
+                    InventoryKind::Symlink,
+                    Some(sha256(target.as_os_str().as_encoded_bytes())),
+                    Some(target),
+                )
+            } else if metadata.is_file() {
+                (
+                    InventoryKind::Regular,
+                    Some(sha256(
+                        &std::fs::read(&absolute).map_err(|source| io(&absolute, source))?,
+                    )),
+                    None,
+                )
+            } else if metadata.is_dir() {
+                pending.push(absolute);
+                (InventoryKind::Directory, None, None)
+            } else {
+                return Err(Error::InvalidState(format!(
+                    "unsupported target inventory node {}",
+                    relative.display()
+                )));
+            };
+            entries.push(InventoryEntry {
+                path: relative,
+                kind,
+                sha256: digest,
+                executable,
+                symlink_target: link_target,
+            });
+        }
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let digest = sha256(&canonical_json(&entries)?);
+    Ok(Inventory {
+        entries,
+        sha256: digest,
+    })
+}
+
+fn verify_allowed_inventory(
+    command: &GitCommand,
+    target_root: &Path,
+    inventory: &Inventory,
+    previous: Option<&Inventory>,
+    untracked: &[UntrackedEntry],
+    submodules: &[SubmoduleEntry],
+) -> Result<()> {
+    let mut allowed = BTreeSet::new();
+    collect_allowed_repository(command, target_root, Path::new(""), &mut allowed)?;
+    for entry in untracked {
+        if std::fs::symlink_metadata(target_root.join(&entry.path)).is_ok() {
+            insert_with_parents(&mut allowed, &entry.path);
+        }
+    }
+    for entry in submodules.iter().filter(|entry| entry.initialized) {
+        let git_metadata = entry.path.join(".git");
+        if std::fs::symlink_metadata(target_root.join(&git_metadata)).is_ok() {
+            insert_with_parents(&mut allowed, &git_metadata);
+        }
+        collect_allowed_repository(
+            command,
+            &target_root.join(&entry.path),
+            &entry.path,
+            &mut allowed,
+        )?;
+    }
+    if let Some(previous) = previous {
+        for entry in &previous.entries {
+            if entry.kind == InventoryKind::Directory
+                && std::fs::symlink_metadata(target_root.join(&entry.path))
+                    .is_ok_and(|metadata| metadata.is_dir())
+            {
+                allowed.insert(entry.path.clone());
+            }
+        }
+    }
+    let actual = inventory
+        .entries
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect::<BTreeSet<_>>();
+    if actual != allowed {
+        let unexpected = actual.difference(&allowed).next();
+        let missing = allowed.difference(&actual).next();
+        return Err(Error::InvalidState(format!(
+            "target inventory contains unexpected or missing paths (unexpected: {unexpected:?}, missing: {missing:?})"
+        )));
+    }
+    Ok(())
+}
+
+fn collect_allowed_repository(
+    command: &GitCommand,
+    repository: &Path,
+    prefix: &Path,
+    allowed: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let paths = nul_paths(command.output(repository, ["ls-files", "--cached", "-z"])?)?;
+    for path in paths {
+        if std::fs::symlink_metadata(repository.join(&path)).is_ok() {
+            insert_with_parents(allowed, &prefix.join(path));
+        }
+    }
+    Ok(())
+}
+
+fn insert_with_parents(paths: &mut BTreeSet<PathBuf>, path: &Path) {
+    let mut current = Some(path);
+    while let Some(path) = current {
+        if !path.as_os_str().is_empty() {
+            paths.insert(path.to_path_buf());
+        }
+        current = path.parent();
+    }
+}
+
+fn verify_saved_cwd(target_root: &Path, cwd_relative: &Path) -> Result<()> {
+    let path = target_root.join(cwd_relative);
+    let canonical = path.canonicalize().map_err(|source| io(&path, source))?;
+    if !canonical.starts_with(target_root) || !canonical.is_dir() {
+        return Err(Error::InvalidState(
+            "saved cwd is not a real directory in the target worktree".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn decode_canonical_json<T>(bytes: &[u8], label: &str) -> Result<T>
+where
+    T: serde::de::DeserializeOwned + Serialize,
+{
+    let value = serde_json::from_slice(bytes)
+        .map_err(|error| Error::InvalidState(format!("cannot decode {label}: {error}")))?;
+    if canonical_json(&value)? != bytes {
+        return Err(Error::InvalidState(format!(
+            "{label} is not canonical JSON"
+        )));
+    }
+    Ok(value)
+}
+
+fn nul_paths(bytes: Vec<u8>) -> Result<Vec<PathBuf>> {
+    if !bytes.is_empty() && !bytes.ends_with(&[0]) {
+        return Err(Error::InvalidState(
+            "Git path list was not NUL-terminated".into(),
+        ));
+    }
+    bytes
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            let path = PathBuf::from(OsString::from_vec(path.to_vec()));
+            require_relative_path(&path, "Git path")?;
+            Ok(path)
+        })
+        .collect()
+}
+
+fn require_relative_path(path: &Path, label: &str) -> Result<()> {
+    if path.as_os_str().is_empty()
+        || path.to_str().is_none()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(Error::InvalidState(format!(
+            "{label} must be a normalized relative valid UTF-8 path"
+        )));
+    }
+    Ok(())
+}
+
+fn require_object_id(value: &str) -> Result<()> {
+    if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::InvalidState("malformed Git object ID".into()));
+    }
+    Ok(())
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }

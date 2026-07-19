@@ -428,7 +428,7 @@ rtk git commit -m "feat: capture durable worktree fork artifacts"
 - Modify: `src/git/fingerprint.rs`
 - Create: `tests/fork_state.rs`
 
-- [ ] **Step 1: Write the failing real-Git duplication matrix**
+- [x] **Step 1: Write the failing real-Git duplication matrix**
 
 Create `tests/fork_state.rs`. In one source linked worktree, construct all of these simultaneously:
 
@@ -464,13 +464,13 @@ assert!(!target_worktree.join("ignored.secret").exists());
 
 Compare snapshots after replacing identity, branch, and cwd-relative fields with their expected target values; do not accidentally compare source worktree identity to target identity.
 
-- [ ] **Step 2: Run the state test and verify materialization is absent**
+- [x] **Step 2: Run the state test and verify materialization is absent**
 
 Run: `rtk cargo test --test fork_state -- --nocapture`
 
 Expected: FAIL because target creation and patch application are not implemented.
 
-- [ ] **Step 3: Add a Git runner that preserves expected non-zero statuses**
+- [x] **Step 3: Add a Git runner that preserves expected non-zero statuses**
 
 Extend `GitCommand` with:
 
@@ -490,7 +490,7 @@ where
 
 `output` delegates to `output_status` and requires success. Do not invoke a shell, interpolate a command string, or decode path-bearing stdout as UTF-8.
 
-- [ ] **Step 4: Create the worktree and apply tracked state in two layers**
+- [x] **Step 4: Create the worktree and apply tracked state in two layers**
 
 Implement `materialize` with the source common Git directory and the recorded exact source HEAD. Run, in this order:
 
@@ -521,7 +521,7 @@ Set `branch_created` and `target_created` in the same durable phase update. Befo
 
 The cleanup inventory recursively hashes every target path, type, content or symlink target, and executable bit, including ignored files and empty directories. Exclude only the root worktree `.git` administration entry. Never follow symlinks. This inventory is stricter than the product duplication manifest because rollback must detect an ignored or otherwise unexpected file created after Sesh made the target.
 
-- [ ] **Step 5: Restore untracked files without following links**
+- [x] **Step 5: Restore untracked files without following links**
 
 For every sorted manifest entry:
 
@@ -535,7 +535,7 @@ After the full manifest succeeds, transition `UnstagedApplied -> UntrackedCopied
 
 Do not copy empty untracked directories: Git does not represent them and the approved manifest is path-based.
 
-- [ ] **Step 6: Handle clean submodules without network access**
+- [x] **Step 6: Handle clean submodules without network access**
 
 Dirty submodules and staged gitlink changes already fail preflight. Recreate only the exact initialized topology recorded in `submodules.json`, in parent-before-child order. For each initialized path, invoke the update from its recorded parent repository and pass that one relative path after `--`; never use an unscoped recursive update:
 
@@ -545,7 +545,7 @@ git -C <target-parent-repository> -c protocol.allow=never submodule update --ini
 
 Set `GIT_TERMINAL_PROMPT=0`. Require the resulting submodule HEAD to equal its recorded gitlink object before processing children. If Git would need any protocol, object fetch, credentials, or new clone, fail before verification and enter safe rollback. Paths recorded as uninitialized are never passed to `submodule update`, so they remain uninitialized in the target. Add local-only tests for initialized, uninitialized, and mixed nested clean submodules; no test may have network access.
 
-- [ ] **Step 7: Re-observe both sides and compare semantic state**
+- [x] **Step 7: Re-observe both sides and compare semantic state**
 
 After copying, capture a fresh source fingerprint and require it still equals the operation's source fingerprint. Then observe the target and compare:
 
@@ -563,7 +563,7 @@ Store the target fingerprint and transition `UntrackedCopied -> Verified` only a
 
 Add a negative test that mutates the source from a boundary callback after target creation; verification must fail rather than produce a mixed-state fork.
 
-- [ ] **Step 8: Prove the source worktree was not rewritten**
+- [x] **Step 8: Prove the source worktree was not rewritten**
 
 Before materialization, record:
 
@@ -576,7 +576,7 @@ staged.patch and unstaged.patch hashes
 
 After success, assert every value is unchanged. Do not compare volatile Git administration files or stat-cache bytes; the invariant is the source working files, semantic index, branch, and HEAD.
 
-- [ ] **Step 9: Verify and commit exact duplication**
+- [x] **Step 9: Verify and commit exact duplication**
 
 Run:
 
