@@ -76,6 +76,9 @@ fn cargo_package_metadata_is_ready_for_a_future_release() {
             "Cargo.toml is missing {expected}"
         );
     }
+
+    assert!(read("rust-toolchain.toml").contains("channel = \"1.88.0\""));
+    assert!(read("README.md").contains("Rust 1.88 or newer"));
 }
 
 #[test]
