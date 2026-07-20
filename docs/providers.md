@@ -99,9 +99,11 @@ fields and item counts, and sorted unique event references that already exist.
 Unknown fields and oversized payloads are rejected.
 
 Provider processes cannot use the human mutation path. A provider checkpoint is
-accepted only for the active run and from a process proven to descend from the
-provider process. Inbox input remains untrusted until validation and canonical
-journal promotion complete.
+accepted only when its session ID, run ID, and private inbox path match the
+active run. Those values are inherited by launched provider descendants, but
+this does not prove process ancestry or create a same-user authorization
+boundary. Inbox input remains untrusted until validation and canonical journal
+promotion complete.
 
 ## Hooks
 

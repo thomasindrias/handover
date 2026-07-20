@@ -61,6 +61,15 @@ fn readme_is_concise_human_and_routes_details_to_focused_docs() {
 }
 
 #[test]
+fn security_docs_do_not_overstate_same_user_process_isolation() {
+    for document in [read("docs/architecture.md"), read("docs/providers.md")] {
+        assert!(!document.contains("proven to descend"));
+        assert!(document.contains("does not prove process ancestry"));
+        assert!(document.contains("same-user"));
+    }
+}
+
+#[test]
 fn cargo_package_metadata_is_ready_for_a_future_release() {
     let manifest = read("Cargo.toml");
     for expected in [

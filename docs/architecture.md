@@ -196,8 +196,10 @@ encryption, automatic secret detection, or redaction.
 
 Provider hook inputs and run-inbox checkpoint files are untrusted. They are
 bounded, parsed, normalized, and validated before canonical history changes.
-Only a child process proven to descend from the active provider may submit a
-provider checkpoint. Human checkpoints use a separate path.
+Provider checkpoint submission is scoped to the active run through private
+identifiers and an inbox path inherited by launched provider descendants. This
+does not prove process ancestry and is not a same-user authorization boundary.
+Human checkpoints use a separate path.
 
 ## V1 non-goals
 
