@@ -105,7 +105,8 @@ fn automation_and_community_files_are_secure_by_default() {
 
     let security = read(".github/workflows/security.yml");
     assert!(security.contains("permissions:\n  contents: read"));
-    assert!(security.contains("rustsec/audit-check@"));
+    assert!(security.contains("cargo install cargo-audit --version 0.22.2 --locked"));
+    assert!(security.contains("run: cargo audit"));
     assert!(security.contains("EmbarkStudios/cargo-deny-action@"));
 
     for workflow in [ci, security] {
