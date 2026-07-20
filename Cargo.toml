@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A local-first session layer for coding agents"
+license = "Apache-2.0"
+repository = "https://github.com/thomasindrias/sesh"
+homepage = "https://github.com/thomasindrias/sesh"
+readme = "README.md"
+keywords = ["ai", "cli", "developer-tools", "git", "session"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
