@@ -280,16 +280,15 @@ impl HandoffInput {
             None => {}
         }
         self.snapshot.identity.validate()?;
-        if let Some(parent) = self.parent_lineage.as_ref() {
-            if parent.session_id == self.session_id
+        if let Some(parent) = self.parent_lineage.as_ref()
+            && (parent.session_id == self.session_id
                 || parent.transition_sequence != self.transition_sequence
                 || parent.narrative_sequence
-                    != self.narrative_checkpoint.as_ref().map(|item| item.0)
-            {
-                return Err(Error::InvalidState(
-                    "handoff parent lineage is inconsistent".into(),
-                ));
-            }
+                    != self.narrative_checkpoint.as_ref().map(|item| item.0))
+        {
+            return Err(Error::InvalidState(
+                "handoff parent lineage is inconsistent".into(),
+            ));
         }
         validate_snapshot_paths(&self.snapshot)?;
         validate_sequence_pairs("recent events", &self.recent_events)?;

@@ -1601,12 +1601,12 @@ fn collect_blob_reference(
 ) -> Result<()> {
     if let ContentRef::Blob { sha256, bytes } = content {
         blobs.resolve(content)?;
-        if let Some(previous) = references.insert(sha256.clone(), *bytes) {
-            if previous != *bytes {
-                return Err(Error::InvalidState(format!(
-                    "blob {sha256} has conflicting recorded sizes"
-                )));
-            }
+        if let Some(previous) = references.insert(sha256.clone(), *bytes)
+            && previous != *bytes
+        {
+            return Err(Error::InvalidState(format!(
+                "blob {sha256} has conflicting recorded sizes"
+            )));
         }
     }
     Ok(())

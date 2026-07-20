@@ -340,30 +340,30 @@ pub fn repair(layout: &StateLayout) -> Vec<Diagnostic> {
             continue;
         };
         let journal = path.join("events.jsonl");
-        if let Ok(scan) = scan_journal(&journal, &id) {
-            if scan.partial_bytes > 0 {
-                let committed = scan.committed_bytes;
-                let result = std::fs::OpenOptions::new()
-                    .write(true)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(&journal)
-                    .and_then(|file| {
-                        file.set_len(committed as u64)?;
-                        file.sync_all()
-                    });
-                match result {
-                    Ok(()) => diagnostics.push(Diagnostic::repaired(
-                        "journal.tail_repaired",
-                        format!(
-                            "removed {} final bytes from session {id}",
-                            scan.partial_bytes
-                        ),
-                    )),
-                    Err(error) => diagnostics.push(Diagnostic::error(
-                        "journal.repair_failed",
-                        format!("cannot repair session {id}: {error}"),
-                    )),
-                }
+        if let Ok(scan) = scan_journal(&journal, &id)
+            && scan.partial_bytes > 0
+        {
+            let committed = scan.committed_bytes;
+            let result = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&journal)
+                .and_then(|file| {
+                    file.set_len(committed as u64)?;
+                    file.sync_all()
+                });
+            match result {
+                Ok(()) => diagnostics.push(Diagnostic::repaired(
+                    "journal.tail_repaired",
+                    format!(
+                        "removed {} final bytes from session {id}",
+                        scan.partial_bytes
+                    ),
+                )),
+                Err(error) => diagnostics.push(Diagnostic::error(
+                    "journal.repair_failed",
+                    format!("cannot repair session {id}: {error}"),
+                )),
             }
         }
         let scan = match scan_journal(&journal, &id) {
