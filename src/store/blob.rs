@@ -21,12 +21,12 @@ impl BlobStore {
     }
 
     pub fn put(&self, bytes: &[u8]) -> Result<ContentRef> {
-        if bytes.len() <= INLINE_LIMIT_BYTES {
-            if let Ok(text) = std::str::from_utf8(bytes) {
-                return Ok(ContentRef::Inline {
-                    text: text.to_owned(),
-                });
-            }
+        if bytes.len() <= INLINE_LIMIT_BYTES
+            && let Ok(text) = std::str::from_utf8(bytes)
+        {
+            return Ok(ContentRef::Inline {
+                text: text.to_owned(),
+            });
         }
 
         let sha256 = hex::encode(Sha256::digest(bytes));

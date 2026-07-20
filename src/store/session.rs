@@ -393,12 +393,12 @@ fn already_bound(reference: &WorktreeRef) -> Error {
 }
 
 fn validate_checkpoint_author(author: CheckpointAuthor, provider: Option<Provider>) -> Result<()> {
-    if let CheckpointAuthor::Provider(author_provider) = author {
-        if provider != Some(author_provider) {
-            return Err(Error::InvalidState(
-                "provider checkpoint author does not match event provider".into(),
-            ));
-        }
+    if let CheckpointAuthor::Provider(author_provider) = author
+        && provider != Some(author_provider)
+    {
+        return Err(Error::InvalidState(
+            "provider checkpoint author does not match event provider".into(),
+        ));
     }
     Ok(())
 }

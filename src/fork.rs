@@ -283,17 +283,18 @@ pub fn recover_fork_failure_with_live_child(
                 ),
             );
         }
-    } else if operation.branch_created && branch_exists(&operation)? {
-        if let Err(error) = remove_proven_branch(&GitCommand, &operation) {
-            return mark_manual(
-                store,
-                &operation,
-                format!(
-                    "{message}; target branch {:?} was not removed: {error}",
-                    operation.target_branch
-                ),
-            );
-        }
+    } else if operation.branch_created
+        && branch_exists(&operation)?
+        && let Err(error) = remove_proven_branch(&GitCommand, &operation)
+    {
+        return mark_manual(
+            store,
+            &operation,
+            format!(
+                "{message}; target branch {:?} was not removed: {error}",
+                operation.target_branch
+            ),
+        );
     }
 
     store.transition(operation.phase, ForkPhase::RolledBack, |record| {

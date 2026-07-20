@@ -216,12 +216,12 @@ impl UntrackedEntry {
     pub fn validate(&self) -> Result<()> {
         require_relative_utf8(&self.path, "untracked path")?;
         require_sha256(&self.sha256, "untracked content")?;
-        if let Some(target) = self.symlink_target.as_ref() {
-            if target.as_os_str().is_empty() || target.to_str().is_none() {
-                return Err(Error::InvalidState(
-                    "untracked symlink target must be valid UTF-8".into(),
-                ));
-            }
+        if let Some(target) = self.symlink_target.as_ref()
+            && (target.as_os_str().is_empty() || target.to_str().is_none())
+        {
+            return Err(Error::InvalidState(
+                "untracked symlink target must be valid UTF-8".into(),
+            ));
         }
         if let Some(artifact) = self.artifact.as_ref() {
             require_relative_utf8(artifact, "untracked artifact")?;
