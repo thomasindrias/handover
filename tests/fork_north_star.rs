@@ -143,7 +143,7 @@ exit 0
             (path, meta)
         })
         .collect::<Vec<_>>();
-    metas.sort_by(|left, right| left.1.id.to_string().cmp(&right.1.id.to_string()));
+    metas.sort_by_key(|item| item.1.id.to_string());
     assert_eq!(metas.len(), 2);
     let (_, child) = metas
         .iter()

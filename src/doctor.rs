@@ -665,7 +665,7 @@ fn check_handshake_timeout(envelopes: &[EventEnvelope], diagnostics: &mut Vec<Di
     if !handshook && stopped {
         diagnostics.push(Diagnostic::error(
             "run.session_start_timeout",
-            format!("run {:?} stopped without a SessionStart handshake", run_id),
+            format!("run {run_id:?} stopped without a SessionStart handshake"),
         ));
     }
 }
