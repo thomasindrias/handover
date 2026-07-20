@@ -77,3 +77,62 @@ fn cargo_package_metadata_is_ready_for_a_future_release() {
         );
     }
 }
+
+#[test]
+fn automation_and_community_files_are_secure_by_default() {
+    for required in [
+        ".github/dependabot.yml",
+        ".github/PULL_REQUEST_TEMPLATE.md",
+        ".github/ISSUE_TEMPLATE/bug_report.yml",
+        ".github/ISSUE_TEMPLATE/config.yml",
+        ".github/workflows/ci.yml",
+        ".github/workflows/security.yml",
+        "deny.toml",
+    ] {
+        assert!(root().join(required).is_file(), "missing {required}");
+    }
+
+    let ci = read(".github/workflows/ci.yml");
+    assert!(ci.contains("permissions:\n  contents: read"));
+    assert!(ci.contains("ubuntu-latest"));
+    assert!(ci.contains("macos-latest"));
+    assert!(ci.contains("cargo fmt --check"));
+    assert!(ci.contains("cargo clippy --all-targets --all-features -- -D warnings"));
+    assert!(ci.contains("cargo test --all-targets --all-features"));
+
+    let security = read(".github/workflows/security.yml");
+    assert!(security.contains("permissions:\n  contents: read"));
+    assert!(security.contains("rustsec/audit-check@"));
+    assert!(security.contains("EmbarkStudios/cargo-deny-action@"));
+
+    for workflow in [ci, security] {
+        for line in workflow.lines() {
+            let Some((_, reference)) = line
+                .trim()
+                .strip_prefix("- uses: ")
+                .and_then(|line| line.split_once('@'))
+            else {
+                continue;
+            };
+            let revision = reference.split_whitespace().next().unwrap();
+            assert_eq!(
+                revision.len(),
+                40,
+                "action is not pinned to a full SHA: {line}"
+            );
+            assert!(
+                revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "action is not pinned to a commit SHA: {line}"
+            );
+        }
+    }
+
+    let dependabot = read(".github/dependabot.yml");
+    assert!(dependabot.contains("package-ecosystem: cargo"));
+    assert!(dependabot.contains("package-ecosystem: github-actions"));
+    assert_eq!(dependabot.matches("interval: weekly").count(), 2);
+
+    let issue_config = read(".github/ISSUE_TEMPLATE/config.yml");
+    assert!(issue_config.contains("blank_issues_enabled: false"));
+    assert!(issue_config.contains("SECURITY.md"));
+}
