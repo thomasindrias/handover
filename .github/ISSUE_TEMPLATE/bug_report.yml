@@ -1,0 +1,62 @@
+name: Bug report
+description: Report a reproducible problem in Sesh
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Sesh. Do not include secrets or private session data. Report vulnerabilities through the private path in SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: Sesh version
+      description: Paste `sesh --version` or the commit SHA.
+      placeholder: sesh 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: Provider and version
+      description: For example, the output of `claude --version` or `codex --version`.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the actual and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: List the smallest safe sequence of commands that reproduces the problem.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Add relevant `sesh doctor --json` output after removing paths, prompts, credentials, and private context.
+      render: json
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed secrets, credentials, personal data, and private session content.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true

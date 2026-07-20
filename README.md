@@ -28,7 +28,7 @@ service.
 
 ## Quick start
 
-Sesh V1 supports macOS and Linux. It requires Git, Rust 1.85 or newer, and an
+Sesh V1 supports macOS and Linux. It requires Git, Rust 1.88 or newer, and an
 installed Claude Code or Codex CLI.
 
 ```bash
