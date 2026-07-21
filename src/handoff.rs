@@ -57,6 +57,7 @@ pub struct HandoffInput {
 pub struct RenderedHandoff {
     pub markdown: String,
     pub recent_event_sequences: Vec<u64>,
+    pub omitted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -110,6 +111,13 @@ pub fn render_with_selection(input: HandoffInput, max_bytes: usize) -> Result<Re
             return Ok(RenderedHandoff {
                 markdown: output,
                 recent_event_sequences: events.iter().map(|item| item.0).collect(),
+                omitted: !omitted_events.is_empty()
+                    || !omitted_commands.is_empty()
+                    || omitted_paths.staged > 0
+                    || omitted_paths.unstaged > 0
+                    || omitted_paths.untracked > 0
+                    || omitted_paths.dirty_submodules > 0
+                    || !omitted_gaps.is_empty(),
             });
         }
         if !events.is_empty() {
@@ -1173,5 +1181,18 @@ mod tests {
         );
         assert!(rendered.recent_event_sequences.last() == Some(&20));
         assert!(rendered.markdown.contains("Omitted event sequences"));
+    }
+
+    #[test]
+    fn omitted_flag_reflects_whether_the_bounded_selection_dropped_anything() {
+        let fits = render_with_selection(HandoffInput::fixture(), 65_536).unwrap();
+        assert!(!fits.omitted);
+
+        let mut input = HandoffInput::fixture();
+        input.recent_events = (20..=120)
+            .map(|sequence| (sequence, "x".repeat(256)))
+            .collect();
+        let overflowed = render_with_selection(input, 4_096).unwrap();
+        assert!(overflowed.omitted);
     }
 }
