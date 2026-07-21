@@ -1,5 +1,7 @@
 use sesh::model::Provider;
-use sesh::provider::hook::{HookEvent, capture_failure_output, normalize, session_start_output};
+use sesh::provider::hook::{
+    HookEvent, capture_failure_output, normalize, session_start_output, stale_narrative_output,
+};
 
 #[test]
 fn normalizes_claude_prompt_without_persisting_transcript_path() {
@@ -335,6 +337,35 @@ fn session_start_output_is_exact_and_provider_safe() {
             }
         })
     );
+}
+
+#[test]
+fn stale_narrative_output_is_exactly_one_system_message() {
+    let stale = stale_narrative_output(27, true);
+    assert_eq!(stale.exit_code, 0);
+    assert!(stale.stderr.is_empty());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stale.stdout).unwrap(),
+        serde_json::json!({
+            "systemMessage": "Sesh: 27 events since the last narrative checkpoint. \
+             Ask the agent to checkpoint, or run `sesh checkpoint`."
+        })
+    );
+
+    let never = stale_narrative_output(27, false);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&never.stdout).unwrap(),
+        serde_json::json!({
+            "systemMessage": "Sesh: 27 events and no narrative checkpoint yet. \
+             Ask the agent to checkpoint, or run `sesh checkpoint`."
+        })
+    );
+
+    for output in [&stale, &never] {
+        let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        let keys: Vec<&String> = value.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["systemMessage"]);
+    }
 }
 
 #[test]
