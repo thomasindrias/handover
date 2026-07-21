@@ -15,19 +15,20 @@ pub fn list_command(json: bool, layout: &StateLayout) -> Result<i32> {
         let entry = entry.map_err(|source| io(&sessions_dir, source))?;
         names.push(entry.file_name());
     }
-    names.sort();
     let mut rows = Vec::new();
     for name in &names {
         rows.push(session_row(layout, name));
     }
     rows.sort_by(|left, right| {
-        let key = |row: &serde_json::Value| {
-            (
-                std::cmp::Reverse(row["last_activity"].as_str().map(str::to_owned)),
-                row["session_id"].as_str().map(str::to_owned),
-            )
-        };
-        key(left).cmp(&key(right))
+        let left_key = (
+            std::cmp::Reverse(left["last_activity"].as_str()),
+            left["session_id"].as_str(),
+        );
+        let right_key = (
+            std::cmp::Reverse(right["last_activity"].as_str()),
+            right["session_id"].as_str(),
+        );
+        left_key.cmp(&right_key)
     });
     let value = serde_json::json!({
         "schema_version": 1,
@@ -75,14 +76,14 @@ fn degraded_row(name: &str, diagnostic: &str) -> serde_json::Value {
         "session_id": name,
         "degraded": true,
         "diagnostics": [format!("{diagnostic}; run sesh doctor")],
-        "repository": serde_json::Value::Null,
-        "worktree": serde_json::Value::Null,
-        "branch": serde_json::Value::Null,
+        "repository": null,
+        "worktree": null,
+        "branch": null,
         "bound": false,
-        "last_provider": serde_json::Value::Null,
-        "last_activity": serde_json::Value::Null,
-        "latest_narrative_checkpoint": serde_json::Value::Null,
-        "events_since_narrative": serde_json::Value::Null,
+        "last_provider": null,
+        "last_activity": null,
+        "latest_narrative_checkpoint": null,
+        "events_since_narrative": null,
     })
 }
 
@@ -146,11 +147,16 @@ pub(crate) fn narrative_freshness(events: &[Event]) -> (Option<u64>, u64) {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::model::{
-        CheckpointKind, Event, EventKind, GitSnapshot, Provider, SessionId, WorktreeIdentity,
-    };
+    use tempfile::TempDir;
 
-    use super::{last_activity, last_branch, last_provider, narrative_freshness};
+    use crate::model::{
+        CheckpointKind, Event, EventKind, GitSnapshot, Provider, SessionId, SessionMeta,
+        WorktreeIdentity, WorktreeRef,
+    };
+    use crate::store::StateLayout;
+    use crate::store::refs::write_json_create;
+
+    use super::{binding_state, last_activity, last_branch, last_provider, narrative_freshness};
 
     fn event(sequence: u64, provider: Option<Provider>, kind: EventKind) -> Event {
         Event {
@@ -261,5 +267,80 @@ mod tests {
         let unsummarized = [run_started(1, Provider::Claude), snapshot_event(2, None)];
         assert_eq!(narrative_freshness(&unsummarized), (None, 2));
         assert_eq!(narrative_freshness(&[]), (None, 0));
+    }
+
+    fn worktree_identity() -> WorktreeIdentity {
+        let common_git_dir = PathBuf::from("/work/repo/.git");
+        let git_dir = common_git_dir.clone();
+        WorktreeIdentity {
+            key: WorktreeIdentity::derive_key(&common_git_dir, &git_dir),
+            common_git_dir,
+            git_dir,
+            worktree: PathBuf::from("/work/repo"),
+            cwd_relative: PathBuf::new(),
+        }
+    }
+
+    fn session_meta(id: SessionId, worktree: WorktreeIdentity) -> SessionMeta {
+        SessionMeta {
+            schema_version: 1,
+            id,
+            created_at: "2026-07-21T10:00:00Z".into(),
+            worktree,
+            parent_session_id: None,
+            parent_checkpoint_sequence: None,
+        }
+    }
+
+    #[test]
+    fn binding_state_flags_a_worktree_ref_that_names_another_session() {
+        let temp = TempDir::new().unwrap();
+        let layout = StateLayout::new(temp.path().to_path_buf());
+        let identity = worktree_identity();
+        let meta = session_meta(SessionId::new(), identity.clone());
+        let ref_path = layout
+            .worktree_refs()
+            .join(format!("{}.json", identity.key));
+        let reference = WorktreeRef {
+            schema_version: 1,
+            key: identity.key.clone(),
+            session_id: SessionId::new(),
+            identity,
+        };
+        write_json_create(&ref_path, &reference).unwrap();
+
+        let (bound, diagnostic) = binding_state(&layout, &meta);
+        assert!(!bound);
+        assert_eq!(
+            diagnostic.as_deref(),
+            Some("worktree ref names another session")
+        );
+    }
+
+    #[test]
+    fn binding_state_flags_a_worktree_ref_that_is_not_valid_json() {
+        let temp = TempDir::new().unwrap();
+        let layout = StateLayout::new(temp.path().to_path_buf());
+        let identity = worktree_identity();
+        let meta = session_meta(SessionId::new(), identity.clone());
+        let ref_path = layout
+            .worktree_refs()
+            .join(format!("{}.json", identity.key));
+        let reference = WorktreeRef {
+            schema_version: 1,
+            key: identity.key.clone(),
+            session_id: meta.id.clone(),
+            identity,
+        };
+        write_json_create(&ref_path, &reference).unwrap();
+        std::fs::write(&ref_path, b"not json").unwrap();
+
+        let (bound, diagnostic) = binding_state(&layout, &meta);
+        assert!(!bound);
+        assert!(
+            diagnostic
+                .unwrap()
+                .starts_with("worktree ref is unreadable")
+        );
     }
 }

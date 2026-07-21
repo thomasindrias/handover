@@ -209,9 +209,18 @@ fn corrupt_sessions_degrade_to_diagnostic_rows_without_failing_the_listing() {
         assert!(row["last_activity"].is_null());
         assert_eq!(row["bound"], false);
     }
-    assert!(
-        degraded
-            .iter()
-            .any(|row| row["session_id"] == "not-a-session")
-    );
+
+    let degraded_ids: Vec<&str> = degraded
+        .iter()
+        .map(|row| row["session_id"].as_str().unwrap())
+        .collect();
+    let beta_id = beta_dir.file_name().unwrap().to_string_lossy().into_owned();
+    let gamma_id = gamma_dir
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(degraded_ids.contains(&beta_id.as_str()));
+    assert!(degraded_ids.contains(&gamma_id.as_str()));
+    assert!(degraded_ids.contains(&"not-a-session"));
 }
