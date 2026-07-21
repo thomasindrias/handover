@@ -175,6 +175,25 @@ pub fn session_start_output(handoff: &str) -> HookOutput {
     }
 }
 
+pub fn stale_narrative_output(events_since: u64, has_narrative_checkpoint: bool) -> HookOutput {
+    let message = if has_narrative_checkpoint {
+        format!(
+            "Sesh: {events_since} events since the last narrative checkpoint. \
+             Ask the agent to checkpoint, or run `sesh checkpoint`."
+        )
+    } else {
+        format!(
+            "Sesh: {events_since} events and no narrative checkpoint yet. \
+             Ask the agent to checkpoint, or run `sesh checkpoint`."
+        )
+    };
+    HookOutput {
+        stdout: serde_json::json!({ "systemMessage": message }).to_string(),
+        stderr: String::new(),
+        exit_code: 0,
+    }
+}
+
 pub fn capture_failure_output(_provider: Provider, event: &str, message: &str) -> HookOutput {
     let reason = format!(
         "Sesh capture failed: {}",

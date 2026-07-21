@@ -20,6 +20,10 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 - A `sesh handoff <provider>` command that renders the exact handoff a
   switch would produce right now, without switching, so a missing or stale
   narrative checkpoint is visible before a switch is spent.
+- Checkpoint staleness signals: `sesh status` reports
+  `latest_narrative_checkpoint` and `events_since_narrative`, and the Stop
+  hook warns with a single `systemMessage` when 20 or more events accumulate
+  without a fresh narrative checkpoint.
 
 ### Security
 

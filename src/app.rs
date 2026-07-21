@@ -31,6 +31,7 @@ use crate::model::{
 };
 use crate::provider::hook::{
     HookEvent, HookOutput, NormalizedHook, capture_failure_output, normalize, session_start_output,
+    stale_narrative_output,
 };
 use crate::provider::{LaunchContext, adapter};
 use crate::runtime::Runtime;
@@ -44,6 +45,7 @@ use crate::supervisor::{ExitFacts, Supervisor};
 
 const MAX_HOOK_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_HANDOFF_BYTES: usize = 65_536;
+const STALE_NARRATIVE_EVENT_THRESHOLD: u64 = 20;
 
 pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result<i32> {
     if environment.get("SESH_RUN_ID").is_some() && !provider_command_allowed(&cli.command) {
@@ -1328,6 +1330,7 @@ fn status_command(json: bool, environment: &Environment) -> Result<i32> {
         .canonicalize()
         .map_err(|source| io(&saved_cwd_path, source))?;
     let (_, _, _, gaps) = command_facts(&store, &events)?;
+    let (latest_narrative, events_since) = crate::list::narrative_freshness(&events);
     let value = serde_json::json!({
         "schema_version": 1,
         "session_id": store.id(),
@@ -1343,6 +1346,8 @@ fn status_command(json: bool, environment: &Environment) -> Result<i32> {
             "dirty_submodules": snapshot.dirty_submodules,
         },
         "latest_checkpoint": latest_checkpoint_value(&store, &events)?,
+        "latest_narrative_checkpoint": latest_narrative,
+        "events_since_narrative": events_since,
         "capture_gaps": gaps.into_iter().map(|gap| serde_json::json!({
             "sequence": gap.sequence,
             "phase": gap.phase,
@@ -1982,6 +1987,7 @@ fn ingest_hook_inner(
         .get("SESH_PROVIDER_VERSION")
         .and_then(OsStr::to_str)
         .map(str::to_owned);
+    let is_stop = matches!(normalized.event, HookEvent::Stopped { .. });
     let (outcome, follow_snapshot, handoff) = map_and_append_hook(
         &store,
         runtime,
@@ -2012,11 +2018,23 @@ fn ingest_hook_inner(
             .map_err(|_| Error::InvalidState("handoff is not valid UTF-8".into()))?;
         return Ok(session_start_output(text));
     }
+    if is_stop
+        && let Ok(events) = store.events()
+        && let Some(output) = stop_nudge(&events)
+    {
+        return Ok(output);
+    }
     Ok(HookOutput {
         stdout: String::new(),
         stderr: String::new(),
         exit_code: 0,
     })
+}
+
+fn stop_nudge(events: &[Event]) -> Option<HookOutput> {
+    let (latest_narrative, events_since) = crate::list::narrative_freshness(events);
+    (events_since >= STALE_NARRATIVE_EVENT_THRESHOLD)
+        .then(|| stale_narrative_output(events_since, latest_narrative.is_some()))
 }
 
 fn map_and_append_hook(
@@ -2336,12 +2354,13 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        command_facts, latest_narrative_checkpoint, recover_stale_lease, with_rename_rollback,
+        command_facts, latest_narrative_checkpoint, recover_stale_lease, stop_nudge,
+        with_rename_rollback,
     };
     use crate::error::Error;
     use crate::model::{
-        CheckpointAuthor, ContentRef, EventKind, GitSnapshot, NarrativeInput, Provider, RunId,
-        SessionId, WorktreeIdentity,
+        CheckpointAuthor, CheckpointKind, ContentRef, Event, EventKind, GitSnapshot,
+        NarrativeInput, Provider, RunId, SessionId, WorktreeIdentity,
     };
     use crate::runtime::Runtime;
     use crate::store::blob::BlobStore;
@@ -2611,5 +2630,65 @@ mod tests {
                 _ => None,
             })
             .unwrap()
+    }
+
+    fn observed_event(sequence: u64, kind: EventKind) -> Event {
+        Event {
+            schema_version: 1,
+            sequence,
+            occurred_at: format!("2026-07-21T10:00:{:02}Z", sequence % 60),
+            recorded_at: format!("2026-07-21T10:00:{:02}Z", sequence % 60),
+            session_id: SessionId::parse("11111111-1111-4111-8111-111111111111").unwrap(),
+            run_id: None,
+            provider: Some(Provider::Claude),
+            idempotency_key: None,
+            kind,
+        }
+    }
+
+    fn stop_event(sequence: u64) -> Event {
+        observed_event(
+            sequence,
+            EventKind::ProviderStopObserved {
+                native_session_id: "native".into(),
+            },
+        )
+    }
+
+    fn narrative_checkpoint_event(sequence: u64) -> Event {
+        observed_event(
+            sequence,
+            EventKind::CheckpointCreated {
+                checkpoint_kind: CheckpointKind::Narrative,
+                through_sequence: sequence - 1,
+                path: format!("checkpoints/{sequence:012}.json"),
+            },
+        )
+    }
+
+    #[test]
+    fn stop_nudge_fires_at_twenty_stale_events_and_not_below() {
+        let below: Vec<Event> = (1..=19).map(stop_event).collect();
+        assert!(stop_nudge(&below).is_none());
+
+        let at: Vec<Event> = (1..=20).map(stop_event).collect();
+        let nudge = stop_nudge(&at).unwrap();
+        assert!(
+            nudge
+                .stdout
+                .contains("20 events and no narrative checkpoint yet")
+        );
+
+        let mut checkpointed: Vec<Event> = vec![narrative_checkpoint_event(1)];
+        checkpointed.extend((2..=20).map(stop_event));
+        assert!(stop_nudge(&checkpointed).is_none());
+
+        checkpointed.push(stop_event(21));
+        let stale = stop_nudge(&checkpointed).unwrap();
+        assert!(
+            stale
+                .stdout
+                .contains("20 events since the last narrative checkpoint")
+        );
     }
 }
