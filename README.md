@@ -58,6 +58,7 @@ Inspect what Sesh knows:
 ```bash
 sesh list
 sesh status
+sesh handoff codex
 sesh log
 sesh inspect
 sesh doctor

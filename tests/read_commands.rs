@@ -147,6 +147,7 @@ exit 0
         vec!["inspect", "--json"],
         vec!["delete", "--yes"],
         vec!["switch", "codex"],
+        vec!["handoff", "codex"],
         vec!["run", "codex"],
         vec!["checkpoint", "--format", "json"],
     ] {

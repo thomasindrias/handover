@@ -28,6 +28,11 @@ pub enum Command {
         #[arg(last = true, allow_hyphen_values = true)]
         provider_args: Vec<OsString>,
     },
+    Handoff {
+        provider: Provider,
+        #[arg(long)]
+        json: bool,
+    },
     Fork {
         provider: Provider,
         #[arg(long)]

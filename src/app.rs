@@ -60,6 +60,7 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
             provider,
             provider_args,
         } => switch_command(provider, provider_args, environment, runtime),
+        Command::Handoff { provider, json } => handoff_command(provider, json, environment),
         Command::Fork {
             provider,
             branch,
@@ -686,17 +687,7 @@ pub fn switch_command(
     let locked_snapshot = Git::new().snapshot(&invocation_cwd)?;
     recover_stale_lease(&store, &leases, runtime, &locked_snapshot)?;
 
-    let saved_cwd_relative = store.saved_cwd_relative()?;
-    let saved_cwd_path = store.meta().worktree.worktree.join(&saved_cwd_relative);
-    let saved_cwd = saved_cwd_path
-        .canonicalize()
-        .map_err(|source| io(&saved_cwd_path, source))?;
-    if !saved_cwd.is_dir() || !saved_cwd.starts_with(&store.meta().worktree.worktree) {
-        return Err(Error::InvalidState(format!(
-            "saved cwd {} is not an existing directory in the session worktree",
-            saved_cwd_path.display()
-        )));
-    }
+    let (saved_cwd_relative, saved_cwd) = resolve_saved_cwd(&store)?;
     let switch_snapshot = Git::new().snapshot(&saved_cwd)?;
     verify_switch_snapshot(
         &invocation_snapshot,
@@ -731,22 +722,7 @@ pub fn switch_command(
 
     let envelopes = EventJournal::new(&store.session_dir(), store.id().clone()).read_repair()?;
     let recent_boundary = narrative_sequence.unwrap_or(0);
-    let mut recent_events = Vec::new();
-    for envelope in envelopes
-        .iter()
-        .filter(|item| item.event.sequence > recent_boundary)
-    {
-        let mut line = envelope.line()?;
-        if line.last() == Some(&b'\n') {
-            line.pop();
-        }
-        recent_events.push((
-            envelope.event.sequence,
-            String::from_utf8(line).map_err(|_| {
-                Error::InvalidState("canonical event envelope is not valid UTF-8".into())
-            })?,
-        ));
-    }
+    let recent_events = collect_recent_events(&envelopes, recent_boundary)?;
     let events: Vec<_> = envelopes.iter().map(|item| item.event.clone()).collect();
     let (recent_commands, latest_test, latest_failure, capture_gaps) =
         command_facts(&store, &events)?;
@@ -867,6 +843,169 @@ pub fn switch_command(
     Ok(facts
         .exit_code
         .unwrap_or_else(|| 128 + facts.signal.unwrap_or(1)))
+}
+
+fn resolve_saved_cwd(store: &SessionStore) -> Result<(PathBuf, PathBuf)> {
+    let saved_cwd_relative = store.saved_cwd_relative()?;
+    let saved_cwd_path = store.meta().worktree.worktree.join(&saved_cwd_relative);
+    let saved_cwd = saved_cwd_path
+        .canonicalize()
+        .map_err(|source| io(&saved_cwd_path, source))?;
+    if !saved_cwd.is_dir() || !saved_cwd.starts_with(&store.meta().worktree.worktree) {
+        return Err(Error::InvalidState(format!(
+            "saved cwd {} is not an existing directory in the session worktree",
+            saved_cwd_path.display()
+        )));
+    }
+    Ok((saved_cwd_relative, saved_cwd))
+}
+
+fn collect_recent_events(
+    envelopes: &[EventEnvelope],
+    recent_boundary: u64,
+) -> Result<Vec<(u64, String)>> {
+    let mut recent_events = Vec::new();
+    for envelope in envelopes
+        .iter()
+        .filter(|item| item.event.sequence > recent_boundary)
+    {
+        let mut line = envelope.line()?;
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        recent_events.push((
+            envelope.event.sequence,
+            String::from_utf8(line).map_err(|_| {
+                Error::InvalidState("canonical event envelope is not valid UTF-8".into())
+            })?,
+        ));
+    }
+    Ok(recent_events)
+}
+
+fn handoff_command(provider: Provider, json: bool, environment: &Environment) -> Result<i32> {
+    let invocation_cwd = std::env::current_dir().map_err(|source| io(".", source))?;
+    let layout = resolve_layout(environment, &invocation_cwd)?;
+    let invocation_snapshot = Git::new().snapshot(&invocation_cwd)?;
+    let store = SessionStore::find_for_worktree(&layout, &invocation_snapshot.identity)?
+        .ok_or_else(|| Error::InvalidState("this worktree has no Sesh session".into()))?;
+
+    let (saved_cwd_relative, saved_cwd) = resolve_saved_cwd(&store)?;
+    let switch_snapshot = Git::new().snapshot(&saved_cwd)?;
+    verify_switch_snapshot(
+        &invocation_snapshot,
+        &switch_snapshot,
+        &store.meta().worktree,
+        &saved_cwd_relative,
+    )?;
+
+    let events = store.events()?;
+    let previous_provider_value = previous_provider(&events)?;
+    let narrative_checkpoint = latest_narrative_checkpoint(&store, &events)?;
+    let narrative_sequence = narrative_checkpoint.as_ref().map(|item| item.0);
+
+    let envelopes = store.envelopes()?;
+    let recent_boundary = narrative_sequence.unwrap_or(0);
+    let recent_events = collect_recent_events(&envelopes, recent_boundary)?;
+    let (recent_commands, latest_test, latest_failure, capture_gaps) =
+        command_facts(&store, &events)?;
+
+    let through_sequence = events.last().map(|event| event.sequence).unwrap_or(0);
+    let transition_sequence = through_sequence + 1;
+    let transition_checkpoint = Checkpoint {
+        schema_version: 1,
+        checkpoint_kind: CheckpointKind::Transition,
+        through_sequence,
+        author: CheckpointAuthor::System,
+        narrative: None,
+        narrative_checkpoint_sequence: narrative_sequence,
+    };
+
+    let rendered = render_with_selection(
+        HandoffInput {
+            session_id: store.id().clone(),
+            parent_lineage: None,
+            from_provider: previous_provider_value,
+            to_provider: provider,
+            transition_sequence,
+            transition_checkpoint,
+            narrative_checkpoint: narrative_checkpoint.clone(),
+            snapshot: switch_snapshot,
+            recent_events,
+            recent_commands,
+            latest_test,
+            latest_failure,
+            capture_gaps: capture_gaps.clone(),
+        },
+        MAX_HANDOFF_BYTES,
+    )?;
+    let recent_events_jsonl = selected_event_lines(&envelopes, &rendered.recent_event_sequences)?;
+    if recent_events_jsonl.len() > MAX_HANDOFF_BYTES {
+        return Err(Error::InvalidState(
+            "selected recent events exceed 64 KiB".into(),
+        ));
+    }
+
+    if json {
+        write_handoff_projection(
+            &store,
+            previous_provider_value,
+            provider,
+            transition_sequence,
+            through_sequence,
+            &events,
+            narrative_checkpoint,
+            capture_gaps,
+            &rendered,
+        )
+    } else {
+        std::io::stdout()
+            .write_all(rendered.markdown.as_bytes())
+            .map_err(|source| io("stdout", source))?;
+        Ok(0)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_handoff_projection(
+    store: &SessionStore,
+    from_provider: Option<Provider>,
+    to_provider: Provider,
+    transition_sequence: u64,
+    through_sequence: u64,
+    events: &[Event],
+    narrative_checkpoint: Option<(u64, Checkpoint)>,
+    capture_gaps: Vec<CaptureGap>,
+    rendered: &crate::handoff::RenderedHandoff,
+) -> Result<i32> {
+    let value = serde_json::json!({
+        "schema_version": 1,
+        "session_id": store.id(),
+        "from_provider": from_provider,
+        "to_provider": to_provider,
+        "transition": {
+            "sequence": transition_sequence,
+            "through_sequence": through_sequence,
+        },
+        "narrative_checkpoint": narrative_checkpoint.map(|(sequence, checkpoint)| {
+            serde_json::json!({
+                "sequence": sequence,
+                "through_sequence": checkpoint.through_sequence,
+                "author": checkpoint.author,
+                "events_since": events.iter().filter(|event| event.sequence > sequence).count() as u64,
+            })
+        }),
+        "capture_gaps": capture_gaps.into_iter().map(|gap| serde_json::json!({
+            "sequence": gap.sequence,
+            "phase": gap.phase,
+            "message": gap.message,
+        })).collect::<Vec<_>>(),
+        "omitted": rendered.omitted,
+        "markdown_bytes": rendered.markdown.len(),
+        "markdown": rendered.markdown,
+    });
+    write_projection(&value, true)?;
+    Ok(0)
 }
 
 fn recover_stale_lease(
