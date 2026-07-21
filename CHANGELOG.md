@@ -14,6 +14,9 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 - Inspect, status, log, doctor, setup, and complete logical deletion commands.
 - Verified worktree forks with staged, unstaged, and untracked state, durable
   transaction recovery, and parent-child session lineage.
+- A global `sesh list` command that reports every local session across
+  repositories, rendering corrupt sessions as degraded diagnostic rows instead
+  of failing the listing.
 
 ### Security
 

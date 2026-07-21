@@ -90,6 +90,11 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
                 input_is_terminal,
             )
         }
+        Command::List { json } => {
+            let cwd = std::env::current_dir().map_err(|source| io(".", source))?;
+            let layout = resolve_layout(environment, &cwd)?;
+            crate::list::list_command(json, &layout)
+        }
         Command::Status { json } => status_command(json, environment),
         Command::Log { from, json } => log_command(from, json, environment),
         Command::Inspect { json } => inspect_command(json, environment),
@@ -1689,7 +1694,7 @@ fn remove_tree_without_following(path: &Path) -> Result<()> {
     }
 }
 
-fn write_projection(value: &serde_json::Value, compact: bool) -> Result<()> {
+pub(crate) fn write_projection(value: &serde_json::Value, compact: bool) -> Result<()> {
     let mut bytes = if compact {
         serde_json::to_vec(value)
     } else {

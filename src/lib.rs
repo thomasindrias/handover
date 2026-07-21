@@ -6,6 +6,7 @@ pub mod error;
 pub mod fork;
 pub mod git;
 pub mod handoff;
+pub mod list;
 pub mod model;
 pub mod provider;
 pub mod runtime;

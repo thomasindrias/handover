@@ -56,6 +56,7 @@ sesh switch codex
 Inspect what Sesh knows:
 
 ```bash
+sesh list
 sesh status
 sesh log
 sesh inspect

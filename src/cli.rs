@@ -43,6 +43,10 @@ pub enum Command {
         #[arg(long)]
         from_provider: bool,
     },
+    List {
+        #[arg(long)]
+        json: bool,
+    },
     Status {
         #[arg(long)]
         json: bool,
