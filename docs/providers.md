@@ -126,6 +126,15 @@ or fields do not become canonical data automatically. Hook input is size-bounded
 sensitive environment values are not copied, and canonical writes still pass
 through session locks and schema validation.
 
+On `Stop`, Sesh may reply with a single `systemMessage` warning when 20 or
+more events have been observed since the latest narrative checkpoint. The
+shape follows Claude Code's documented Stop-hook output contract, which
+validates Stop output strictly; the warning never blocks the stop and a
+failure to compute it degrades to empty output. Codex documents the same
+output fields, but delivery through Sesh's configuration overlays in
+interactive Codex sessions is not yet verified upstream, so the nudge
+remains best-effort observation on both providers.
+
 Claude assets are stored as a versioned plugin manifest and hook definitions.
 Codex assets are stored as versioned configuration overlays. `sesh doctor`
 checks that materialized assets still match the Sesh version.
