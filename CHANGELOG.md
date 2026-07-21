@@ -17,6 +17,9 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 - A global `sesh list` command that reports every local session across
   repositories, rendering corrupt sessions as degraded diagnostic rows instead
   of failing the listing.
+- A `sesh handoff <provider>` command that renders the exact handoff a
+  switch would produce right now, without switching, so a missing or stale
+  narrative checkpoint is visible before a switch is spent.
 
 ### Security
 

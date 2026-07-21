@@ -50,6 +50,12 @@ Git facts, recent activity and failures, provider transition, fork lineage when
 present, omissions, and the expected next action. It is generated from committed
 Sesh state rather than a provider transcript.
 
+`sesh handoff <provider> [--json]` renders this same content without
+switching: no event is appended, no checkpoint is committed, and no
+provider launches. It applies the same fail-closed snapshot verification as
+`switch`, so a missing or stale narrative checkpoint is visible before a
+switch is spent.
+
 ## Checkpoints
 
 A checkpoint is the portable narrative that observed activity cannot supply.
