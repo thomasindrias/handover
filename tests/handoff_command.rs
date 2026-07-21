@@ -134,3 +134,94 @@ fn handoff_reports_missing_narrative_checkpoint_like_a_real_switch_would() {
         "No narrative checkpoint exists. Objective, decisions, assumptions, and next steps were not checkpointed."
     ));
 }
+
+#[test]
+fn handoff_json_exposes_narrative_freshness_and_the_rendered_markdown() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    let cwd = repo.join("apps/web");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    fake_claude_with_narrative(&bin);
+    let state = temp.path().join("state");
+    let path = path_with(&bin);
+
+    cargo_bin_cmd!("sesh")
+        .current_dir(&cwd)
+        .env("SESH_HOME", &state)
+        .env("PATH", &path)
+        .args(["run", "claude"])
+        .assert()
+        .success();
+
+    let handoff_output = cargo_bin_cmd!("sesh")
+        .current_dir(&repo)
+        .env("SESH_HOME", &state)
+        .args(["handoff", "codex", "--json"])
+        .output()
+        .unwrap();
+    assert!(handoff_output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&handoff_output.stdout).unwrap();
+
+    assert_eq!(value["schema_version"], 1);
+    assert!(value["session_id"].as_str().is_some());
+    assert_eq!(value["from_provider"], "claude");
+    assert_eq!(value["to_provider"], "codex");
+    let sequence = value["transition"]["sequence"].as_u64().unwrap();
+    let through_sequence = value["transition"]["through_sequence"].as_u64().unwrap();
+    assert_eq!(sequence, through_sequence + 1);
+    assert!(value["narrative_checkpoint"]["sequence"].as_u64().is_some());
+    assert!(
+        value["narrative_checkpoint"]["events_since"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(value["narrative_checkpoint"]["author"]["kind"], "provider");
+    assert_eq!(
+        value["narrative_checkpoint"]["author"]["provider"],
+        "claude"
+    );
+    assert!(value["capture_gaps"].as_array().unwrap().is_empty());
+    assert_eq!(value["omitted"], false);
+    let markdown = value["markdown"].as_str().unwrap();
+    assert!(markdown.starts_with("# Sesh handoff"));
+    assert_eq!(
+        value["markdown_bytes"].as_u64().unwrap() as usize,
+        markdown.len()
+    );
+}
+
+#[test]
+fn handoff_json_reports_null_narrative_checkpoint_when_none_exists() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    let cwd = repo.join("apps/web");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    fake_claude_without_narrative(&bin);
+    let state = temp.path().join("state");
+    let path = path_with(&bin);
+
+    cargo_bin_cmd!("sesh")
+        .current_dir(&cwd)
+        .env("SESH_HOME", &state)
+        .env("PATH", &path)
+        .args(["run", "claude"])
+        .assert()
+        .success();
+
+    let handoff_output = cargo_bin_cmd!("sesh")
+        .current_dir(&repo)
+        .env("SESH_HOME", &state)
+        .args(["handoff", "codex", "--json"])
+        .output()
+        .unwrap();
+    assert!(handoff_output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&handoff_output.stdout).unwrap();
+    assert!(value["narrative_checkpoint"].is_null());
+}

@@ -957,28 +957,55 @@ fn handoff_command(provider: Provider, json: bool, environment: &Environment) ->
             narrative_checkpoint,
             capture_gaps,
             &rendered,
-        )?;
+        )
     } else {
         std::io::stdout()
             .write_all(rendered.markdown.as_bytes())
             .map_err(|source| io("stdout", source))?;
+        Ok(0)
     }
-    Ok(0)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn write_handoff_projection(
-    _store: &SessionStore,
-    _from_provider: Option<Provider>,
-    _to_provider: Provider,
-    _transition_sequence: u64,
-    _through_sequence: u64,
-    _events: &[Event],
-    _narrative_checkpoint: Option<(u64, Checkpoint)>,
-    _capture_gaps: Vec<CaptureGap>,
-    _rendered: &crate::handoff::RenderedHandoff,
+    store: &SessionStore,
+    from_provider: Option<Provider>,
+    to_provider: Provider,
+    transition_sequence: u64,
+    through_sequence: u64,
+    events: &[Event],
+    narrative_checkpoint: Option<(u64, Checkpoint)>,
+    capture_gaps: Vec<CaptureGap>,
+    rendered: &crate::handoff::RenderedHandoff,
 ) -> Result<i32> {
-    unreachable!("Task 3 implements the --json projection")
+    let value = serde_json::json!({
+        "schema_version": 1,
+        "session_id": store.id(),
+        "from_provider": from_provider,
+        "to_provider": to_provider,
+        "transition": {
+            "sequence": transition_sequence,
+            "through_sequence": through_sequence,
+        },
+        "narrative_checkpoint": narrative_checkpoint.map(|(sequence, checkpoint)| {
+            serde_json::json!({
+                "sequence": sequence,
+                "through_sequence": checkpoint.through_sequence,
+                "author": checkpoint.author,
+                "events_since": events.iter().filter(|event| event.sequence > sequence).count() as u64,
+            })
+        }),
+        "capture_gaps": capture_gaps.into_iter().map(|gap| serde_json::json!({
+            "sequence": gap.sequence,
+            "phase": gap.phase,
+            "message": gap.message,
+        })).collect::<Vec<_>>(),
+        "omitted": rendered.omitted,
+        "markdown_bytes": rendered.markdown.len(),
+        "markdown": rendered.markdown,
+    });
+    write_projection(&value, true)?;
+    Ok(0)
 }
 
 fn recover_stale_lease(
