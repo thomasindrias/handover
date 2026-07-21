@@ -72,6 +72,39 @@ exit 0
     assert!(status["latest_checkpoint"]["sequence"].as_u64().is_some());
     assert!(status["capture_gaps"].is_array());
 
+    assert_eq!(
+        status["latest_narrative_checkpoint"],
+        status["latest_checkpoint"]["sequence"]
+    );
+    let events_since = status["events_since_narrative"].as_u64().unwrap();
+    assert!(
+        (2..20).contains(&events_since),
+        "expected a small post-checkpoint tail, got {events_since}"
+    );
+
+    let list_output = cargo_bin_cmd!("sesh")
+        .current_dir(&repo)
+        .env("SESH_HOME", &state)
+        .args(["list", "--json"])
+        .output()
+        .unwrap();
+    assert!(list_output.status.success());
+    let list: serde_json::Value = serde_json::from_slice(&list_output.stdout).unwrap();
+    let row = list["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["session_id"] == status["session_id"])
+        .unwrap();
+    assert_eq!(
+        row["latest_narrative_checkpoint"],
+        status["latest_narrative_checkpoint"]
+    );
+    assert_eq!(
+        row["events_since_narrative"],
+        status["events_since_narrative"]
+    );
+
     let log_output = cargo_bin_cmd!("sesh")
         .current_dir(&repo)
         .env("SESH_HOME", &state)

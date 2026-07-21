@@ -1328,6 +1328,7 @@ fn status_command(json: bool, environment: &Environment) -> Result<i32> {
         .canonicalize()
         .map_err(|source| io(&saved_cwd_path, source))?;
     let (_, _, _, gaps) = command_facts(&store, &events)?;
+    let (latest_narrative, events_since) = crate::list::narrative_freshness(&events);
     let value = serde_json::json!({
         "schema_version": 1,
         "session_id": store.id(),
@@ -1343,6 +1344,8 @@ fn status_command(json: bool, environment: &Environment) -> Result<i32> {
             "dirty_submodules": snapshot.dirty_submodules,
         },
         "latest_checkpoint": latest_checkpoint_value(&store, &events)?,
+        "latest_narrative_checkpoint": latest_narrative,
+        "events_since_narrative": events_since,
         "capture_gaps": gaps.into_iter().map(|gap| serde_json::json!({
             "sequence": gap.sequence,
             "phase": gap.phase,
