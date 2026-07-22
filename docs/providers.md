@@ -153,19 +153,22 @@ Sesh version.
 The normal test suite uses deterministic local provider fixtures and never logs
 in, opens an agent session, supplies a prompt, or spends model quota.
 
-Two ignored tests can validate the installed CLIs and static integration assets:
+One ignored test can validate the installed Claude CLI against a static
+integration asset without starting a model conversation:
 
 ```bash
 cargo test --test provider_smoke -- --ignored --exact \
   claude_validates_the_materialized_sesh_plugin_without_opening_a_session
-
-cargo test --test provider_smoke -- --ignored --exact \
-  codex_accepts_every_static_hook_overlay_without_opening_a_session
 ```
 
-The Claude test runs plugin validation against a temporary materialization. The
-Codex test asks strict configuration parsing to list features with each static
-overlay. Neither test starts a model conversation.
+It runs plugin validation against a temporary materialization. Codex has no
+equivalent: no installed-CLI command inspects `hooks.json` without starting
+a real session (`codex doctor` was tried and confirmed to ignore the file
+entirely), so `tests/provider_smoke.rs` documents that gap in a comment
+rather than asserting a check that would only test authentication.
+`CodexAdapter`'s own unit tests still cover the materialized file's shape
+and content without a real CLI; confirming Codex actually reads and fires
+the hooks requires a real, manually run session.
 
 Provider releases can change their CLI or hook contracts. When an optional smoke
 test fails, inspect the installed provider version and adapter assets before
