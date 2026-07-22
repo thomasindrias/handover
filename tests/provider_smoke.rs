@@ -32,27 +32,30 @@ fn claude_validates_the_materialized_sesh_plugin_without_opening_a_session() {
 
 #[test]
 #[ignore = "requires the provider CLI to be installed"]
-fn codex_accepts_every_static_hook_overlay_without_opening_a_session() {
+fn codex_accepts_the_materialized_hooks_file_without_opening_a_session() {
     let temp = TempDir::new().unwrap();
     let layout = StateLayout::new(temp.path().join("state"));
     layout.ensure().unwrap();
     adapter(Provider::Codex)
         .setup(&layout.integrations())
         .unwrap();
-    let overlays =
-        std::fs::read_to_string(layout.integrations().join("codex/1/hooks.txt")).unwrap();
-    let mut command = Command::new("codex");
-    command
-        .env("SESH_HOME", layout.root())
-        .arg("--strict-config");
-    for overlay in overlays.lines() {
-        command.args(["-c", overlay]);
-    }
-    let output = command.args(["features", "list"]).output().unwrap();
+    let codex_home = temp.path().join("codex_home");
+    std::fs::create_dir(&codex_home).unwrap();
+    std::os::unix::fs::symlink(
+        layout.integrations().join("codex/1/hooks.json"),
+        codex_home.join("hooks.json"),
+    )
+    .unwrap();
+
+    let output = Command::new("codex")
+        .env("CODEX_HOME", &codex_home)
+        .arg("doctor")
+        .output()
+        .unwrap();
 
     assert!(
         output.status.success(),
-        "codex strict overlay validation failed: {}",
+        "codex doctor failed with the materialized hooks.json present: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
