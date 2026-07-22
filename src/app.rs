@@ -933,32 +933,46 @@ fn collect_recent_events(
     Ok(recent_events)
 }
 
-fn handoff_command(provider: Provider, json: bool, environment: &Environment) -> Result<i32> {
-    let invocation_cwd = std::env::current_dir().map_err(|source| io(".", source))?;
-    let layout = resolve_layout(environment, &invocation_cwd)?;
-    let invocation_snapshot = Git::new().snapshot(&invocation_cwd)?;
-    let store = SessionStore::find_for_worktree(&layout, &invocation_snapshot.identity)?
-        .ok_or_else(|| Error::InvalidState("this worktree has no Sesh session".into()))?;
+struct HandoffPreview {
+    events: Vec<Event>,
+    from_provider: Option<Provider>,
+    transition_sequence: u64,
+    through_sequence: u64,
+    narrative_checkpoint: Option<(u64, Checkpoint)>,
+    capture_gaps: Vec<CaptureGap>,
+    rendered: crate::handoff::RenderedHandoff,
+}
 
-    let (saved_cwd_relative, saved_cwd) = resolve_saved_cwd(&store)?;
+/// Dry-run of the same handoff a `switch` to `to_provider` would build:
+/// resolves the saved cwd, verifies it against `invocation_snapshot`, and
+/// renders — a pure read with no mutation, no lease/journal writes. Used
+/// by `handoff_command` (`sesh handoff`) and by `status_command`'s
+/// `switch_readiness` check so both report the exact same verdict
+/// `switch` itself will produce.
+fn preview_handoff(
+    store: &SessionStore,
+    invocation_snapshot: &GitSnapshot,
+    to_provider: Provider,
+) -> Result<HandoffPreview> {
+    let (saved_cwd_relative, saved_cwd) = resolve_saved_cwd(store)?;
     let switch_snapshot = Git::new().snapshot(&saved_cwd)?;
     verify_switch_snapshot(
-        &invocation_snapshot,
+        invocation_snapshot,
         &switch_snapshot,
         &store.meta().worktree,
         &saved_cwd_relative,
     )?;
 
     let events = store.events()?;
-    let previous_provider_value = previous_provider(&events)?;
-    let narrative_checkpoint = latest_narrative_checkpoint(&store, &events)?;
+    let from_provider = previous_provider(&events)?;
+    let narrative_checkpoint = latest_narrative_checkpoint(store, &events)?;
     let narrative_sequence = narrative_checkpoint.as_ref().map(|item| item.0);
 
     let envelopes = store.envelopes()?;
     let recent_boundary = narrative_sequence.unwrap_or(0);
     let recent_events = collect_recent_events(&envelopes, recent_boundary)?;
     let (recent_commands, latest_test, latest_failure, capture_gaps) =
-        command_facts(&store, &events)?;
+        command_facts(store, &events)?;
 
     let through_sequence = events.last().map(|event| event.sequence).unwrap_or(0);
     let transition_sequence = through_sequence + 1;
@@ -975,8 +989,8 @@ fn handoff_command(provider: Provider, json: bool, environment: &Environment) ->
         HandoffInput {
             session_id: store.id().clone(),
             parent_lineage: None,
-            from_provider: previous_provider_value,
-            to_provider: provider,
+            from_provider,
+            to_provider,
             transition_sequence,
             transition_checkpoint,
             narrative_checkpoint: narrative_checkpoint.clone(),
@@ -996,21 +1010,41 @@ fn handoff_command(provider: Provider, json: bool, environment: &Environment) ->
         ));
     }
 
+    Ok(HandoffPreview {
+        events,
+        from_provider,
+        transition_sequence,
+        through_sequence,
+        narrative_checkpoint,
+        capture_gaps,
+        rendered,
+    })
+}
+
+fn handoff_command(provider: Provider, json: bool, environment: &Environment) -> Result<i32> {
+    let invocation_cwd = std::env::current_dir().map_err(|source| io(".", source))?;
+    let layout = resolve_layout(environment, &invocation_cwd)?;
+    let invocation_snapshot = Git::new().snapshot(&invocation_cwd)?;
+    let store = SessionStore::find_for_worktree(&layout, &invocation_snapshot.identity)?
+        .ok_or_else(|| Error::InvalidState("this worktree has no Sesh session".into()))?;
+
+    let preview = preview_handoff(&store, &invocation_snapshot, provider)?;
+
     if json {
         write_handoff_projection(
             &store,
-            previous_provider_value,
+            preview.from_provider,
             provider,
-            transition_sequence,
-            through_sequence,
-            &events,
-            narrative_checkpoint,
-            capture_gaps,
-            &rendered,
+            preview.transition_sequence,
+            preview.through_sequence,
+            &preview.events,
+            preview.narrative_checkpoint,
+            preview.capture_gaps,
+            &preview.rendered,
         )
     } else {
         std::io::stdout()
-            .write_all(rendered.markdown.as_bytes())
+            .write_all(preview.rendered.markdown.as_bytes())
             .map_err(|source| io("stdout", source))?;
         Ok(0)
     }
