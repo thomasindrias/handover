@@ -105,9 +105,26 @@ reporting instructions.
 ## Project status
 
 Sesh is early-stage V1 software. The core Claude Code to Codex continuation path,
-checkpoints, inspection, deletion, and explicit worktree forks are implemented
-and tested on Unix-like systems. Storage formats and CLI details may still change
-before a stable release.
+checkpoints, handoff previews, cross-repository session listing, inspection,
+deletion, and explicit worktree forks are implemented and tested on Unix-like
+systems. Storage formats and CLI details may still change before a stable
+release.
+
+## Roadmap
+
+Planned, in rough order:
+
+- **v0.1.0** — switch-moment polish, prebuilt binaries, a Homebrew formula,
+  and a short tutorial.
+- **More providers** — Gemini CLI, opencode, Cursor CLI. Not every CLI exposes
+  lifecycle hooks, so provider support will be tiered and documented honestly.
+- **Multi-machine** — sync through a private Git remote you control, and
+  single-file session export and import.
+- **A session browser** — the form is deliberately undecided until `list` and
+  `handoff` have seen real daily use.
+
+Not planned: a cloud service, Windows support (for now), embeddings, or
+AI-generated summaries. Sync will always be a Git remote you own.
 
 ## Contributing
 
