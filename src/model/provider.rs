@@ -15,6 +15,13 @@ impl Provider {
             Self::Codex => "codex",
         }
     }
+
+    pub fn other(self) -> Self {
+        match self {
+            Self::Claude => Self::Codex,
+            Self::Codex => Self::Claude,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -34,5 +41,11 @@ mod tests {
         assert_eq!(Provider::Claude.executable(), "claude");
         assert_eq!(Provider::Codex.executable(), "codex");
         assert!(serde_json::from_str::<Provider>("\"gemini\"").is_err());
+    }
+
+    #[test]
+    fn other_returns_the_opposite_variant() {
+        assert_eq!(Provider::Claude.other(), Provider::Codex);
+        assert_eq!(Provider::Codex.other(), Provider::Claude);
     }
 }
