@@ -31,7 +31,7 @@ fn claude_validates_the_materialized_sesh_plugin_without_opening_a_session() {
 }
 
 #[test]
-#[ignore = "requires the provider CLI to be installed"]
+#[ignore = "requires the provider CLI to be installed and authenticated"]
 fn codex_accepts_the_materialized_hooks_file_without_opening_a_session() {
     let temp = TempDir::new().unwrap();
     let layout = StateLayout::new(temp.path().join("state"));
@@ -46,6 +46,15 @@ fn codex_accepts_the_materialized_hooks_file_without_opening_a_session() {
         codex_home.join("hooks.json"),
     )
     .unwrap();
+    // `codex doctor` treats missing auth as a hard failure independent of
+    // hooks.json, so mirror what a real launch does (best-effort symlink of
+    // the real auth.json) rather than testing against an artificially
+    // incomplete CODEX_HOME.
+    if let Some(real_auth) = real_codex_home().map(|home| home.join("auth.json"))
+        && real_auth.exists()
+    {
+        std::os::unix::fs::symlink(real_auth, codex_home.join("auth.json")).unwrap();
+    }
 
     let output = Command::new("codex")
         .env("CODEX_HOME", &codex_home)
@@ -58,4 +67,13 @@ fn codex_accepts_the_materialized_hooks_file_without_opening_a_session() {
         "codex doctor failed with the materialized hooks.json present: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn real_codex_home() -> Option<std::path::PathBuf> {
+    if let Ok(home) = std::env::var("CODEX_HOME") {
+        return Some(std::path::PathBuf::from(home));
+    }
+    std::env::var("HOME")
+        .ok()
+        .map(|home| std::path::PathBuf::from(home).join(".codex"))
 }
