@@ -24,6 +24,13 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
   `latest_narrative_checkpoint` and `events_since_narrative`, and the Stop
   hook warns with a single `systemMessage` when 20 or more events accumulate
   without a fresh narrative checkpoint.
+- Switch-moment ergonomics: a live-lease refusal in `sesh switch` now names
+  the holding provider, pid, and start time with a one-line next step; a
+  same-host stale lease is recovered only through an explicit, journaled
+  `sesh switch` prompt (or `--recover-lease` non-interactively) instead of
+  silently auto-recovering; and `sesh status` reports a `switch_readiness`
+  block (lease state, checkpoint freshness, handoff renderability) so a
+  switch's success can be seen before quitting the current provider.
 
 ### Fixed
 
