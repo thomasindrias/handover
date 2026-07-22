@@ -1612,7 +1612,7 @@ fn status_command(json: bool, environment: &Environment) -> Result<i32> {
             Ok(_) => (true, None),
             Err(error) => (false, Some(error.to_string())),
         };
-    let ready = lease_state != "blocked" && handoff_renderable;
+    let ready = lease_state == "free" && handoff_renderable;
     let value = serde_json::json!({
         "schema_version": 1,
         "session_id": store.id(),
