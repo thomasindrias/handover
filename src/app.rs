@@ -1538,6 +1538,57 @@ fn add_run_environment(
     }
 }
 
+fn classify_lease(leases: &LeaseStore) -> Result<(&'static str, Option<String>)> {
+    let Some(lease) = leases.read()? else {
+        return Ok(("free", None));
+    };
+    if lease.host != host_name()? {
+        return Ok((
+            "blocked",
+            Some(format!(
+                "lease belongs to host {} ({}, {}); liveness cannot be checked from this host",
+                lease.host,
+                lease.provider.executable(),
+                lease.supervisor.describe()
+            )),
+        ));
+    }
+    let supervisor_live = lease.supervisor.is_live()?;
+    let child_live = lease
+        .child
+        .as_ref()
+        .map(ProcessIdentity::is_live)
+        .transpose()?
+        .unwrap_or(false);
+    if supervisor_live || child_live {
+        let holder = if child_live {
+            lease
+                .child
+                .as_ref()
+                .expect("child_live implies child is present")
+        } else {
+            &lease.supervisor
+        };
+        return Ok((
+            "blocked",
+            Some(format!(
+                "{} is still running this session ({})",
+                lease.provider.executable(),
+                holder.describe()
+            )),
+        ));
+    }
+    let holder = lease.child.as_ref().unwrap_or(&lease.supervisor);
+    Ok((
+        "recoverable",
+        Some(format!(
+            "stale {} lease ({}); switch will prompt to recover it, or pass --recover-lease",
+            lease.provider.executable(),
+            holder.describe()
+        )),
+    ))
+}
+
 fn status_command(json: bool, environment: &Environment) -> Result<i32> {
     let (_layout, snapshot, store) = current_session(environment)?;
     let events = store.events()?;
@@ -1552,6 +1603,16 @@ fn status_command(json: bool, environment: &Environment) -> Result<i32> {
         .map_err(|source| io(&saved_cwd_path, source))?;
     let (_, _, _, gaps) = command_facts(&store, &events)?;
     let (latest_narrative, events_since) = crate::list::narrative_freshness(&events);
+    let leases = LeaseStore::new(&store.session_dir());
+    let (lease_state, lease_reason) = classify_lease(&leases)?;
+    let checkpoint_fresh = events_since < STALE_NARRATIVE_EVENT_THRESHOLD;
+    let target_provider = provider.map(Provider::other).unwrap_or(Provider::Claude);
+    let (handoff_renderable, handoff_error) =
+        match preview_handoff(&store, &snapshot, target_provider) {
+            Ok(_) => (true, None),
+            Err(error) => (false, Some(error.to_string())),
+        };
+    let ready = lease_state != "blocked" && handoff_renderable;
     let value = serde_json::json!({
         "schema_version": 1,
         "session_id": store.id(),
@@ -1574,6 +1635,14 @@ fn status_command(json: bool, environment: &Environment) -> Result<i32> {
             "phase": gap.phase,
             "message": gap.message,
         })).collect::<Vec<_>>(),
+        "switch_readiness": {
+            "ready": ready,
+            "lease": lease_state,
+            "lease_reason": lease_reason,
+            "checkpoint_fresh": checkpoint_fresh,
+            "handoff_renderable": handoff_renderable,
+            "handoff_error": handoff_error,
+        },
     });
     write_projection(&value, json)?;
     Ok(0)
@@ -2591,7 +2660,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        command_facts, confirm_lease_recovery, latest_narrative_checkpoint,
+        classify_lease, command_facts, confirm_lease_recovery, latest_narrative_checkpoint,
         recover_stale_lease_for_switch, resolve_provider_home, stop_nudge, with_rename_rollback,
     };
     use crate::error::Error;
@@ -2879,6 +2948,65 @@ mod tests {
             .to_string();
             assert!(error.contains("not recovered"));
         }
+    }
+
+    #[test]
+    fn classify_lease_distinguishes_free_recoverable_and_blocked() {
+        let (_temp, store) = store_fixture();
+        let leases = LeaseStore::new(&store.session_dir());
+
+        let (state, reason) = classify_lease(&leases).unwrap();
+        assert_eq!(state, "free");
+        assert!(reason.is_none());
+
+        let dead = RunLease::new(
+            store.id().clone(),
+            RunId::new(),
+            Provider::Claude,
+            ProcessIdentity {
+                pid: u32::MAX,
+                start_token: "gone".into(),
+            },
+        )
+        .unwrap();
+        leases.create(&dead).unwrap();
+        let (state, reason) = classify_lease(&leases).unwrap();
+        assert_eq!(state, "recoverable");
+        assert!(reason.unwrap().contains("--recover-lease"));
+        leases.clear(&dead.run_id).unwrap();
+
+        let live = RunLease::new(
+            store.id().clone(),
+            RunId::new(),
+            Provider::Claude,
+            ProcessIdentity::capture(std::process::id()).unwrap(),
+        )
+        .unwrap();
+        leases.create(&live).unwrap();
+        let (state, reason) = classify_lease(&leases).unwrap();
+        assert_eq!(state, "blocked");
+        assert!(
+            reason
+                .unwrap()
+                .contains(&format!("pid {}", std::process::id()))
+        );
+        leases.clear(&live.run_id).unwrap();
+
+        let mut foreign = RunLease::new(
+            store.id().clone(),
+            RunId::new(),
+            Provider::Claude,
+            ProcessIdentity {
+                pid: u32::MAX,
+                start_token: "gone".into(),
+            },
+        )
+        .unwrap();
+        foreign.host = "different-host".into();
+        leases.create(&foreign).unwrap();
+        let (state, reason) = classify_lease(&leases).unwrap();
+        assert_eq!(state, "blocked");
+        assert!(reason.unwrap().contains("different-host"));
     }
 
     #[test]
