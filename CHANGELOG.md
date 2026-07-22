@@ -25,6 +25,14 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
   hook warns with a single `systemMessage` when 20 or more events accumulate
   without a fresh narrative checkpoint.
 
+### Fixed
+
+- Codex hook delivery: hooks registered via `-c` config overlays never
+  actually fired against real Codex CLI builds. Each Codex launch now gets
+  a private, per-run `CODEX_HOME` with a materialized `hooks.json` and
+  symlinked real `config.toml`/`auth.json`, verified working end to end
+  against Codex 0.145.0.
+
 ### Security
 
 - Private local state permissions, ownership and symlink checks, and fail-closed

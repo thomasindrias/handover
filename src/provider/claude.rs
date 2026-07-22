@@ -79,6 +79,8 @@ mod tests {
                 hook_bin: Path::new("/usr/local/bin/sesh"),
                 provider_args: &args,
                 bootstrap: None,
+                run_dir: Path::new("/state/run"),
+                provider_home: None,
             })
             .unwrap();
 
@@ -116,6 +118,8 @@ mod tests {
                 hook_bin: Path::new("/bin/sesh"),
                 provider_args: &args,
                 bootstrap: Some("continue"),
+                run_dir: Path::new("/run"),
+                provider_home: None,
             })
             .unwrap();
         assert_eq!(spec.args[spec.args.len() - 2], raw);

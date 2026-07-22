@@ -344,6 +344,7 @@ fn fork_command(
             request.provider,
             ProcessIdentity::capture(std::process::id())?,
         )?)?;
+        let provider_home = resolve_provider_home(request.provider, environment);
         let mut spec = provider_adapter.launch_spec(LaunchContext {
             cwd: &target_cwd,
             inbox: &run_paths.inbox,
@@ -351,6 +352,8 @@ fn fork_command(
             hook_bin: &hook_bin,
             provider_args: &request.provider_args,
             bootstrap: Some(BOOTSTRAP),
+            run_dir: &run_paths.root,
+            provider_home: provider_home.as_deref(),
         })?;
         add_run_environment(
             &mut spec.env,
@@ -456,18 +459,21 @@ fn setup_command(
         .canonicalize()
         .map_err(|source| io("current executable", source))?;
     let mut arguments = Vec::<OsString>::new();
+    let mut extra_env = Vec::<(&str, OsString)>::new();
     match provider {
         Provider::Claude => {
             arguments.push("--plugin-dir".into());
             arguments.push(layout.integrations().join("claude/1").into_os_string());
         }
         Provider::Codex => {
-            let overlays = std::fs::read_to_string(layout.integrations().join("codex/1/hooks.txt"))
-                .map_err(|source| io(layout.integrations().join("codex/1/hooks.txt"), source))?;
-            for overlay in overlays.lines() {
-                arguments.push("-c".into());
-                arguments.push(overlay.into());
-            }
+            let review_dir = layout.integrations().join("codex/1/review");
+            let provider_home = resolve_provider_home(provider, environment);
+            crate::provider::codex::materialize_codex_home(
+                &review_dir,
+                &layout.integrations().join("codex/1/hooks.json"),
+                provider_home.as_deref(),
+            )?;
+            extra_env.push(("CODEX_HOME", review_dir.into_os_string()));
         }
     }
     let command = std::iter::once(OsString::from(provider.executable()))
@@ -475,10 +481,16 @@ fn setup_command(
         .map(|argument| shell_words::quote(&argument.to_string_lossy()).into_owned())
         .collect::<Vec<_>>()
         .join(" ");
-    let equivalent = format!(
+    let mut equivalent = format!(
         "SESH_HOOK_BIN={} {command}",
         shell_words::quote(&hook_bin.to_string_lossy())
     );
+    for (key, value) in &extra_env {
+        equivalent = format!(
+            "{key}={} {equivalent}",
+            shell_words::quote(&value.to_string_lossy())
+        );
+    }
     if !input_is_terminal {
         println!("{equivalent}");
         return Ok(2);
@@ -491,7 +503,8 @@ fn setup_command(
             "Open /hooks, review commands equal to '\"$SESH_HOOK_BIN\" __hook codex', trust them, then exit."
         ),
     }
-    let status = std::process::Command::new(provider.executable())
+    let mut command = std::process::Command::new(provider.executable());
+    command
         .args(&arguments)
         .env("SESH_HOOK_BIN", &hook_bin)
         .env_remove("SESH_HOME")
@@ -500,7 +513,11 @@ fn setup_command(
         .env_remove("SESH_PROVIDER")
         .env_remove("SESH_PROVIDER_VERSION")
         .env_remove("SESH_HANDOFF_PATH")
-        .env_remove("SESH_CHECKPOINT_INBOX")
+        .env_remove("SESH_CHECKPOINT_INBOX");
+    for (key, value) in &extra_env {
+        command.env(key, value);
+    }
+    let status = command
         .status()
         .map_err(|error| Error::Command(format!("cannot launch setup TUI: {error}")))?;
     Ok(status.code().unwrap_or(1))
@@ -611,6 +628,7 @@ pub fn run_command(
         ProcessIdentity::capture(std::process::id())?,
     )?;
     leases.create(&lease)?;
+    let provider_home = resolve_provider_home(provider, environment);
     let mut spec = provider_adapter.launch_spec(LaunchContext {
         cwd: &cwd,
         inbox: &run_paths.inbox,
@@ -618,6 +636,8 @@ pub fn run_command(
         hook_bin: &hook_bin,
         provider_args: &provider_args,
         bootstrap: None,
+        run_dir: &run_paths.root,
+        provider_home: provider_home.as_deref(),
     })?;
     for (key, value) in [
         ("SESH_HOME", layout.root().as_os_str()),
@@ -787,6 +807,7 @@ pub fn switch_command(
         ProcessIdentity::capture(std::process::id())?,
     )?;
     leases.create(&lease)?;
+    let provider_home = resolve_provider_home(provider, environment);
     let mut spec = provider_adapter.launch_spec(LaunchContext {
         cwd: &saved_cwd,
         inbox: &run_paths.inbox,
@@ -794,6 +815,8 @@ pub fn switch_command(
         hook_bin: &hook_bin,
         provider_args: &provider_args,
         bootstrap: Some(BOOTSTRAP),
+        run_dir: &run_paths.root,
+        provider_home: provider_home.as_deref(),
     })?;
     add_run_environment(
         &mut spec.env,
@@ -2224,6 +2247,7 @@ fn put_optional(store: &BlobStore, value: Option<String>) -> Result<Option<Conte
 }
 
 struct RunPaths {
+    root: PathBuf,
     inbox: PathBuf,
     checkpoints: PathBuf,
     handoff: PathBuf,
@@ -2267,6 +2291,7 @@ fn prepare_run_directory(
         crate::store::ensure_private_dir(directory)?;
     }
     Ok(RunPaths {
+        root: final_path,
         inbox: final_inbox.clone(),
         checkpoints: final_checkpoints,
         handoff: final_inbox.join("handoff.md"),
@@ -2277,6 +2302,20 @@ fn resolve_layout(environment: &Environment, cwd: &Path) -> Result<StateLayout> 
     let layout = StateLayout::from_environment_at(environment, cwd)?;
     layout.ensure()?;
     layout.canonicalized()
+}
+
+fn resolve_provider_home(provider: Provider, environment: &Environment) -> Option<PathBuf> {
+    if provider != Provider::Codex {
+        return None;
+    }
+    if let Some(home) = environment
+        .get("CODEX_HOME")
+        .filter(|value| !value.is_empty())
+    {
+        return Some(PathBuf::from(home));
+    }
+    let home = environment.get("HOME").filter(|value| !value.is_empty())?;
+    Some(PathBuf::from(home).join(".codex"))
 }
 
 fn required_env_utf8<'a>(environment: &'a Environment, key: &str) -> Result<&'a str> {
@@ -2354,8 +2393,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        command_facts, latest_narrative_checkpoint, recover_stale_lease, stop_nudge,
-        with_rename_rollback,
+        command_facts, latest_narrative_checkpoint, recover_stale_lease, resolve_provider_home,
+        stop_nudge, with_rename_rollback,
     };
     use crate::error::Error;
     use crate::model::{
@@ -2689,6 +2728,43 @@ mod tests {
             stale
                 .stdout
                 .contains("20 events since the last narrative checkpoint")
+        );
+    }
+
+    #[test]
+    fn resolve_provider_home_prefers_codex_home_over_derived_default() {
+        let with_override =
+            crate::store::Environment::from_pairs(std::collections::HashMap::from([
+                ("CODEX_HOME", std::ffi::OsString::from("/custom/codex-home")),
+                ("HOME", std::ffi::OsString::from("/home/dev")),
+            ]));
+        assert_eq!(
+            resolve_provider_home(Provider::Codex, &with_override),
+            Some(PathBuf::from("/custom/codex-home"))
+        );
+
+        let default_only = crate::store::Environment::from_pairs(std::collections::HashMap::from(
+            [("HOME", std::ffi::OsString::from("/home/dev"))],
+        ));
+        assert_eq!(
+            resolve_provider_home(Provider::Codex, &default_only),
+            Some(PathBuf::from("/home/dev/.codex"))
+        );
+
+        let neither = crate::store::Environment::from_pairs(std::collections::HashMap::new());
+        assert_eq!(resolve_provider_home(Provider::Codex, &neither), None);
+    }
+
+    #[test]
+    fn resolve_provider_home_is_none_for_providers_other_than_codex() {
+        let with_codex_home_set =
+            crate::store::Environment::from_pairs(std::collections::HashMap::from([
+                ("CODEX_HOME", std::ffi::OsString::from("/custom/codex-home")),
+                ("HOME", std::ffi::OsString::from("/home/dev")),
+            ]));
+        assert_eq!(
+            resolve_provider_home(Provider::Claude, &with_codex_home_set),
+            None
         );
     }
 }

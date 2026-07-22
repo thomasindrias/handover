@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, io};
 use crate::model::Provider;
 use crate::store::atomic::{create_private, read_private};
 
@@ -20,6 +20,8 @@ pub struct LaunchContext<'a> {
     pub hook_bin: &'a Path,
     pub provider_args: &'a [OsString],
     pub bootstrap: Option<&'a str>,
+    pub run_dir: &'a Path,
+    pub provider_home: Option<&'a Path>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,6 +84,15 @@ fn verify_materialized(path: &Path, expected: &[u8]) -> Result<()> {
             path.display()
         )))
     }
+}
+
+fn refresh_symlink(source: &Path, link: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(link) {
+        Ok(_) => std::fs::remove_file(link).map_err(|error| io(link, error))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io(link, error)),
+    }
+    std::os::unix::fs::symlink(source, link).map_err(|error| io(link, error))
 }
 
 fn probe_version(provider: Provider) -> Result<String> {

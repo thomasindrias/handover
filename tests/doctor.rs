@@ -42,7 +42,7 @@ fn setup_is_inspectable_noninteractive_and_refuses_asset_drift() {
         .args(["setup", "codex"])
         .assert()
         .code(2)
-        .stdout(predicates::str::contains("hooks.SessionStart"))
+        .stdout(predicates::str::contains("CODEX_HOME="))
         .stdout(predicates::str::contains("dangerously-bypass-hook-trust").not());
 
     cargo_bin_cmd!("sesh")

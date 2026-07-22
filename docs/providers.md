@@ -131,32 +131,44 @@ more events have been observed since the latest narrative checkpoint. The
 shape follows Claude Code's documented Stop-hook output contract, which
 validates Stop output strictly; the warning never blocks the stop and a
 failure to compute it degrades to empty output. Codex documents the same
-output fields, but delivery through Sesh's configuration overlays in
-interactive Codex sessions is not yet verified upstream, so the nudge
-remains best-effort observation on both providers.
+output fields; hook delivery to Codex is now confirmed working end to end
+(see below), so the nudge is exercised the same way on both providers.
+Verified against a real Claude Code session: the hook contract holds
+(payloads normalize, the Stop response is accepted without error), but
+`systemMessage` is a UI-layer notice shown only in an interactive session —
+headless invocations (`claude -p`, any `--output-format`) never surface it,
+by design.
 
-Claude assets are stored as a versioned plugin manifest and hook definitions.
-Codex assets are stored as versioned configuration overlays. `sesh doctor`
-checks that materialized assets still match the Sesh version.
+Claude assets are stored as a versioned plugin manifest and hook
+definitions, loaded per session via `--plugin-dir`. Codex assets are stored
+as a versioned `hooks.json`; each launch gives the child process a private,
+per-run `CODEX_HOME` containing that file plus best-effort symlinks to the
+user's real `config.toml`/`auth.json`, so login and preferences carry over
+without Sesh ever writing to the user's actual `~/.codex` or the target
+repository. `sesh doctor` checks that materialized assets still match the
+Sesh version.
 
 ## Optional smoke tests
 
 The normal test suite uses deterministic local provider fixtures and never logs
 in, opens an agent session, supplies a prompt, or spends model quota.
 
-Two ignored tests can validate the installed CLIs and static integration assets:
+One ignored test can validate the installed Claude CLI against a static
+integration asset without starting a model conversation:
 
 ```bash
 cargo test --test provider_smoke -- --ignored --exact \
   claude_validates_the_materialized_sesh_plugin_without_opening_a_session
-
-cargo test --test provider_smoke -- --ignored --exact \
-  codex_accepts_every_static_hook_overlay_without_opening_a_session
 ```
 
-The Claude test runs plugin validation against a temporary materialization. The
-Codex test asks strict configuration parsing to list features with each static
-overlay. Neither test starts a model conversation.
+It runs plugin validation against a temporary materialization. Codex has no
+equivalent: no installed-CLI command inspects `hooks.json` without starting
+a real session (`codex doctor` was tried and confirmed to ignore the file
+entirely), so `tests/provider_smoke.rs` documents that gap in a comment
+rather than asserting a check that would only test authentication.
+`CodexAdapter`'s own unit tests still cover the materialized file's shape
+and content without a real CLI; confirming Codex actually reads and fires
+the hooks requires a real, manually run session.
 
 Provider releases can change their CLI or hook contracts. When an optional smoke
 test fails, inspect the installed provider version and adapter assets before
