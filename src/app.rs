@@ -344,7 +344,7 @@ fn fork_command(
             request.provider,
             ProcessIdentity::capture(std::process::id())?,
         )?)?;
-        let provider_home = resolve_provider_home(environment);
+        let provider_home = resolve_provider_home(request.provider, environment);
         let mut spec = provider_adapter.launch_spec(LaunchContext {
             cwd: &target_cwd,
             inbox: &run_paths.inbox,
@@ -467,7 +467,7 @@ fn setup_command(
         }
         Provider::Codex => {
             let review_dir = layout.integrations().join("codex/1/review");
-            let provider_home = resolve_provider_home(environment);
+            let provider_home = resolve_provider_home(provider, environment);
             crate::provider::codex::materialize_codex_home(
                 &review_dir,
                 &layout.integrations().join("codex/1/hooks.json"),
@@ -628,7 +628,7 @@ pub fn run_command(
         ProcessIdentity::capture(std::process::id())?,
     )?;
     leases.create(&lease)?;
-    let provider_home = resolve_provider_home(environment);
+    let provider_home = resolve_provider_home(provider, environment);
     let mut spec = provider_adapter.launch_spec(LaunchContext {
         cwd: &cwd,
         inbox: &run_paths.inbox,
@@ -807,7 +807,7 @@ pub fn switch_command(
         ProcessIdentity::capture(std::process::id())?,
     )?;
     leases.create(&lease)?;
-    let provider_home = resolve_provider_home(environment);
+    let provider_home = resolve_provider_home(provider, environment);
     let mut spec = provider_adapter.launch_spec(LaunchContext {
         cwd: &saved_cwd,
         inbox: &run_paths.inbox,
@@ -2304,7 +2304,10 @@ fn resolve_layout(environment: &Environment, cwd: &Path) -> Result<StateLayout> 
     layout.canonicalized()
 }
 
-fn resolve_provider_home(environment: &Environment) -> Option<PathBuf> {
+fn resolve_provider_home(provider: Provider, environment: &Environment) -> Option<PathBuf> {
+    if provider != Provider::Codex {
+        return None;
+    }
     if let Some(home) = environment
         .get("CODEX_HOME")
         .filter(|value| !value.is_empty())
@@ -2736,7 +2739,7 @@ mod tests {
                 ("HOME", std::ffi::OsString::from("/home/dev")),
             ]));
         assert_eq!(
-            resolve_provider_home(&with_override),
+            resolve_provider_home(Provider::Codex, &with_override),
             Some(PathBuf::from("/custom/codex-home"))
         );
 
@@ -2744,11 +2747,24 @@ mod tests {
             [("HOME", std::ffi::OsString::from("/home/dev"))],
         ));
         assert_eq!(
-            resolve_provider_home(&default_only),
+            resolve_provider_home(Provider::Codex, &default_only),
             Some(PathBuf::from("/home/dev/.codex"))
         );
 
         let neither = crate::store::Environment::from_pairs(std::collections::HashMap::new());
-        assert_eq!(resolve_provider_home(&neither), None);
+        assert_eq!(resolve_provider_home(Provider::Codex, &neither), None);
+    }
+
+    #[test]
+    fn resolve_provider_home_is_none_for_providers_other_than_codex() {
+        let with_codex_home_set =
+            crate::store::Environment::from_pairs(std::collections::HashMap::from([
+                ("CODEX_HOME", std::ffi::OsString::from("/custom/codex-home")),
+                ("HOME", std::ffi::OsString::from("/home/dev")),
+            ]));
+        assert_eq!(
+            resolve_provider_home(Provider::Claude, &with_codex_home_set),
+            None
+        );
     }
 }
