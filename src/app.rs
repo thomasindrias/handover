@@ -344,6 +344,7 @@ fn fork_command(
             request.provider,
             ProcessIdentity::capture(std::process::id())?,
         )?)?;
+        let provider_home = resolve_provider_home(environment);
         let mut spec = provider_adapter.launch_spec(LaunchContext {
             cwd: &target_cwd,
             inbox: &run_paths.inbox,
@@ -351,6 +352,8 @@ fn fork_command(
             hook_bin: &hook_bin,
             provider_args: &request.provider_args,
             bootstrap: Some(BOOTSTRAP),
+            run_dir: &run_paths.root,
+            provider_home: provider_home.as_deref(),
         })?;
         add_run_environment(
             &mut spec.env,
@@ -611,6 +614,7 @@ pub fn run_command(
         ProcessIdentity::capture(std::process::id())?,
     )?;
     leases.create(&lease)?;
+    let provider_home = resolve_provider_home(environment);
     let mut spec = provider_adapter.launch_spec(LaunchContext {
         cwd: &cwd,
         inbox: &run_paths.inbox,
@@ -618,6 +622,8 @@ pub fn run_command(
         hook_bin: &hook_bin,
         provider_args: &provider_args,
         bootstrap: None,
+        run_dir: &run_paths.root,
+        provider_home: provider_home.as_deref(),
     })?;
     for (key, value) in [
         ("SESH_HOME", layout.root().as_os_str()),
@@ -787,6 +793,7 @@ pub fn switch_command(
         ProcessIdentity::capture(std::process::id())?,
     )?;
     leases.create(&lease)?;
+    let provider_home = resolve_provider_home(environment);
     let mut spec = provider_adapter.launch_spec(LaunchContext {
         cwd: &saved_cwd,
         inbox: &run_paths.inbox,
@@ -794,6 +801,8 @@ pub fn switch_command(
         hook_bin: &hook_bin,
         provider_args: &provider_args,
         bootstrap: Some(BOOTSTRAP),
+        run_dir: &run_paths.root,
+        provider_home: provider_home.as_deref(),
     })?;
     add_run_environment(
         &mut spec.env,
@@ -2224,6 +2233,7 @@ fn put_optional(store: &BlobStore, value: Option<String>) -> Result<Option<Conte
 }
 
 struct RunPaths {
+    root: PathBuf,
     inbox: PathBuf,
     checkpoints: PathBuf,
     handoff: PathBuf,
@@ -2267,6 +2277,7 @@ fn prepare_run_directory(
         crate::store::ensure_private_dir(directory)?;
     }
     Ok(RunPaths {
+        root: final_path,
         inbox: final_inbox.clone(),
         checkpoints: final_checkpoints,
         handoff: final_inbox.join("handoff.md"),
@@ -2277,6 +2288,17 @@ fn resolve_layout(environment: &Environment, cwd: &Path) -> Result<StateLayout> 
     let layout = StateLayout::from_environment_at(environment, cwd)?;
     layout.ensure()?;
     layout.canonicalized()
+}
+
+fn resolve_provider_home(environment: &Environment) -> Option<PathBuf> {
+    if let Some(home) = environment
+        .get("CODEX_HOME")
+        .filter(|value| !value.is_empty())
+    {
+        return Some(PathBuf::from(home));
+    }
+    let home = environment.get("HOME").filter(|value| !value.is_empty())?;
+    Some(PathBuf::from(home).join(".codex"))
 }
 
 fn required_env_utf8<'a>(environment: &'a Environment, key: &str) -> Result<&'a str> {
@@ -2354,8 +2376,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        command_facts, latest_narrative_checkpoint, recover_stale_lease, stop_nudge,
-        with_rename_rollback,
+        command_facts, latest_narrative_checkpoint, recover_stale_lease, resolve_provider_home,
+        stop_nudge, with_rename_rollback,
     };
     use crate::error::Error;
     use crate::model::{
@@ -2690,5 +2712,29 @@ mod tests {
                 .stdout
                 .contains("20 events since the last narrative checkpoint")
         );
+    }
+
+    #[test]
+    fn resolve_provider_home_prefers_codex_home_over_derived_default() {
+        let with_override =
+            crate::store::Environment::from_pairs(std::collections::HashMap::from([
+                ("CODEX_HOME", std::ffi::OsString::from("/custom/codex-home")),
+                ("HOME", std::ffi::OsString::from("/home/dev")),
+            ]));
+        assert_eq!(
+            resolve_provider_home(&with_override),
+            Some(PathBuf::from("/custom/codex-home"))
+        );
+
+        let default_only = crate::store::Environment::from_pairs(std::collections::HashMap::from(
+            [("HOME", std::ffi::OsString::from("/home/dev"))],
+        ));
+        assert_eq!(
+            resolve_provider_home(&default_only),
+            Some(PathBuf::from("/home/dev/.codex"))
+        );
+
+        let neither = crate::store::Environment::from_pairs(std::collections::HashMap::new());
+        assert_eq!(resolve_provider_home(&neither), None);
     }
 }
