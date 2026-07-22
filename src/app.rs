@@ -1044,8 +1044,10 @@ fn recover_stale_lease(
     };
     if lease.host != host_name()? {
         return Err(Error::InvalidState(format!(
-            "session lease {} belongs to host {}; explicit recovery is required",
-            lease.run_id, lease.host
+            "cannot switch: session lease belongs to host {} ({}, {}); liveness cannot be checked from this host. If you're sure it's gone, remove refs/active-run.json for this session by hand after confirming.",
+            lease.host,
+            lease.provider.executable(),
+            lease.supervisor.describe()
         )));
     }
     let supervisor_live = lease.supervisor.is_live()?;
@@ -1056,9 +1058,19 @@ fn recover_stale_lease(
         .transpose()?
         .unwrap_or(false);
     if supervisor_live || child_live {
+        let holder = if child_live {
+            lease
+                .child
+                .as_ref()
+                .expect("child_live implies child is present")
+        } else {
+            &lease.supervisor
+        };
         return Err(Error::InvalidState(format!(
-            "session already has active provider {}",
-            lease.run_id
+            "cannot switch: {} is still running this session ({}). Finish or quit {}, then retry the switch.",
+            lease.provider.executable(),
+            holder.describe(),
+            lease.provider.executable()
         )));
     }
     store.append(
@@ -2523,7 +2535,13 @@ mod tests {
         .unwrap();
         foreign.host = "different-host".into();
         leases.create(&foreign).unwrap();
-        assert!(recover_stale_lease(&store, &leases, &FixedRuntime, &recovery_snapshot).is_err());
+        let foreign_error = recover_stale_lease(&store, &leases, &FixedRuntime, &recovery_snapshot)
+            .unwrap_err()
+            .to_string();
+        assert!(foreign_error.contains("different-host"));
+        assert!(foreign_error.contains("claude"));
+        assert!(foreign_error.contains("pid 4294967295"));
+        assert!(foreign_error.contains("liveness cannot be checked from this host"));
         assert_eq!(leases.read().unwrap().unwrap().run_id, foreign.run_id);
         leases.clear(&foreign.run_id).unwrap();
 
@@ -2535,7 +2553,12 @@ mod tests {
         )
         .unwrap();
         leases.create(&live).unwrap();
-        assert!(recover_stale_lease(&store, &leases, &FixedRuntime, &recovery_snapshot).is_err());
+        let live_error = recover_stale_lease(&store, &leases, &FixedRuntime, &recovery_snapshot)
+            .unwrap_err()
+            .to_string();
+        assert!(live_error.contains("codex"));
+        assert!(live_error.contains(&format!("pid {}", std::process::id())));
+        assert!(live_error.contains("retry the switch"));
         assert_eq!(leases.read().unwrap().unwrap().run_id, live.run_id);
     }
 
