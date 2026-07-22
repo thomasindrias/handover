@@ -131,13 +131,22 @@ more events have been observed since the latest narrative checkpoint. The
 shape follows Claude Code's documented Stop-hook output contract, which
 validates Stop output strictly; the warning never blocks the stop and a
 failure to compute it degrades to empty output. Codex documents the same
-output fields, but delivery through Sesh's configuration overlays in
-interactive Codex sessions is not yet verified upstream, so the nudge
-remains best-effort observation on both providers.
+output fields; hook delivery to Codex is now confirmed working end to end
+(see below), so the nudge is exercised the same way on both providers.
+Verified against a real Claude Code session: the hook contract holds
+(payloads normalize, the Stop response is accepted without error), but
+`systemMessage` is a UI-layer notice shown only in an interactive session —
+headless invocations (`claude -p`, any `--output-format`) never surface it,
+by design.
 
-Claude assets are stored as a versioned plugin manifest and hook definitions.
-Codex assets are stored as versioned configuration overlays. `sesh doctor`
-checks that materialized assets still match the Sesh version.
+Claude assets are stored as a versioned plugin manifest and hook
+definitions, loaded per session via `--plugin-dir`. Codex assets are stored
+as a versioned `hooks.json`; each launch gives the child process a private,
+per-run `CODEX_HOME` containing that file plus best-effort symlinks to the
+user's real `config.toml`/`auth.json`, so login and preferences carry over
+without Sesh ever writing to the user's actual `~/.codex` or the target
+repository. `sesh doctor` checks that materialized assets still match the
+Sesh version.
 
 ## Optional smoke tests
 
