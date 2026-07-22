@@ -459,18 +459,21 @@ fn setup_command(
         .canonicalize()
         .map_err(|source| io("current executable", source))?;
     let mut arguments = Vec::<OsString>::new();
+    let mut extra_env = Vec::<(&str, OsString)>::new();
     match provider {
         Provider::Claude => {
             arguments.push("--plugin-dir".into());
             arguments.push(layout.integrations().join("claude/1").into_os_string());
         }
         Provider::Codex => {
-            let overlays = std::fs::read_to_string(layout.integrations().join("codex/1/hooks.txt"))
-                .map_err(|source| io(layout.integrations().join("codex/1/hooks.txt"), source))?;
-            for overlay in overlays.lines() {
-                arguments.push("-c".into());
-                arguments.push(overlay.into());
-            }
+            let review_dir = layout.integrations().join("codex/1/review");
+            let provider_home = resolve_provider_home(environment);
+            crate::provider::codex::materialize_codex_home(
+                &review_dir,
+                &layout.integrations().join("codex/1/hooks.json"),
+                provider_home.as_deref(),
+            )?;
+            extra_env.push(("CODEX_HOME", review_dir.into_os_string()));
         }
     }
     let command = std::iter::once(OsString::from(provider.executable()))
@@ -478,10 +481,16 @@ fn setup_command(
         .map(|argument| shell_words::quote(&argument.to_string_lossy()).into_owned())
         .collect::<Vec<_>>()
         .join(" ");
-    let equivalent = format!(
+    let mut equivalent = format!(
         "SESH_HOOK_BIN={} {command}",
         shell_words::quote(&hook_bin.to_string_lossy())
     );
+    for (key, value) in &extra_env {
+        equivalent = format!(
+            "{key}={} {equivalent}",
+            shell_words::quote(&value.to_string_lossy())
+        );
+    }
     if !input_is_terminal {
         println!("{equivalent}");
         return Ok(2);
@@ -494,7 +503,8 @@ fn setup_command(
             "Open /hooks, review commands equal to '\"$SESH_HOOK_BIN\" __hook codex', trust them, then exit."
         ),
     }
-    let status = std::process::Command::new(provider.executable())
+    let mut command = std::process::Command::new(provider.executable());
+    command
         .args(&arguments)
         .env("SESH_HOOK_BIN", &hook_bin)
         .env_remove("SESH_HOME")
@@ -503,7 +513,11 @@ fn setup_command(
         .env_remove("SESH_PROVIDER")
         .env_remove("SESH_PROVIDER_VERSION")
         .env_remove("SESH_HANDOFF_PATH")
-        .env_remove("SESH_CHECKPOINT_INBOX")
+        .env_remove("SESH_CHECKPOINT_INBOX");
+    for (key, value) in &extra_env {
+        command.env(key, value);
+    }
+    let status = command
         .status()
         .map_err(|error| Error::Command(format!("cannot launch setup TUI: {error}")))?;
     Ok(status.code().unwrap_or(1))
