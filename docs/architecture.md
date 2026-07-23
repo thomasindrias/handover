@@ -131,6 +131,14 @@ Run leases contain the process identity needed to distinguish a live provider
 from a stale record. Stale leases are recovered explicitly and recorded; Sesh
 does not permit two live provider attachments to the same session.
 
+`sesh switch` surfaces this at two points: a live or foreign-host lease
+refuses with the holding provider, pid, and start time; a same-host dead
+lease is recovered only after an explicit `[y/N]` prompt (or
+`--recover-lease` non-interactively), never silently. `sesh status` reports
+a `switch_readiness` block — lease state, narrative checkpoint freshness,
+and handoff renderability — so this can be checked before quitting the
+current provider.
+
 ## Fork transaction
 
 `sesh fork` deliberately creates a separate line of work. It is not an option on

@@ -25,6 +25,8 @@ pub enum Command {
     },
     Switch {
         provider: Provider,
+        #[arg(long)]
+        recover_lease: bool,
         #[arg(last = true, allow_hyphen_values = true)]
         provider_args: Vec<OsString>,
     },

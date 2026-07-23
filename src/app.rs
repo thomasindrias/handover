@@ -60,8 +60,21 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
         } => run_command(provider, provider_args, environment, runtime),
         Command::Switch {
             provider,
+            recover_lease,
             provider_args,
-        } => switch_command(provider, provider_args, environment, runtime),
+        } => {
+            let stdin = std::io::stdin();
+            let input_is_terminal = stdin.is_terminal();
+            switch_command(
+                provider,
+                provider_args,
+                recover_lease,
+                environment,
+                runtime,
+                stdin.lock(),
+                input_is_terminal,
+            )
+        }
         Command::Handoff { provider, json } => handoff_command(provider, json, environment),
         Command::Fork {
             provider,
@@ -696,8 +709,11 @@ pub fn run_command(
 pub fn switch_command(
     provider: Provider,
     provider_args: Vec<OsString>,
+    recover_lease: bool,
     environment: &Environment,
     runtime: &dyn Runtime,
+    input: impl Read,
+    input_is_terminal: bool,
 ) -> Result<i32> {
     let invocation_cwd = std::env::current_dir().map_err(|source| io(".", source))?;
     let layout = resolve_layout(environment, &invocation_cwd)?;
@@ -707,7 +723,16 @@ pub fn switch_command(
     let operation = SessionOperationLock::acquire(&store.session_dir())?;
     let leases = LeaseStore::new(&store.session_dir());
     let locked_snapshot = Git::new().snapshot(&invocation_cwd)?;
-    recover_stale_lease(&store, &leases, runtime, &locked_snapshot)?;
+    recover_stale_lease_for_switch(
+        &store,
+        &leases,
+        runtime,
+        &locked_snapshot,
+        provider,
+        recover_lease,
+        input,
+        input_is_terminal,
+    )?;
 
     let (saved_cwd_relative, saved_cwd) = resolve_saved_cwd(&store)?;
     let switch_snapshot = Git::new().snapshot(&saved_cwd)?;
@@ -908,32 +933,46 @@ fn collect_recent_events(
     Ok(recent_events)
 }
 
-fn handoff_command(provider: Provider, json: bool, environment: &Environment) -> Result<i32> {
-    let invocation_cwd = std::env::current_dir().map_err(|source| io(".", source))?;
-    let layout = resolve_layout(environment, &invocation_cwd)?;
-    let invocation_snapshot = Git::new().snapshot(&invocation_cwd)?;
-    let store = SessionStore::find_for_worktree(&layout, &invocation_snapshot.identity)?
-        .ok_or_else(|| Error::InvalidState("this worktree has no Sesh session".into()))?;
+struct HandoffPreview {
+    events: Vec<Event>,
+    from_provider: Option<Provider>,
+    transition_sequence: u64,
+    through_sequence: u64,
+    narrative_checkpoint: Option<(u64, Checkpoint)>,
+    capture_gaps: Vec<CaptureGap>,
+    rendered: crate::handoff::RenderedHandoff,
+}
 
-    let (saved_cwd_relative, saved_cwd) = resolve_saved_cwd(&store)?;
+/// Dry-run of the same handoff a `switch` to `to_provider` would build:
+/// resolves the saved cwd, verifies it against `invocation_snapshot`, and
+/// renders — a pure read with no mutation, no lease/journal writes. Used
+/// by `handoff_command` (`sesh handoff`) and by `status_command`'s
+/// `switch_readiness` check so both report the exact same verdict
+/// `switch` itself will produce.
+fn preview_handoff(
+    store: &SessionStore,
+    invocation_snapshot: &GitSnapshot,
+    to_provider: Provider,
+) -> Result<HandoffPreview> {
+    let (saved_cwd_relative, saved_cwd) = resolve_saved_cwd(store)?;
     let switch_snapshot = Git::new().snapshot(&saved_cwd)?;
     verify_switch_snapshot(
-        &invocation_snapshot,
+        invocation_snapshot,
         &switch_snapshot,
         &store.meta().worktree,
         &saved_cwd_relative,
     )?;
 
     let events = store.events()?;
-    let previous_provider_value = previous_provider(&events)?;
-    let narrative_checkpoint = latest_narrative_checkpoint(&store, &events)?;
+    let from_provider = previous_provider(&events)?;
+    let narrative_checkpoint = latest_narrative_checkpoint(store, &events)?;
     let narrative_sequence = narrative_checkpoint.as_ref().map(|item| item.0);
 
     let envelopes = store.envelopes()?;
     let recent_boundary = narrative_sequence.unwrap_or(0);
     let recent_events = collect_recent_events(&envelopes, recent_boundary)?;
     let (recent_commands, latest_test, latest_failure, capture_gaps) =
-        command_facts(&store, &events)?;
+        command_facts(store, &events)?;
 
     let through_sequence = events.last().map(|event| event.sequence).unwrap_or(0);
     let transition_sequence = through_sequence + 1;
@@ -950,8 +989,8 @@ fn handoff_command(provider: Provider, json: bool, environment: &Environment) ->
         HandoffInput {
             session_id: store.id().clone(),
             parent_lineage: None,
-            from_provider: previous_provider_value,
-            to_provider: provider,
+            from_provider,
+            to_provider,
             transition_sequence,
             transition_checkpoint,
             narrative_checkpoint: narrative_checkpoint.clone(),
@@ -971,21 +1010,41 @@ fn handoff_command(provider: Provider, json: bool, environment: &Environment) ->
         ));
     }
 
+    Ok(HandoffPreview {
+        events,
+        from_provider,
+        transition_sequence,
+        through_sequence,
+        narrative_checkpoint,
+        capture_gaps,
+        rendered,
+    })
+}
+
+fn handoff_command(provider: Provider, json: bool, environment: &Environment) -> Result<i32> {
+    let invocation_cwd = std::env::current_dir().map_err(|source| io(".", source))?;
+    let layout = resolve_layout(environment, &invocation_cwd)?;
+    let invocation_snapshot = Git::new().snapshot(&invocation_cwd)?;
+    let store = SessionStore::find_for_worktree(&layout, &invocation_snapshot.identity)?
+        .ok_or_else(|| Error::InvalidState("this worktree has no Sesh session".into()))?;
+
+    let preview = preview_handoff(&store, &invocation_snapshot, provider)?;
+
     if json {
         write_handoff_projection(
             &store,
-            previous_provider_value,
+            preview.from_provider,
             provider,
-            transition_sequence,
-            through_sequence,
-            &events,
-            narrative_checkpoint,
-            capture_gaps,
-            &rendered,
+            preview.transition_sequence,
+            preview.through_sequence,
+            &preview.events,
+            preview.narrative_checkpoint,
+            preview.capture_gaps,
+            &preview.rendered,
         )
     } else {
         std::io::stdout()
-            .write_all(rendered.markdown.as_bytes())
+            .write_all(preview.rendered.markdown.as_bytes())
             .map_err(|source| io("stdout", source))?;
         Ok(0)
     }
@@ -1031,6 +1090,145 @@ fn write_handoff_projection(
     });
     write_projection(&value, true)?;
     Ok(0)
+}
+
+fn confirm_lease_recovery(
+    lease: &RunLease,
+    target: Provider,
+    recover_lease: bool,
+    mut input: impl Read,
+    input_is_terminal: bool,
+) -> Result<&'static str> {
+    if recover_lease {
+        return Ok("recovery confirmed via --recover-lease");
+    }
+    let holder = lease.child.as_ref().unwrap_or(&lease.supervisor);
+    if !input_is_terminal {
+        return Err(Error::InvalidState(format!(
+            "session has a stale {} lease ({}); rerun with `sesh switch {} --recover-lease`, or run `sesh switch {}` in a terminal to confirm",
+            lease.provider.executable(),
+            holder.describe(),
+            target.executable(),
+            target.executable()
+        )));
+    }
+    eprintln!(
+        "Stale lease from {} ({}) — the process is no longer running.",
+        lease.provider.executable(),
+        holder.describe()
+    );
+    eprint!("Recover this lease and continue switching? [y/N] ");
+    std::io::stderr()
+        .flush()
+        .map_err(|source| io("stderr", source))?;
+    let mut bytes = Vec::new();
+    input
+        .by_ref()
+        .take(4097)
+        .read_to_end(&mut bytes)
+        .map_err(|source| io("stdin", source))?;
+    if bytes.len() > 4096 {
+        return Err(Error::InvalidState(
+            "lease recovery confirmation is too long".into(),
+        ));
+    }
+    let answer = std::str::from_utf8(&bytes)
+        .map_err(|_| Error::InvalidState("lease recovery confirmation is not UTF-8".into()))?
+        .trim()
+        .to_lowercase();
+    if answer != "y" && answer != "yes" {
+        return Err(Error::InvalidState(
+            "switch cancelled: stale lease was not recovered".into(),
+        ));
+    }
+    Ok("recovery confirmed interactively")
+}
+
+/// Stale-lease recovery for `sesh switch`: refuses a live or foreign-host
+/// lease with holder detail (provider, pid, started-when), and recovers a
+/// same-host dead lease only after explicit consent (an interactive
+/// `[y/N]` prompt or `--recover-lease`) via `confirm_lease_recovery`.
+///
+/// `sesh fork` has its own, unrelated `recover_stale_lease` below: fork's
+/// UX is out of scope for this consent gate and keeps its original,
+/// unprompted, generically-worded behavior unchanged.
+#[allow(clippy::too_many_arguments)]
+fn recover_stale_lease_for_switch(
+    store: &SessionStore,
+    leases: &LeaseStore,
+    runtime: &dyn Runtime,
+    recovery_snapshot: &GitSnapshot,
+    target: Provider,
+    recover_lease: bool,
+    input: impl Read,
+    input_is_terminal: bool,
+) -> Result<()> {
+    let Some(lease) = leases.read()? else {
+        return Ok(());
+    };
+    if lease.host != host_name()? {
+        return Err(Error::InvalidState(format!(
+            "cannot switch: session lease belongs to host {} ({}, {}); liveness cannot be checked from this host. If you're sure it's gone, remove refs/active-run.json for this session by hand after confirming.",
+            lease.host,
+            lease.provider.executable(),
+            lease.supervisor.describe()
+        )));
+    }
+    let supervisor_live = lease.supervisor.is_live()?;
+    let child_live = lease
+        .child
+        .as_ref()
+        .map(ProcessIdentity::is_live)
+        .transpose()?
+        .unwrap_or(false);
+    if supervisor_live || child_live {
+        let holder = if child_live {
+            lease
+                .child
+                .as_ref()
+                .expect("child_live implies child is present")
+        } else {
+            &lease.supervisor
+        };
+        return Err(Error::InvalidState(format!(
+            "cannot switch: {} is still running this session ({}). Finish or quit {}, then retry the switch.",
+            lease.provider.executable(),
+            holder.describe(),
+            lease.provider.executable()
+        )));
+    }
+    let reason_suffix =
+        confirm_lease_recovery(&lease, target, recover_lease, input, input_is_terminal)?;
+    store.append(
+        runtime,
+        Some(lease.run_id.clone()),
+        Some(lease.provider),
+        EventKind::RunRecovered {
+            supervisor_pid: lease.supervisor.pid,
+            supervisor_start_token: lease.supervisor.start_token.clone(),
+            child_pid: lease.child.as_ref().map(|child| child.pid),
+            child_start_token: lease.child.as_ref().map(|child| child.start_token.clone()),
+            host: lease.host.clone(),
+            reason: format!(
+                "same-host supervisor and child processes are no longer live; {reason_suffix}"
+            ),
+        },
+    )?;
+    store.append(
+        runtime,
+        Some(lease.run_id.clone()),
+        Some(lease.provider),
+        EventKind::GitSnapshot {
+            snapshot: recovery_snapshot.clone(),
+        },
+    )?;
+    leases.clear(&lease.run_id)?;
+    eprintln!(
+        "Recovered stale {} lease ({}); continuing switch.",
+        lease.provider.executable(),
+        lease.supervisor.describe()
+    );
+    Ok(())
 }
 
 fn recover_stale_lease(
@@ -1340,6 +1538,57 @@ fn add_run_environment(
     }
 }
 
+fn classify_lease(leases: &LeaseStore) -> Result<(&'static str, Option<String>)> {
+    let Some(lease) = leases.read()? else {
+        return Ok(("free", None));
+    };
+    if lease.host != host_name()? {
+        return Ok((
+            "blocked",
+            Some(format!(
+                "lease belongs to host {} ({}, {}); liveness cannot be checked from this host",
+                lease.host,
+                lease.provider.executable(),
+                lease.supervisor.describe()
+            )),
+        ));
+    }
+    let supervisor_live = lease.supervisor.is_live()?;
+    let child_live = lease
+        .child
+        .as_ref()
+        .map(ProcessIdentity::is_live)
+        .transpose()?
+        .unwrap_or(false);
+    if supervisor_live || child_live {
+        let holder = if child_live {
+            lease
+                .child
+                .as_ref()
+                .expect("child_live implies child is present")
+        } else {
+            &lease.supervisor
+        };
+        return Ok((
+            "blocked",
+            Some(format!(
+                "{} is still running this session ({})",
+                lease.provider.executable(),
+                holder.describe()
+            )),
+        ));
+    }
+    let holder = lease.child.as_ref().unwrap_or(&lease.supervisor);
+    Ok((
+        "recoverable",
+        Some(format!(
+            "stale {} lease ({}); switch will prompt to recover it, or pass --recover-lease",
+            lease.provider.executable(),
+            holder.describe()
+        )),
+    ))
+}
+
 fn status_command(json: bool, environment: &Environment) -> Result<i32> {
     let (_layout, snapshot, store) = current_session(environment)?;
     let events = store.events()?;
@@ -1354,6 +1603,16 @@ fn status_command(json: bool, environment: &Environment) -> Result<i32> {
         .map_err(|source| io(&saved_cwd_path, source))?;
     let (_, _, _, gaps) = command_facts(&store, &events)?;
     let (latest_narrative, events_since) = crate::list::narrative_freshness(&events);
+    let leases = LeaseStore::new(&store.session_dir());
+    let (lease_state, lease_reason) = classify_lease(&leases)?;
+    let checkpoint_fresh = events_since < STALE_NARRATIVE_EVENT_THRESHOLD;
+    let target_provider = provider.map(Provider::other).unwrap_or(Provider::Claude);
+    let (handoff_renderable, handoff_error) =
+        match preview_handoff(&store, &snapshot, target_provider) {
+            Ok(_) => (true, None),
+            Err(error) => (false, Some(error.to_string())),
+        };
+    let ready = lease_state == "free" && handoff_renderable;
     let value = serde_json::json!({
         "schema_version": 1,
         "session_id": store.id(),
@@ -1376,6 +1635,14 @@ fn status_command(json: bool, environment: &Environment) -> Result<i32> {
             "phase": gap.phase,
             "message": gap.message,
         })).collect::<Vec<_>>(),
+        "switch_readiness": {
+            "ready": ready,
+            "lease": lease_state,
+            "lease_reason": lease_reason,
+            "checkpoint_fresh": checkpoint_fresh,
+            "handoff_renderable": handoff_renderable,
+            "handoff_error": handoff_error,
+        },
     });
     write_projection(&value, json)?;
     Ok(0)
@@ -2393,8 +2660,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        command_facts, latest_narrative_checkpoint, recover_stale_lease, resolve_provider_home,
-        stop_nudge, with_rename_rollback,
+        classify_lease, command_facts, confirm_lease_recovery, latest_narrative_checkpoint,
+        recover_stale_lease_for_switch, resolve_provider_home, stop_nudge, with_rename_rollback,
     };
     use crate::error::Error;
     use crate::model::{
@@ -2483,7 +2750,17 @@ mod tests {
         leases.create(&stale).unwrap();
 
         let recovery_snapshot = recorded_snapshot(&store);
-        recover_stale_lease(&store, &leases, &FixedRuntime, &recovery_snapshot).unwrap();
+        recover_stale_lease_for_switch(
+            &store,
+            &leases,
+            &FixedRuntime,
+            &recovery_snapshot,
+            Provider::Codex,
+            true,
+            std::io::Cursor::new(Vec::new()),
+            false,
+        )
+        .unwrap();
 
         assert!(leases.read().unwrap().is_none());
         let events = store.events().unwrap();
@@ -2499,10 +2776,11 @@ mod tests {
                             child_pid: None,
                             child_start_token: None,
                             host,
-                            ..
+                            reason,
                         } if *supervisor_pid == u32::MAX
                             && supervisor_start_token == "gone"
                             && host == &stale.host
+                            && reason.contains("--recover-lease")
                     )
             })
             .unwrap();
@@ -2523,7 +2801,22 @@ mod tests {
         .unwrap();
         foreign.host = "different-host".into();
         leases.create(&foreign).unwrap();
-        assert!(recover_stale_lease(&store, &leases, &FixedRuntime, &recovery_snapshot).is_err());
+        let foreign_error = recover_stale_lease_for_switch(
+            &store,
+            &leases,
+            &FixedRuntime,
+            &recovery_snapshot,
+            Provider::Codex,
+            true,
+            std::io::Cursor::new(Vec::new()),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(foreign_error.contains("different-host"));
+        assert!(foreign_error.contains("claude"));
+        assert!(foreign_error.contains("pid 4294967295"));
+        assert!(foreign_error.contains("liveness cannot be checked from this host"));
         assert_eq!(leases.read().unwrap().unwrap().run_id, foreign.run_id);
         leases.clear(&foreign.run_id).unwrap();
 
@@ -2535,8 +2828,185 @@ mod tests {
         )
         .unwrap();
         leases.create(&live).unwrap();
-        assert!(recover_stale_lease(&store, &leases, &FixedRuntime, &recovery_snapshot).is_err());
+        let live_error = recover_stale_lease_for_switch(
+            &store,
+            &leases,
+            &FixedRuntime,
+            &recovery_snapshot,
+            Provider::Codex,
+            true,
+            std::io::Cursor::new(Vec::new()),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(live_error.contains("codex"));
+        assert!(live_error.contains(&format!("pid {}", std::process::id())));
+        assert!(live_error.contains("retry the switch"));
         assert_eq!(leases.read().unwrap().unwrap().run_id, live.run_id);
+    }
+
+    #[test]
+    fn confirm_lease_recovery_skips_the_prompt_with_the_flag() {
+        let (_temp, store) = store_fixture();
+        let lease = RunLease::new(
+            store.id().clone(),
+            RunId::new(),
+            Provider::Claude,
+            ProcessIdentity {
+                pid: u32::MAX,
+                start_token: "gone".into(),
+            },
+        )
+        .unwrap();
+        let reason = confirm_lease_recovery(
+            &lease,
+            Provider::Codex,
+            true,
+            std::io::Cursor::new(Vec::new()),
+            false,
+        )
+        .unwrap();
+        assert_eq!(reason, "recovery confirmed via --recover-lease");
+    }
+
+    #[test]
+    fn confirm_lease_recovery_requires_a_terminal_without_the_flag() {
+        let (_temp, store) = store_fixture();
+        let lease = RunLease::new(
+            store.id().clone(),
+            RunId::new(),
+            Provider::Claude,
+            ProcessIdentity {
+                pid: u32::MAX,
+                start_token: "gone".into(),
+            },
+        )
+        .unwrap();
+        let error = confirm_lease_recovery(
+            &lease,
+            Provider::Codex,
+            false,
+            std::io::Cursor::new(Vec::new()),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("--recover-lease"));
+        assert!(error.contains("sesh switch codex --recover-lease"));
+        assert!(error.contains("claude"));
+    }
+
+    #[test]
+    fn confirm_lease_recovery_accepts_an_interactive_yes() {
+        let (_temp, store) = store_fixture();
+        let lease = RunLease::new(
+            store.id().clone(),
+            RunId::new(),
+            Provider::Claude,
+            ProcessIdentity {
+                pid: u32::MAX,
+                start_token: "gone".into(),
+            },
+        )
+        .unwrap();
+        for answer in ["y\n", "yes\n", "Y\n", " YES \n"] {
+            let reason = confirm_lease_recovery(
+                &lease,
+                Provider::Codex,
+                false,
+                std::io::Cursor::new(answer.as_bytes().to_vec()),
+                true,
+            )
+            .unwrap();
+            assert_eq!(reason, "recovery confirmed interactively");
+        }
+    }
+
+    #[test]
+    fn confirm_lease_recovery_rejects_anything_else_interactively() {
+        let (_temp, store) = store_fixture();
+        let lease = RunLease::new(
+            store.id().clone(),
+            RunId::new(),
+            Provider::Claude,
+            ProcessIdentity {
+                pid: u32::MAX,
+                start_token: "gone".into(),
+            },
+        )
+        .unwrap();
+        for answer in ["n\n", "\n", "nope\n"] {
+            let error = confirm_lease_recovery(
+                &lease,
+                Provider::Codex,
+                false,
+                std::io::Cursor::new(answer.as_bytes().to_vec()),
+                true,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("not recovered"));
+        }
+    }
+
+    #[test]
+    fn classify_lease_distinguishes_free_recoverable_and_blocked() {
+        let (_temp, store) = store_fixture();
+        let leases = LeaseStore::new(&store.session_dir());
+
+        let (state, reason) = classify_lease(&leases).unwrap();
+        assert_eq!(state, "free");
+        assert!(reason.is_none());
+
+        let dead = RunLease::new(
+            store.id().clone(),
+            RunId::new(),
+            Provider::Claude,
+            ProcessIdentity {
+                pid: u32::MAX,
+                start_token: "gone".into(),
+            },
+        )
+        .unwrap();
+        leases.create(&dead).unwrap();
+        let (state, reason) = classify_lease(&leases).unwrap();
+        assert_eq!(state, "recoverable");
+        assert!(reason.unwrap().contains("--recover-lease"));
+        leases.clear(&dead.run_id).unwrap();
+
+        let live = RunLease::new(
+            store.id().clone(),
+            RunId::new(),
+            Provider::Claude,
+            ProcessIdentity::capture(std::process::id()).unwrap(),
+        )
+        .unwrap();
+        leases.create(&live).unwrap();
+        let (state, reason) = classify_lease(&leases).unwrap();
+        assert_eq!(state, "blocked");
+        assert!(
+            reason
+                .unwrap()
+                .contains(&format!("pid {}", std::process::id()))
+        );
+        leases.clear(&live.run_id).unwrap();
+
+        let mut foreign = RunLease::new(
+            store.id().clone(),
+            RunId::new(),
+            Provider::Claude,
+            ProcessIdentity {
+                pid: u32::MAX,
+                start_token: "gone".into(),
+            },
+        )
+        .unwrap();
+        foreign.host = "different-host".into();
+        leases.create(&foreign).unwrap();
+        let (state, reason) = classify_lease(&leases).unwrap();
+        assert_eq!(state, "blocked");
+        assert!(reason.unwrap().contains("different-host"));
     }
 
     #[test]

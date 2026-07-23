@@ -80,6 +80,10 @@ impl ProcessIdentity {
             Err(error) => Err(error),
         }
     }
+
+    pub fn describe(&self) -> String {
+        format!("pid {}, started {}", self.pid, self.start_token)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -272,6 +276,18 @@ mod tests {
     fn current_process_identity_is_live() {
         let identity = ProcessIdentity::capture(std::process::id()).unwrap();
         assert!(identity.is_live().unwrap());
+    }
+
+    #[test]
+    fn describe_formats_pid_and_start_token() {
+        let identity = ProcessIdentity {
+            pid: 4821,
+            start_token: "Tue Jul 21 09:14:02 2026".into(),
+        };
+        assert_eq!(
+            identity.describe(),
+            "pid 4821, started Tue Jul 21 09:14:02 2026"
+        );
     }
 
     #[test]
