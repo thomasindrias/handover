@@ -31,6 +31,9 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
   silently auto-recovering; and `sesh status` reports a `switch_readiness`
   block (lease state, checkpoint freshness, handoff renderability) so a
   switch's success can be seen before quitting the current provider.
+- A one-command `install.sh` script that builds and installs sesh from
+  source (`curl -fsSL .../install.sh | sh`), safe to re-run as an upgrade,
+  with a `PATH` check and next-step guidance on success.
 
 ### Fixed
 

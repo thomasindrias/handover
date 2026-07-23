@@ -41,3 +41,28 @@ jobs:
         run: cargo test --test fork_north_star -- --nocapture
       - name: Build documentation
         run: cargo doc --no-deps --document-private-items
+  install-script:
+    name: install.sh (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - name: Install shellcheck (macOS)
+        if: runner.os == 'macOS'
+        run: brew install shellcheck
+      - name: Shellcheck install.sh
+        run: shellcheck install.sh
+      - name: Run install.sh against a sandboxed install root
+        run: |
+          export CARGO_INSTALL_ROOT="$RUNNER_TEMP/cargo-install-root"
+          ./install.sh
+          "$CARGO_INSTALL_ROOT/bin/sesh" --version
