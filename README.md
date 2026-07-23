@@ -29,13 +29,30 @@ service.
 ## Quick start
 
 Sesh V1 supports macOS and Linux. It requires Git, Rust 1.88 or newer, and an
-installed Claude Code or Codex CLI.
+installed Claude Code or Codex CLI. There are no prebuilt binaries yet, so
+every install method compiles from source.
+
+Install with one command:
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/thomasindrias/sesh/main/install.sh | sh
+```
+
+Prefer to inspect the script first, or build by hand? Either works:
+
+```bash
+# clone and build manually
 git clone https://github.com/thomasindrias/sesh.git
 cd sesh
 cargo install --path .
 
+# or install straight from the Git repository, no separate clone step
+cargo install --git https://github.com/thomasindrias/sesh --locked
+```
+
+Then set up the providers you use:
+
+```bash
 sesh setup claude
 sesh setup codex
 ```
