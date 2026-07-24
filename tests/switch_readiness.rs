@@ -85,6 +85,14 @@ fn a_fresh_checkpointed_session_reports_ready() {
 }
 
 #[test]
+fn status_includes_the_exact_switch_command_to_run() {
+    let (_temp, repo, state) = run_fake_claude(1, true);
+    let status = status_json(&repo, &state);
+    let readiness = &status["switch_readiness"];
+    assert_eq!(readiness["suggested_switch_command"], "sesh switch codex");
+}
+
+#[test]
 fn a_stale_narrative_checkpoint_is_advisory_and_does_not_block_readiness() {
     let (_temp, repo, state) = run_fake_claude(7, false);
     let status = status_json(&repo, &state);

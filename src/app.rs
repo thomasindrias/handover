@@ -1589,7 +1589,7 @@ fn classify_lease(leases: &LeaseStore) -> Result<(&'static str, Option<String>)>
     ))
 }
 
-fn status_command(json: bool, environment: &Environment) -> Result<i32> {
+pub(crate) fn build_status_value(environment: &Environment) -> Result<serde_json::Value> {
     let (_layout, snapshot, store) = current_session(environment)?;
     let events = store.events()?;
     let provider = previous_provider(&events)?;
@@ -1613,7 +1613,7 @@ fn status_command(json: bool, environment: &Environment) -> Result<i32> {
             Err(error) => (false, Some(error.to_string())),
         };
     let ready = lease_state == "free" && handoff_renderable;
-    let value = serde_json::json!({
+    Ok(serde_json::json!({
         "schema_version": 1,
         "session_id": store.id(),
         "provider": provider,
@@ -1642,8 +1642,13 @@ fn status_command(json: bool, environment: &Environment) -> Result<i32> {
             "checkpoint_fresh": checkpoint_fresh,
             "handoff_renderable": handoff_renderable,
             "handoff_error": handoff_error,
+            "suggested_switch_command": format!("sesh switch {}", target_provider.executable()),
         },
-    });
+    }))
+}
+
+fn status_command(json: bool, environment: &Environment) -> Result<i32> {
+    let value = build_status_value(environment)?;
     write_projection(&value, json)?;
     Ok(0)
 }
