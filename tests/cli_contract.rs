@@ -50,6 +50,7 @@ fn implemented_commands_are_visible_and_internal_hooks_are_hidden() {
             "delete",
             "setup",
             "doctor",
+            "mcp-server",
         ]
     );
     assert!(!help.contains("__hook"));

@@ -124,6 +124,7 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
             setup_command(provider, environment, stdin.is_terminal())
         }
         Command::Doctor { json, repair } => doctor_command(json, repair, environment),
+        Command::McpServer => crate::mcp::mcp_server_command(environment),
         Command::Hook { provider } => {
             if ["SESH_HOME", "SESH_SESSION_ID", "SESH_RUN_ID"]
                 .into_iter()
@@ -151,6 +152,7 @@ fn provider_command_allowed(command: &Command) -> bool {
                 from_provider: true,
                 ..
             }
+            | Command::McpServer
     )
 }
 

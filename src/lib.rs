@@ -7,6 +7,7 @@ pub mod fork;
 pub mod git;
 pub mod handoff;
 pub mod list;
+pub mod mcp;
 pub mod model;
 pub mod provider;
 pub mod runtime;

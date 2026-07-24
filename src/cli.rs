@@ -81,6 +81,8 @@ pub enum Command {
         #[arg(long)]
         repair: bool,
     },
+    #[command(name = "mcp-server")]
+    McpServer,
     #[command(name = "__hook", hide = true)]
     Hook {
         provider: Provider,
