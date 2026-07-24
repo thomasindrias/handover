@@ -8,7 +8,7 @@ use crate::model::{
 use crate::store::refs::read_json;
 use crate::store::{SessionStore, StateLayout};
 
-pub fn list_command(json: bool, layout: &StateLayout) -> Result<i32> {
+pub(crate) fn build_list_value(layout: &StateLayout) -> Result<serde_json::Value> {
     let sessions_dir = layout.sessions();
     let mut names = Vec::new();
     for entry in std::fs::read_dir(&sessions_dir).map_err(|source| io(&sessions_dir, source))? {
@@ -30,10 +30,14 @@ pub fn list_command(json: bool, layout: &StateLayout) -> Result<i32> {
         );
         left_key.cmp(&right_key)
     });
-    let value = serde_json::json!({
+    Ok(serde_json::json!({
         "schema_version": 1,
         "sessions": rows,
-    });
+    }))
+}
+
+pub fn list_command(json: bool, layout: &StateLayout) -> Result<i32> {
+    let value = build_list_value(layout)?;
     write_projection(&value, json)?;
     Ok(0)
 }
@@ -156,7 +160,10 @@ mod tests {
     use crate::store::StateLayout;
     use crate::store::refs::write_json_create;
 
-    use super::{binding_state, last_activity, last_branch, last_provider, narrative_freshness};
+    use super::{
+        binding_state, build_list_value, last_activity, last_branch, last_provider,
+        narrative_freshness,
+    };
 
     fn event(sequence: u64, provider: Option<Provider>, kind: EventKind) -> Event {
         Event {
@@ -342,5 +349,17 @@ mod tests {
                 .unwrap()
                 .starts_with("worktree ref is unreadable")
         );
+    }
+
+    #[test]
+    fn build_list_value_reports_schema_version_and_empty_sessions_for_a_fresh_layout() {
+        let temp = TempDir::new().unwrap();
+        let layout = StateLayout::new(temp.path().to_path_buf());
+        std::fs::create_dir_all(layout.sessions()).unwrap();
+
+        let value = build_list_value(&layout).unwrap();
+
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["sessions"].as_array().unwrap().len(), 0);
     }
 }
