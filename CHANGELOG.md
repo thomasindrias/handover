@@ -34,6 +34,9 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 - A one-command `install.sh` script that builds and installs sesh from
   source (`curl -fsSL .../install.sh | sh`), safe to re-run as an upgrade,
   with a `PATH` check and next-step guidance on success.
+- A `sesh mcp-server` subcommand exposing `list`, `handoff`, and `status` as
+  MCP tools over stdio, so a provider attached to a Sesh session can query
+  it directly instead of a human running commands in a second terminal.
 
 ### Fixed
 

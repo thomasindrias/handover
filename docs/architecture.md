@@ -215,3 +215,14 @@ V1 does not include cloud or multi-machine synchronization, remote MCP, team
 sharing, embeddings, semantic retrieval, transcript scraping, autonomous agent
 orchestration, Windows support, or worktree creation during normal switching.
 These boundaries keep the core continuation path small and auditable.
+
+## MCP server
+
+`sesh mcp-server` (`docs/mcp.md`) exposes `list`, `handoff`, and `status` as
+MCP tools over stdio. `provider_command_allowed` (src/app.rs) has one
+explicit exception for `Command::McpServer` so the subcommand can start even
+when `SESH_RUN_ID` is set — the situation it's built for, since an MCP client
+spawns the server as a subprocess of the very provider Sesh launched. No
+other command's behavior under that guard changes. Tool calls run the same
+value-producing code the CLI uses, entirely in-process — never a subprocess,
+never a second pass through the CLI dispatcher.
