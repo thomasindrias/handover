@@ -26,25 +26,54 @@ fn mcp_server_starts_under_an_attached_provider_while_other_commands_stay_refuse
     let temp = TempDir::new().unwrap();
     let state = temp.path().join("state");
 
-    cargo_bin_cmd!("sesh")
+    // The server itself starts, and a real tool call inside it succeeds —
+    // not just an empty stream exiting cleanly. `list` works without a bound
+    // session (it reports an empty session array), so no fixture session is
+    // needed here.
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": "list", "arguments": {} },
+    });
+    let output = cargo_bin_cmd!("sesh")
         .env("SESH_HOME", &state)
         .env("SESH_SESSION_ID", SESSION_ID)
         .env("SESH_RUN_ID", RUN_ID)
         .args(["mcp-server"])
-        .write_stdin("")
-        .assert()
-        .success();
+        .write_stdin(format!("{request}\n"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let responses: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 1);
+    assert!(responses[0].get("error").is_none());
+    assert_eq!(responses[0]["result"]["isError"], false);
 
-    cargo_bin_cmd!("sesh")
-        .env("SESH_HOME", &state)
-        .env("SESH_SESSION_ID", SESSION_ID)
-        .env("SESH_RUN_ID", RUN_ID)
-        .args(["list", "--json"])
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains(
-            "an attached provider may only invoke Sesh hooks or submit provider checkpoints",
-        ));
+    // Meanwhile the same commands invoked as ordinary CLI subprocesses under
+    // the same attached-provider environment stay refused: `list`, `status`,
+    // and `handoff` are the three commands the MCP server re-exposes.
+    for args in [
+        vec!["list", "--json"],
+        vec!["status", "--json"],
+        vec!["handoff", "codex", "--json"],
+    ] {
+        cargo_bin_cmd!("sesh")
+            .env("SESH_HOME", &state)
+            .env("SESH_SESSION_ID", SESSION_ID)
+            .env("SESH_RUN_ID", RUN_ID)
+            .args(&args)
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains(
+                "an attached provider may only invoke Sesh hooks or submit provider checkpoints",
+            ));
+    }
 }
 
 fn send(
@@ -132,6 +161,25 @@ fn tools_list_reports_the_three_tools_with_their_schemas() {
         tools[1]["inputSchema"]["required"],
         serde_json::json!(["provider"])
     );
+}
+
+#[test]
+fn ping_returns_an_empty_result_not_an_error() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let state = temp.path().join("state");
+
+    let (success, responses) = send(
+        &repo,
+        &state,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n",
+    );
+
+    assert!(success);
+    assert_eq!(responses.len(), 1);
+    assert!(responses[0].get("error").is_none());
+    assert_eq!(responses[0]["result"], serde_json::json!({}));
 }
 
 #[test]

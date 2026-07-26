@@ -37,6 +37,9 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 - A `sesh mcp-server` subcommand exposing `list`, `handoff`, and `status` as
   MCP tools over stdio, so a provider attached to a Sesh session can query
   it directly instead of a human running commands in a second terminal.
+  `sesh status --json`'s `switch_readiness` block now also reports a
+  `suggested_switch_command` string naming the exact command to run to
+  switch.
 
 ### Fixed
 

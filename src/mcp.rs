@@ -56,6 +56,7 @@ fn handle_message(line: &str, environment: &Environment) -> Option<String> {
         "initialize" => Ok(initialize_result(&request)),
         "tools/list" => Ok(tools_list_result()),
         "tools/call" => tools_call_result(&request, environment),
+        "ping" => Ok(serde_json::json!({})),
         _ => Err(format!("unknown method: {method}")),
     };
     Some(match outcome {
