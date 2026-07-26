@@ -168,3 +168,41 @@ fn a_malformed_line_gets_a_parse_error_and_the_stream_continues() {
     assert!(responses[0]["id"].is_null());
     assert!(responses[1]["result"]["tools"].is_array());
 }
+
+#[test]
+fn an_invalid_utf8_line_gets_a_parse_error_and_the_stream_continues() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let state = temp.path().join("state");
+
+    // Send invalid UTF-8 bytes followed by a valid JSON-RPC request
+    let mut input = Vec::new();
+    input.extend_from_slice(b"\xff\xfe\n");
+    input.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n");
+
+    let output = cargo_bin_cmd!("sesh")
+        .current_dir(&repo)
+        .env("SESH_HOME", &state)
+        .args(["mcp-server"])
+        .write_stdin(input)
+        .output()
+        .unwrap();
+
+    let responses: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+
+    // Process must succeed
+    assert!(output.status.success());
+    // Should get two responses: parse error for invalid UTF-8, then success for tools/list
+    assert_eq!(responses.len(), 2);
+    // First response: parse error with code -32700 for the bad line
+    assert_eq!(responses[0]["error"]["code"], -32700);
+    assert!(responses[0]["id"].is_null());
+    // Second response: successful tools/list
+    assert!(responses[1]["result"]["tools"].is_array());
+}

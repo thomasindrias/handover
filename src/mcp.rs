@@ -7,7 +7,21 @@ pub fn mcp_server_command(environment: &Environment) -> Result<i32> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
-        let line = line.map_err(|source| io("stdin", source))?;
+        let line = match line {
+            Ok(line) => line,
+            Err(err) => {
+                // Invalid UTF-8 is a bad message (recoverable).
+                // Other I/O errors must propagate (not recoverable).
+                if err.kind() == std::io::ErrorKind::InvalidData {
+                    let response = error_response(serde_json::Value::Null, -32700, "Parse error");
+                    writeln!(stdout, "{response}").map_err(|source| io("stdout", source))?;
+                    stdout.flush().map_err(|source| io("stdout", source))?;
+                    continue;
+                } else {
+                    return Err(io("stdin", err));
+                }
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
