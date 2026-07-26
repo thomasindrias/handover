@@ -1,6 +1,7 @@
 use std::io::{BufRead, Write};
 
-use crate::error::{Result, io};
+use crate::error::{Error, Result, io};
+use crate::model::Provider;
 use crate::store::Environment;
 
 pub fn mcp_server_command(environment: &Environment) -> Result<i32> {
@@ -33,7 +34,7 @@ pub fn mcp_server_command(environment: &Environment) -> Result<i32> {
     Ok(0)
 }
 
-fn handle_message(line: &str, _environment: &Environment) -> Option<String> {
+fn handle_message(line: &str, environment: &Environment) -> Option<String> {
     let request: serde_json::Value = match serde_json::from_str(line) {
         Ok(value) => value,
         Err(_) => {
@@ -54,6 +55,7 @@ fn handle_message(line: &str, _environment: &Environment) -> Option<String> {
     let outcome: std::result::Result<serde_json::Value, String> = match method {
         "initialize" => Ok(initialize_result(&request)),
         "tools/list" => Ok(tools_list_result()),
+        "tools/call" => tools_call_result(&request, environment),
         _ => Err(format!("unknown method: {method}")),
     };
     Some(match outcome {
@@ -120,4 +122,52 @@ fn tools_list_result() -> serde_json::Value {
             },
         ],
     })
+}
+
+fn tools_call_result(
+    request: &serde_json::Value,
+    environment: &Environment,
+) -> std::result::Result<serde_json::Value, String> {
+    let params = request.get("params").cloned().unwrap_or_default();
+    let name = params
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let outcome = match name {
+        "list" => crate::app::mcp_list_value(environment),
+        "status" => crate::app::build_status_value(environment),
+        "handoff" => handoff_tool_value(environment, &arguments),
+        _ => return Err(format!("unknown tool: {name}")),
+    };
+    Ok(tool_call_content(outcome))
+}
+
+fn handoff_tool_value(
+    environment: &Environment,
+    arguments: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let provider_value = arguments
+        .get("provider")
+        .cloned()
+        .ok_or_else(|| Error::InvalidState("missing required argument: provider".into()))?;
+    let provider: Provider = serde_json::from_value(provider_value)
+        .map_err(|error| Error::InvalidState(format!("invalid provider argument: {error}")))?;
+    crate::app::mcp_handoff_value(provider, environment)
+}
+
+fn tool_call_content(outcome: Result<serde_json::Value>) -> serde_json::Value {
+    match outcome {
+        Ok(value) => serde_json::json!({
+            "content": [{ "type": "text", "text": value.to_string() }],
+            "isError": false,
+        }),
+        Err(error) => serde_json::json!({
+            "content": [{ "type": "text", "text": error.to_string() }],
+            "isError": true,
+        }),
+    }
 }

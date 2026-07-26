@@ -3,6 +3,8 @@ mod support;
 use assert_cmd::cargo::cargo_bin_cmd;
 use tempfile::TempDir;
 
+use support::{init_repo, path_with, write_executable};
+
 const SESSION_ID: &str = "11111111-1111-4111-8111-111111111111";
 const RUN_ID: &str = "22222222-2222-4222-8222-222222222222";
 
@@ -205,4 +207,178 @@ fn an_invalid_utf8_line_gets_a_parse_error_and_the_stream_continues() {
     assert!(responses[0]["id"].is_null());
     // Second response: successful tools/list
     assert!(responses[1]["result"]["tools"].is_array());
+}
+
+fn fake_claude_with_narrative(bin: &std::path::Path) {
+    write_executable(
+        &bin.join("claude"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-claude 1.0'; exit 0; fi
+cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
+hook() { printf '%s' "$1" | "$SESH_HOOK_BIN" __hook claude >/dev/null; }
+hook '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}'
+printf '%s' '{"objective":"Ship it","summary":"On track.","decisions":[],"assumptions":[],"constraints":[],"completed":[],"in_progress":[],"blockers":[],"next_steps":["Finish"],"related_event_sequences":[]}' | "$SESH_HOOK_BIN" checkpoint --format json --from-provider
+hook '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"Stop"}'
+exit 0
+"#,
+    );
+}
+
+fn run_fake_claude() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    fake_claude_with_narrative(&bin);
+    let state = temp.path().join("state");
+    let path = path_with(&bin);
+
+    cargo_bin_cmd!("sesh")
+        .current_dir(&repo)
+        .env("SESH_HOME", &state)
+        .env("PATH", &path)
+        .args(["run", "claude"])
+        .assert()
+        .success();
+
+    (temp, repo, state)
+}
+
+fn call_tool(
+    repo: &std::path::Path,
+    state: &std::path::Path,
+    name: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": name, "arguments": arguments },
+    });
+    let (success, responses) = send(repo, state, &format!("{request}\n"));
+    assert!(success);
+    assert_eq!(responses.len(), 1);
+    responses[0]["result"].clone()
+}
+
+#[test]
+fn list_tool_matches_the_cli_json_projection() {
+    let (_temp, repo, state) = run_fake_claude();
+    let cli_output = cargo_bin_cmd!("sesh")
+        .current_dir(&repo)
+        .env("SESH_HOME", &state)
+        .args(["list", "--json"])
+        .output()
+        .unwrap();
+    let cli_value: serde_json::Value = serde_json::from_slice(&cli_output.stdout).unwrap();
+
+    let result = call_tool(&repo, &state, "list", serde_json::json!({}));
+    let text = result["content"][0]["text"].as_str().unwrap();
+    let tool_value: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(tool_value, cli_value);
+    assert_eq!(result["isError"], false);
+}
+
+#[test]
+fn handoff_tool_matches_the_cli_json_projection() {
+    let (_temp, repo, state) = run_fake_claude();
+    let cli_output = cargo_bin_cmd!("sesh")
+        .current_dir(&repo)
+        .env("SESH_HOME", &state)
+        .args(["handoff", "codex", "--json"])
+        .output()
+        .unwrap();
+    let cli_value: serde_json::Value = serde_json::from_slice(&cli_output.stdout).unwrap();
+
+    let result = call_tool(
+        &repo,
+        &state,
+        "handoff",
+        serde_json::json!({"provider": "codex"}),
+    );
+    let text = result["content"][0]["text"].as_str().unwrap();
+    let tool_value: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(tool_value, cli_value);
+    assert_eq!(result["isError"], false);
+}
+
+#[test]
+fn status_tool_matches_the_cli_json_projection() {
+    let (_temp, repo, state) = run_fake_claude();
+    let cli_output = cargo_bin_cmd!("sesh")
+        .current_dir(&repo)
+        .env("SESH_HOME", &state)
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    let cli_value: serde_json::Value = serde_json::from_slice(&cli_output.stdout).unwrap();
+
+    let result = call_tool(&repo, &state, "status", serde_json::json!({}));
+    let text = result["content"][0]["text"].as_str().unwrap();
+    let tool_value: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(tool_value, cli_value);
+    assert_eq!(result["isError"], false);
+}
+
+#[test]
+fn handoff_tool_reports_a_domain_error_when_no_session_is_bound() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    let state = temp.path().join("state");
+
+    let result = call_tool(
+        &repo,
+        &state,
+        "handoff",
+        serde_json::json!({"provider": "codex"}),
+    );
+    assert_eq!(result["isError"], true);
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("this worktree has no Sesh session")
+    );
+}
+
+#[test]
+fn status_tool_reports_a_domain_error_when_no_session_is_bound() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    let state = temp.path().join("state");
+
+    let result = call_tool(&repo, &state, "status", serde_json::json!({}));
+    assert_eq!(result["isError"], true);
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("this worktree has no Sesh session")
+    );
+}
+
+#[test]
+fn handoff_tool_rejects_a_missing_provider_argument_as_a_domain_error() {
+    let (_temp, repo, state) = run_fake_claude();
+    let result = call_tool(&repo, &state, "handoff", serde_json::json!({}));
+    assert_eq!(result["isError"], true);
+}
+
+#[test]
+fn an_unknown_tool_name_returns_a_json_rpc_error_not_a_tool_result() {
+    let (_temp, repo, state) = run_fake_claude();
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": "switch", "arguments": {} },
+    });
+    let (success, responses) = send(&repo, &state, &format!("{request}\n"));
+    assert!(success);
+    assert_eq!(responses[0]["error"]["code"], -32601);
 }

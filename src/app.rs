@@ -1119,6 +1119,25 @@ fn write_handoff_projection(
     Ok(0)
 }
 
+pub(crate) fn mcp_handoff_value(
+    provider: Provider,
+    environment: &Environment,
+) -> Result<serde_json::Value> {
+    let (_layout, snapshot, store) = current_session(environment)?;
+    let preview = preview_handoff(&store, &snapshot, provider)?;
+    Ok(build_handoff_value(
+        &store,
+        preview.from_provider,
+        provider,
+        preview.transition_sequence,
+        preview.through_sequence,
+        &preview.events,
+        preview.narrative_checkpoint,
+        preview.capture_gaps,
+        &preview.rendered,
+    ))
+}
+
 fn confirm_lease_recovery(
     lease: &RunLease,
     target: Provider,
@@ -1672,6 +1691,12 @@ pub(crate) fn build_status_value(environment: &Environment) -> Result<serde_json
             "suggested_switch_command": format!("sesh switch {}", target_provider.executable()),
         },
     }))
+}
+
+pub(crate) fn mcp_list_value(environment: &Environment) -> Result<serde_json::Value> {
+    let cwd = std::env::current_dir().map_err(|source| io(".", source))?;
+    let layout = resolve_layout(environment, &cwd)?;
+    crate::list::build_list_value(&layout)
 }
 
 fn status_command(json: bool, environment: &Environment) -> Result<i32> {
