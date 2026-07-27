@@ -1,11 +1,13 @@
 mod support;
 
 use assert_cmd::cargo::cargo_bin_cmd;
-use sesh::fork::ForkOperationStore;
-use sesh::git::Git;
-use sesh::model::{ForkOperation, ForkPhase, OperationId, Provider, RunId, SessionId, SessionMeta};
-use sesh::store::StateLayout;
-use sesh::store::lease::{LeaseStore, ProcessIdentity, RunLease};
+use handover::fork::ForkOperationStore;
+use handover::git::Git;
+use handover::model::{
+    ForkOperation, ForkPhase, OperationId, Provider, RunId, SessionId, SessionMeta,
+};
+use handover::store::StateLayout;
+use handover::store::lease::{LeaseStore, ProcessIdentity, RunLease};
 use tempfile::TempDir;
 
 use support::{init_repo, path_with, repository_fingerprint, write_executable};
@@ -23,14 +25,14 @@ fn deletion_requires_confirmation_refuses_live_runs_and_preserves_the_repository
 set -euo pipefail
 if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-claude 1.0'; exit 0; fi
 cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
-printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}' | "$SESH_HOOK_BIN" __hook claude >/dev/null
+printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}' | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null
 exit 0
 "#,
     );
     let state = temp.path().join("state");
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", path_with(&bin))
         .args(["run", "claude"])
         .assert()
@@ -47,9 +49,9 @@ exit 0
     std::fs::write(&external, b"outside session\n").unwrap();
     std::os::unix::fs::symlink(&external, session.join("external-link")).unwrap();
 
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .arg("delete")
         .assert()
         .failure();
@@ -64,9 +66,9 @@ exit 0
     )
     .unwrap();
     leases.create(&live).unwrap();
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .args(["delete", "--yes"])
         .assert()
         .failure();
@@ -85,18 +87,18 @@ exit 0
     .unwrap();
     foreign.host = "different-host".into();
     leases.create(&foreign).unwrap();
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .args(["delete", "--yes"])
         .assert()
         .failure();
     assert!(session.exists());
     leases.clear(&foreign.run_id).unwrap();
 
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .args(["delete", "--yes"])
         .assert()
         .success();
@@ -127,22 +129,22 @@ fn deletion_orders_children_and_removes_terminal_fork_artifacts_without_touching
     install_fork_providers(&bin);
     let state = temp.path().join("state");
     let path = path_with(&bin);
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", &path)
         .args(["run", "claude"])
         .assert()
         .success();
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", &path)
         .args([
             "fork",
             "codex",
             "--branch",
-            "sesh/delete-child",
+            "handover/delete-child",
             "--worktree",
             target.to_str().unwrap(),
         ])
@@ -158,14 +160,14 @@ fn deletion_orders_children_and_removes_terminal_fork_artifacts_without_touching
     assert!(
         std::fs::read_dir(child_dir.join("runs"))
             .unwrap()
-            .any(|entry| entry.unwrap().path().join("inbox/handoff.md").exists())
+            .any(|entry| entry.unwrap().path().join("inbox/handover.md").exists())
     );
     let source_before = repository_fingerprint(&repo);
     let target_before = repository_fingerprint(&target);
 
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .args(["delete", "--yes"])
         .assert()
         .failure()
@@ -173,9 +175,9 @@ fn deletion_orders_children_and_removes_terminal_fork_artifacts_without_touching
     assert!(state.join("sessions").join(parent.id.to_string()).exists());
     assert!(child_dir.exists());
 
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&target)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .args(["delete", "--yes"])
         .assert()
         .success();
@@ -183,7 +185,7 @@ fn deletion_orders_children_and_removes_terminal_fork_artifacts_without_touching
     assert!(target.exists());
     assert_eq!(
         git_text(&target, &["branch", "--show-current"]),
-        "sesh/delete-child"
+        "handover/delete-child"
     );
 
     let layout = StateLayout::new(state.clone());
@@ -196,7 +198,7 @@ fn deletion_orders_children_and_removes_terminal_fork_artifacts_without_touching
         source_worktree: snapshot.identity,
         source_checkpoint_sequence: None,
         source_fingerprint: None,
-        target_branch: "sesh/unfinished-delete-test".into(),
+        target_branch: "handover/unfinished-delete-test".into(),
         target_worktree: temp
             .path()
             .canonicalize()
@@ -212,9 +214,9 @@ fn deletion_orders_children_and_removes_terminal_fork_artifacts_without_touching
         updated_at: "2026-07-19T10:00:00Z".into(),
     };
     let unfinished_store = ForkOperationStore::create(&layout, &unfinished).unwrap();
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .args(["delete", "--yes"])
         .assert()
         .failure()
@@ -231,9 +233,9 @@ fn deletion_orders_children_and_removes_terminal_fork_artifacts_without_touching
         .collect::<Vec<_>>();
     assert_eq!(terminal_operations.len(), 2);
 
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .args(["delete", "--yes"])
         .assert()
         .success();
@@ -257,7 +259,7 @@ fn deletion_orders_children_and_removes_terminal_fork_artifacts_without_touching
     assert_eq!(repository_fingerprint(&target), target_before);
     assert_eq!(
         git_text(&target, &["branch", "--show-current"]),
-        "sesh/delete-child"
+        "handover/delete-child"
     );
 }
 
@@ -289,7 +291,7 @@ fn install_fork_providers(bin: &std::path::Path) {
 set -euo pipefail
 if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-claude 1'; exit 0; fi
 cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
-printf '%s' '{"session_id":"claude-native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}' | "$SESH_HOOK_BIN" __hook claude >/dev/null
+printf '%s' '{"session_id":"claude-native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}' | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null
 exit 0
 "#,
     );
@@ -299,7 +301,7 @@ exit 0
 set -euo pipefail
 if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-codex 1'; exit 0; fi
 cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
-printf '%s' '{"session_id":"codex-native","turn_id":"turn-delete","cwd":"'"$cwd_json"'","model":"test","hook_event_name":"SessionStart","source":"startup"}' | "$SESH_HOOK_BIN" __hook codex >/dev/null
+printf '%s' '{"session_id":"codex-native","turn_id":"turn-delete","cwd":"'"$cwd_json"'","model":"test","hook_event_name":"SessionStart","source":"startup"}' | "$HANDOVER_HOOK_BIN" __hook codex >/dev/null
 exit 0
 "#,
     );

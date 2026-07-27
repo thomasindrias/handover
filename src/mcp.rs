@@ -93,7 +93,7 @@ fn initialize_result(request: &serde_json::Value) -> serde_json::Value {
         "protocolVersion": protocol_version,
         "capabilities": { "tools": {} },
         "serverInfo": {
-            "name": "sesh",
+            "name": "handover",
             "version": env!("CARGO_PKG_VERSION"),
         },
     })
@@ -104,12 +104,12 @@ fn tools_list_result() -> serde_json::Value {
         "tools": [
             {
                 "name": "list",
-                "description": "List all Sesh sessions across every repository, with last provider, last activity, and narrative-checkpoint freshness.",
+                "description": "List all Handover sessions across every repository, with last provider, last activity, and narrative-checkpoint freshness.",
                 "inputSchema": { "type": "object", "properties": {} },
             },
             {
-                "name": "handoff",
-                "description": "Preview the exact handoff sesh switch would produce right now, without switching.",
+                "name": "preview",
+                "description": "Preview the exact handover `handover switch` would produce right now, without switching.",
                 "inputSchema": {
                     "type": "object",
                     "properties": { "provider": { "type": "string", "enum": ["claude", "codex"] } },
@@ -141,13 +141,13 @@ fn tools_call_result(
     let outcome = match name {
         "list" => crate::app::mcp_list_value(environment),
         "status" => crate::app::build_status_value(environment),
-        "handoff" => handoff_tool_value(environment, &arguments),
+        "preview" => handover_tool_value(environment, &arguments),
         _ => return Err(format!("unknown tool: {name}")),
     };
     Ok(tool_call_content(outcome))
 }
 
-fn handoff_tool_value(
+fn handover_tool_value(
     environment: &Environment,
     arguments: &serde_json::Value,
 ) -> Result<serde_json::Value> {
@@ -157,7 +157,7 @@ fn handoff_tool_value(
         .ok_or_else(|| Error::InvalidState("missing required argument: provider".into()))?;
     let provider: Provider = serde_json::from_value(provider_value)
         .map_err(|error| Error::InvalidState(format!("invalid provider argument: {error}")))?;
-    crate::app::mcp_handoff_value(provider, environment)
+    crate::app::mcp_handover_value(provider, environment)
 }
 
 fn tool_call_content(outcome: Result<serde_json::Value>) -> serde_json::Value {

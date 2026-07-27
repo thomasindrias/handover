@@ -47,7 +47,7 @@ impl Diagnostic {
             code: code.into(),
             severity: "warning".into(),
             message: message.into(),
-            repair_command: repairable.then(|| "sesh doctor --repair".into()),
+            repair_command: repairable.then(|| "handover doctor --repair".into()),
             command: None,
             command_argv: None,
         }
@@ -68,10 +68,10 @@ impl Diagnostic {
 pub fn check_format(layout: &StateLayout) -> Vec<Diagnostic> {
     let path = layout.root().join("FORMAT");
     match read_private(&path) {
-        Ok(bytes) if bytes == b"sesh-state 1\n" => Vec::new(),
+        Ok(bytes) if bytes == b"handover-state 1\n" => Vec::new(),
         Ok(_) => vec![Diagnostic::error(
             "format.unsupported",
-            format!("{} does not contain `sesh-state 1`", path.display()),
+            format!("{} does not contain `handover-state 1`", path.display()),
         )],
         Err(error) => vec![Diagnostic::error(
             "format.unavailable",
@@ -82,11 +82,31 @@ pub fn check_format(layout: &StateLayout) -> Vec<Diagnostic> {
 
 pub fn check_permissions(layout: &StateLayout) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    check_permission_path(layout.root(), &mut diagnostics);
+    let root = layout.root();
+    check_permission_path(root, root, &mut diagnostics);
     diagnostics
 }
 
-fn check_permission_path(path: &Path, diagnostics: &mut Vec<Diagnostic>) {
+/// A provider's private home holds files the provider writes with its own
+/// permissions, so Handover guarantees the `0700` container and stops there.
+fn is_provider_owned_home(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let Some(parts) = relative
+        .components()
+        .map(|part| part.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    matches!(
+        parts.as_slice(),
+        ["sessions", _, "runs", _, "codex_home"] | ["integrations", "codex", _, "review"]
+    )
+}
+
+fn check_permission_path(root: &Path, path: &Path, diagnostics: &mut Vec<Diagnostic>) {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) => {
@@ -99,9 +119,20 @@ fn check_permission_path(path: &Path, diagnostics: &mut Vec<Diagnostic>) {
     };
     // SAFETY: geteuid has no preconditions and does not dereference pointers.
     let effective_uid = unsafe { libc::geteuid() };
+    // Handover writes only regular files and directories here, so a link is anomalous.
+    if metadata.file_type().is_symlink() {
+        diagnostics.push(Diagnostic::error(
+            "permissions.insecure",
+            format!(
+                "{} is an unexpected symlink in canonical state",
+                path.display()
+            ),
+        ));
+        return;
+    }
     let mode = metadata.permissions().mode() & 0o777;
     let expected = if metadata.is_dir() { 0o700 } else { 0o600 };
-    if metadata.file_type().is_symlink() || metadata.uid() != effective_uid || mode != expected {
+    if metadata.uid() != effective_uid || mode != expected {
         diagnostics.push(Diagnostic::error(
             "permissions.insecure",
             format!(
@@ -112,11 +143,14 @@ fn check_permission_path(path: &Path, diagnostics: &mut Vec<Diagnostic>) {
         return;
     }
     if metadata.is_dir() {
+        if is_provider_owned_home(root, path) {
+            return;
+        }
         match std::fs::read_dir(path) {
             Ok(entries) => {
                 for entry in entries {
                     match entry {
-                        Ok(entry) => check_permission_path(&entry.path(), diagnostics),
+                        Ok(entry) => check_permission_path(root, &entry.path(), diagnostics),
                         Err(error) => diagnostics.push(Diagnostic::error(
                             "permissions.unavailable",
                             format!("cannot inspect {}: {error}", path.display()),
@@ -225,15 +259,26 @@ pub fn check_integrations(layout: &StateLayout) -> Vec<Diagnostic> {
     [Provider::Claude, Provider::Codex]
         .into_iter()
         .filter_map(|provider| {
-            adapter(provider)
-                .verify(&layout.integrations())
-                .err()
-                .map(|error| {
-                    Diagnostic::error(
-                        "integration.invalid",
-                        format!("{} integration: {error}", provider.executable()),
-                    )
-                })
+            let integrations = layout.integrations();
+            adapter(provider).verify(&integrations).err().map(|error| {
+                let executable = provider.executable();
+                // Never running setup is the ordinary first-run state, not corruption.
+                if !integrations.join(executable).exists() {
+                    let setup = format!("handover setup {executable}");
+                    return Diagnostic {
+                        code: "integration.missing".into(),
+                        severity: "error".into(),
+                        message: format!("{executable} integration is not set up; run `{setup}`"),
+                        repair_command: Some(setup),
+                        command: None,
+                        command_argv: None,
+                    };
+                }
+                Diagnostic::error(
+                    "integration.invalid",
+                    format!("{executable} integration: {error}"),
+                )
+            })
         })
         .collect()
 }
@@ -603,7 +648,7 @@ fn fork_diagnostic(
             operation.target_worktree.display(),
             operation.target_branch,
         ),
-        repair_command: repairable.then(|| "sesh doctor --repair".into()),
+        repair_command: repairable.then(|| "handover doctor --repair".into()),
         command: Some(display),
         command_argv: Some(argv),
     }
@@ -662,10 +707,28 @@ fn check_handshake_timeout(envelopes: &[EventEnvelope], diagnostics: &mut Vec<Di
         item.event.run_id.as_ref() == run_id
             && matches!(item.event.kind, EventKind::RunStopped { .. })
     });
-    if !handshook && stopped {
+    if handshook || !stopped {
+        return;
+    }
+    let described = run_id.map_or_else(|| "a run".to_owned(), |id| format!("run {id}"));
+    // An earlier handshake proves the provider's hooks reach Handover, so this run
+    // died for its own reasons. Without one, the integration itself is suspect.
+    if envelopes
+        .iter()
+        .any(|item| matches!(item.event.kind, EventKind::RunHandshake { .. }))
+    {
+        diagnostics.push(Diagnostic::warning(
+            "run.session_start_timeout",
+            format!("{described} stopped without a SessionStart handshake"),
+            false,
+        ));
+    } else {
         diagnostics.push(Diagnostic::error(
             "run.session_start_timeout",
-            format!("run {run_id:?} stopped without a SessionStart handshake"),
+            format!(
+                "{described} stopped without a SessionStart handshake, and no run in this session \
+                 has ever handshaken; check the provider integration with `handover setup <provider>`"
+            ),
         ));
     }
 }
@@ -811,11 +874,12 @@ fn repair_capture_sentinels(session_dir: &Path, diagnostics: &mut Vec<Diagnostic
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     use tempfile::TempDir;
 
-    use super::check_sessions;
+    use super::{check_integrations, check_permissions, check_sessions};
     use crate::model::{EventKind, GitSnapshot, Provider, RunId, SessionId, WorktreeIdentity};
     use crate::runtime::Runtime;
     use crate::store::lease::{LeaseStore, ProcessIdentity, RunLease};
@@ -912,6 +976,174 @@ mod tests {
             check_sessions(&layout)
                 .iter()
                 .any(|item| item.code == "lease.live_orphan_child")
+        );
+    }
+
+    #[test]
+    fn a_failed_run_is_a_warning_once_the_session_has_proven_its_hooks_fire() {
+        let (_temp, layout, store) = fixture();
+        let working = RunId::new();
+        for kind in [
+            EventKind::RunStarted {
+                cwd: "/repo".into(),
+                args: Vec::new(),
+                supervisor_pid: u32::MAX,
+            },
+            EventKind::RunHandshake {
+                native_session_id: "native-1".into(),
+                provider_version: Some("1.0.0".into()),
+            },
+            EventKind::RunStopped {
+                exit_code: Some(0),
+                signal: None,
+            },
+        ] {
+            store
+                .append(
+                    &FixedRuntime,
+                    Some(working.clone()),
+                    Some(Provider::Claude),
+                    kind,
+                )
+                .unwrap();
+        }
+
+        let crashed = RunId::new();
+        for kind in [
+            EventKind::RunStarted {
+                cwd: "/repo".into(),
+                args: Vec::new(),
+                supervisor_pid: u32::MAX,
+            },
+            EventKind::RunStopped {
+                exit_code: Some(1),
+                signal: None,
+            },
+        ] {
+            store
+                .append(
+                    &FixedRuntime,
+                    Some(crashed.clone()),
+                    Some(Provider::Codex),
+                    kind,
+                )
+                .unwrap();
+        }
+
+        let diagnostic = check_sessions(&layout)
+            .into_iter()
+            .find(|item| item.code == "run.session_start_timeout")
+            .expect("the latest run never handshook");
+        assert_eq!(
+            diagnostic.severity, "warning",
+            "an earlier successful handshake proves hooks fire, so one dead run is not a broken install"
+        );
+        assert!(
+            diagnostic.message.contains(&crashed.to_string()),
+            "the message must name the run plainly, got: {}",
+            diagnostic.message
+        );
+        assert!(
+            !diagnostic.message.contains("Some("),
+            "raw Rust debug formatting must not reach a user, got: {}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn integrations_name_the_setup_command_when_a_provider_was_never_set_up() {
+        let (_temp, layout, _store) = fixture();
+        crate::provider::adapter(Provider::Codex)
+            .setup(&layout.integrations())
+            .unwrap();
+
+        let diagnostics = check_integrations(&layout);
+        let missing = diagnostics
+            .iter()
+            .find(|item| item.code == "integration.missing")
+            .expect("claude was never set up");
+        assert!(missing.message.contains("handover setup claude"));
+        assert_eq!(
+            missing.repair_command.as_deref(),
+            Some("handover setup claude")
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|item| item.message.starts_with("codex integration")),
+            "a provider that was set up is healthy"
+        );
+    }
+
+    #[test]
+    fn permissions_accept_a_materialized_codex_home_under_the_state_root() {
+        let (temp, layout, store) = fixture();
+        crate::provider::adapter(Provider::Codex)
+            .setup(&layout.integrations())
+            .unwrap();
+        let provider_home = temp.path().join("dot-codex");
+        std::fs::create_dir(&provider_home).unwrap();
+        for name in ["config.toml", "auth.json"] {
+            let file = provider_home.join(name);
+            std::fs::write(&file, b"x").unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        crate::provider::codex::materialize_codex_home(
+            &store.session_dir().join("runs/run-1/codex_home"),
+            &layout.integrations().join("codex/1/hooks.json"),
+            Some(&provider_home),
+        )
+        .unwrap();
+
+        assert_eq!(
+            check_permissions(&layout),
+            Vec::new(),
+            "a Codex run must not leave `handover doctor` reporting its own state as insecure"
+        );
+    }
+
+    #[test]
+    fn permissions_leave_the_contents_of_a_provider_owned_home_to_the_provider() {
+        let (_temp, layout, store) = fixture();
+        let codex_home = store.session_dir().join("runs/run-1/codex_home");
+        crate::store::ensure_private_dir(&codex_home).unwrap();
+        // Real Codex writes these itself, with its own permissions.
+        let database = codex_home.join("state_5.sqlite");
+        std::fs::write(&database, b"x").unwrap();
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let scratch = codex_home.join("tmp");
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            check_permissions(&layout),
+            Vec::new(),
+            "Handover guarantees the 0700 container, not files the provider writes inside it"
+        );
+
+        std::fs::set_permissions(&codex_home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            check_permissions(&layout)
+                .iter()
+                .any(|item| item.code == "permissions.insecure"),
+            "the container itself must still be private"
+        );
+    }
+
+    #[test]
+    fn permissions_reject_a_symlink_in_canonical_state() {
+        let (temp, layout, _store) = fixture();
+        let target = temp.path().join("elsewhere.json");
+        std::fs::write(&target, b"{}").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, layout.root().join("linked.json")).unwrap();
+
+        assert!(
+            check_permissions(&layout)
+                .iter()
+                .any(|item| item.code == "permissions.insecure"),
+            "Handover writes only regular files and directories into canonical state"
         );
     }
 

@@ -2,18 +2,18 @@ mod support;
 
 use std::os::unix::fs::{PermissionsExt, symlink};
 
-use sesh::error::Error;
-use sesh::fork::{
+use handover::error::Error;
+use handover::fork::{
     ForkOperationStore, StagedChildProof, capture_fork_artifacts, recover_fork_failure,
     recover_fork_failure_with_live_child,
 };
-use sesh::git::Git;
-use sesh::git::fork::{materialize, observe_target_proof};
-use sesh::model::{
+use handover::git::Git;
+use handover::git::fork::{materialize, observe_target_proof};
+use handover::model::{
     EventKind, ForkOperation, ForkPhase, OperationId, RunId, SessionId, UntrackedEntry,
 };
-use sesh::runtime::Runtime;
-use sesh::store::{SessionStore, StateLayout};
+use handover::runtime::Runtime;
+use handover::store::{SessionStore, StateLayout};
 use support::{git, init_repo, repository_fingerprint};
 use tempfile::TempDir;
 
@@ -51,7 +51,7 @@ fn operation_record_round_trips_and_rejects_unknown_schema() {
 
     let mut unsupported = operation.clone();
     unsupported.schema_version = 2;
-    sesh::store::refs::write_json(
+    handover::store::refs::write_json(
         &layout
             .operations()
             .join(unsupported.id.to_string())
@@ -163,7 +163,7 @@ fn rollback_removes_only_targets_matching_each_durable_precommit_phase() {
                     "rev-parse",
                     "--verify",
                     "--quiet",
-                    "refs/heads/sesh/fork-test"
+                    "refs/heads/handover/fork-test"
                 ]
             )
             .is_none(),
@@ -202,7 +202,7 @@ fn rollback_preserves_a_target_changed_after_the_last_durable_phase() {
                 "rev-parse",
                 "--verify",
                 "--quiet",
-                "refs/heads/sesh/fork-test"
+                "refs/heads/handover/fork-test"
             ]
         )
         .as_deref(),
@@ -231,7 +231,7 @@ fn live_mutation_proof_recovers_a_git_change_not_written_to_the_operation_record
             "worktree",
             "add",
             "-b",
-            "sesh/fork-test",
+            "handover/fork-test",
             target.to_str().unwrap(),
             operation.target_head.as_str(),
         ],
@@ -254,7 +254,7 @@ fn live_mutation_proof_recovers_a_git_change_not_written_to_the_operation_record
                 "rev-parse",
                 "--verify",
                 "--quiet",
-                "refs/heads/sesh/fork-test"
+                "refs/heads/handover/fork-test"
             ]
         )
         .is_none()
@@ -277,7 +277,7 @@ fn a_crash_loses_ephemeral_mutation_proof_and_preserves_the_unrecorded_target() 
             "worktree",
             "add",
             "-b",
-            "sesh/fork-test",
+            "handover/fork-test",
             target.to_str().unwrap(),
             operation.target_head.as_str(),
         ],
@@ -435,7 +435,7 @@ fn committed_lineage_recovers_forward_without_removing_git_state() {
                     "rev-parse",
                     "--verify",
                     "--quiet",
-                    "refs/heads/sesh/fork-test"
+                    "refs/heads/handover/fork-test"
                 ]
             )
             .as_deref(),
@@ -600,7 +600,7 @@ fn prepared_operation(repo: &std::path::Path, target: std::path::PathBuf) -> For
         source_worktree: source.identity,
         source_checkpoint_sequence: None,
         source_fingerprint: None,
-        target_branch: "sesh/fork-test".into(),
+        target_branch: "handover/fork-test".into(),
         target_worktree: target,
         target_head: source.head,
         child_session_id: None,
@@ -672,7 +672,7 @@ fn staged_child_fixture_before_record() -> StagedChildFixture {
 struct FixedRuntime;
 
 impl Runtime for FixedRuntime {
-    fn now(&self) -> sesh::error::Result<String> {
+    fn now(&self) -> handover::error::Result<String> {
         Ok("2026-07-19T10:00:00Z".into())
     }
 

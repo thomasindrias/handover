@@ -3,11 +3,11 @@ mod support;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
-use sesh::fork::{ForkOperationStore, capture_fork_artifacts};
-use sesh::git::Git;
-use sesh::git::fork::materialize;
-use sesh::model::{ForkOperation, ForkPhase, OperationId, SessionId};
-use sesh::store::StateLayout;
+use handover::fork::{ForkOperationStore, capture_fork_artifacts};
+use handover::git::Git;
+use handover::git::fork::materialize;
+use handover::model::{ForkOperation, ForkPhase, OperationId, SessionId};
+use handover::store::StateLayout;
 use sha2::{Digest, Sha256};
 use support::{add_linked_worktree, git, init_repo, repository_fingerprint};
 use tempfile::TempDir;
@@ -191,7 +191,7 @@ fn materialize_restores_only_recorded_initialized_submodules_without_a_protocol(
         source_worktree: source_snapshot.identity,
         source_checkpoint_sequence: None,
         source_fingerprint: None,
-        target_branch: "sesh/submodule-copy".into(),
+        target_branch: "handover/submodule-copy".into(),
         target_worktree: target.clone(),
         target_head: source_snapshot.head,
         child_session_id: None,
@@ -303,7 +303,7 @@ impl StateFixture {
             source_cwd,
             target,
             layout,
-            branch: "sesh/state-copy".into(),
+            branch: "handover/state-copy".into(),
         }
     }
 

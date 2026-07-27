@@ -40,7 +40,7 @@ fn repository_has_a_complete_open_source_surface() {
 fn readme_is_concise_human_and_routes_details_to_focused_docs() {
     let readme = read("README.md");
     for heading in [
-        "## Why Sesh",
+        "## Why Handover",
         "## Quick start",
         "## Switch or fork?",
         "## Reliability contract",
@@ -74,8 +74,8 @@ fn cargo_package_metadata_is_ready_for_a_future_release() {
     let manifest = read("Cargo.toml");
     for expected in [
         r#"license = "Apache-2.0""#,
-        r#"repository = "https://github.com/thomasindrias/sesh""#,
-        r#"homepage = "https://github.com/thomasindrias/sesh""#,
+        r#"repository = "https://github.com/thomasindrias/handover""#,
+        r#"homepage = "https://github.com/thomasindrias/handover""#,
         r#"readme = "README.md""#,
         r#"keywords = ["ai", "cli", "developer-tools", "git", "session"]"#,
         r#"categories = ["command-line-utilities", "development-tools"]"#,

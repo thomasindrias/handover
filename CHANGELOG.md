@@ -1,48 +1,74 @@
 # Changelog
 
-All notable changes to Sesh will be documented in this file. The format is based
+All notable changes to Handover will be documented in this file. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-27
+
 ### Added
 
 - Local, provider-neutral coding sessions for Claude Code and Codex.
 - Append-only, checksummed events and explicit narrative checkpoints.
-- Deterministic handoffs that restore the existing worktree and saved cwd.
+- Deterministic handovers that restore the existing worktree and saved cwd.
 - Inspect, status, log, doctor, setup, and complete logical deletion commands.
 - Verified worktree forks with staged, unstaged, and untracked state, durable
   transaction recovery, and parent-child session lineage.
-- A global `sesh list` command that reports every local session across
+- A global `handover list` command that reports every local session across
   repositories, rendering corrupt sessions as degraded diagnostic rows instead
   of failing the listing.
-- A `sesh handoff <provider>` command that renders the exact handoff a
+- A `handover preview <provider>` command that renders the exact handover a
   switch would produce right now, without switching, so a missing or stale
   narrative checkpoint is visible before a switch is spent.
-- Checkpoint staleness signals: `sesh status` reports
+- Checkpoint staleness signals: `handover status` reports
   `latest_narrative_checkpoint` and `events_since_narrative`, and the Stop
   hook warns with a single `systemMessage` when 20 or more events accumulate
   without a fresh narrative checkpoint.
-- Switch-moment ergonomics: a live-lease refusal in `sesh switch` now names
+- Switch-moment ergonomics: a live-lease refusal in `handover switch` now names
   the holding provider, pid, and start time with a one-line next step; a
   same-host stale lease is recovered only through an explicit, journaled
-  `sesh switch` prompt (or `--recover-lease` non-interactively) instead of
-  silently auto-recovering; and `sesh status` reports a `switch_readiness`
-  block (lease state, checkpoint freshness, handoff renderability) so a
+  `handover switch` prompt (or `--recover-lease` non-interactively) instead of
+  silently auto-recovering; and `handover status` reports a `switch_readiness`
+  block (lease state, checkpoint freshness, handover renderability) so a
   switch's success can be seen before quitting the current provider.
-- A one-command `install.sh` script that builds and installs sesh from
+- Prebuilt binaries for macOS and Linux on both Apple silicon and x86-64,
+  published on each tagged release with a `SHA256SUMS` file, plus a Homebrew
+  formula that the release pipeline keeps current. Installing Handover no longer
+  requires a Rust toolchain.
+- A one-command `install.sh` script that builds and installs handover from
   source (`curl -fsSL .../install.sh | sh`), safe to re-run as an upgrade,
   with a `PATH` check and next-step guidance on success.
-- A `sesh mcp-server` subcommand exposing `list`, `handoff`, and `status` as
-  MCP tools over stdio, so a provider attached to a Sesh session can query
+- A `handover mcp-server` subcommand exposing `list`, `preview`, and `status` as
+  MCP tools over stdio, so a provider attached to a Handover session can query
   it directly instead of a human running commands in a second terminal.
-  `sesh status --json`'s `switch_readiness` block now also reports a
+  `handover status --json`'s `switch_readiness` block now also reports a
   `suggested_switch_command` string naming the exact command to run to
   switch.
 
 ### Fixed
 
+- `handover doctor` no longer reports a correctly installed Codex integration as
+  insecure. The permission walk applied Handover's canonical `0600`/`0700` rules to
+  a provider's private home, which Handover creates but does not own: the adapter
+  links `hooks.json`, `config.toml`, and `auth.json` into each run's
+  `CODEX_HOME`, and a real Codex launch then writes its own databases and
+  scratch directory alongside them. `handover setup codex` therefore left `doctor`
+  failing, and every Codex run added more errors about files Handover neither
+  creates nor controls. Handover now guarantees the `0700` container that keeps
+  other users out and leaves its contents to the provider. An unexpected
+  symlink in canonical state is still refused, now with a message that says so.
+- `handover doctor` now reports a provider that was never set up as
+  `integration.missing` with the exact `handover setup <provider>` command,
+  instead of a raw "No such file or directory" I/O error.
+- A run that stopped without a SessionStart handshake is now a warning, rather
+  than an error that pinned `handover doctor` to a failing exit code, once some run
+  in that session has handshaken — an earlier handshake proves the provider's
+  hooks reach Handover, so that run died for its own reasons. When no run in the
+  session has ever handshaken the integration itself is suspect, so it stays an
+  error and now names the provider setup command. The message also no longer
+  prints a raw `Some(RunId(...))` debug value.
 - Codex hook delivery: hooks registered via `-c` config overlays never
   actually fired against real Codex CLI builds. Each Codex launch now gets
   a private, per-run `CODEX_HOME` with a materialized `hooks.json` and

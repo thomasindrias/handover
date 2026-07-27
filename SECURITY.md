@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Sesh is pre-release software. Security fixes are made on the current `main`
+Handover is pre-release software. Security fixes are made on the current `main`
 branch and will be included in the next release. Older revisions are not
 separately supported.
 
@@ -23,12 +23,12 @@ without publishing exploit details.
 
 ## Trust model
 
-Sesh stores session data as plaintext on the local machine. It applies private
+Handover stores session data as plaintext on the local machine. It applies private
 Unix permissions (`0700` directories and `0600` files), rejects unsafe canonical
 state paths and permissions, and keeps its state outside application repositories.
 It does not encrypt or automatically redact stored content.
 
-An unrestricted coding provider launched by Sesh runs as your Unix user. Sesh is
+An unrestricted coding provider launched by Handover runs as your Unix user. Handover is
 not a sandbox or a security boundary between processes owned by that user. Review
 provider permissions, hooks, and configuration before trusting them, and protect
 machine access and backups accordingly.

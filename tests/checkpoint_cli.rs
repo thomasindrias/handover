@@ -23,11 +23,11 @@ fn provider_submission_is_private_and_does_not_touch_the_journal() {
     std::fs::set_permissions(&events, std::fs::Permissions::from_mode(0o600)).unwrap();
     let before = std::fs::read(&events).unwrap();
 
-    cargo_bin_cmd!("sesh")
-        .env("SESH_HOME", &state)
-        .env("SESH_SESSION_ID", SESSION_ID)
-        .env("SESH_RUN_ID", RUN_ID)
-        .env("SESH_CHECKPOINT_INBOX", &inbox)
+    cargo_bin_cmd!("handover")
+        .env("HANDOVER_HOME", &state)
+        .env("HANDOVER_SESSION_ID", SESSION_ID)
+        .env("HANDOVER_RUN_ID", RUN_ID)
+        .env("HANDOVER_CHECKPOINT_INBOX", &inbox)
         .args(["checkpoint", "--format", "json", "--from-provider"])
         .write_stdin(narrative_json())
         .assert()
@@ -69,11 +69,11 @@ fn provider_submission_cannot_redirect_to_an_arbitrary_inbox() {
     std::fs::create_dir(&redirected).unwrap();
     std::fs::set_permissions(&redirected, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-    cargo_bin_cmd!("sesh")
-        .env("SESH_HOME", &state)
-        .env("SESH_SESSION_ID", SESSION_ID)
-        .env("SESH_RUN_ID", RUN_ID)
-        .env("SESH_CHECKPOINT_INBOX", &redirected)
+    cargo_bin_cmd!("handover")
+        .env("HANDOVER_HOME", &state)
+        .env("HANDOVER_SESSION_ID", SESSION_ID)
+        .env("HANDOVER_RUN_ID", RUN_ID)
+        .env("HANDOVER_CHECKPOINT_INBOX", &redirected)
         .args(["checkpoint", "--format", "json", "--from-provider"])
         .write_stdin(narrative_json())
         .assert()
@@ -96,23 +96,23 @@ fn human_submission_commits_an_event_artifacts_and_both_refs() {
 set -euo pipefail
 if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-claude 1.0'; exit 0; fi
 cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
-printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}' | "$SESH_HOOK_BIN" __hook claude >/dev/null
+printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}' | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null
 exit 0
 "#,
     );
     let state = temp.path().join("state");
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", path_with(&bin))
         .args(["run", "claude"])
         .assert()
         .success();
 
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
-        .env_remove("SESH_RUN_ID")
+        .env("HANDOVER_HOME", &state)
+        .env_remove("HANDOVER_RUN_ID")
         .args(["checkpoint", "--format", "json"])
         .write_stdin(narrative_json())
         .assert()
@@ -157,10 +157,10 @@ exit 0
     assert_eq!(checkpoint["author"]["kind"], "human");
 
     let before = std::fs::read(session.join("events.jsonl")).unwrap();
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
-        .env("SESH_RUN_ID", RUN_ID)
+        .env("HANDOVER_HOME", &state)
+        .env("HANDOVER_RUN_ID", RUN_ID)
         .args(["checkpoint", "--format", "json"])
         .write_stdin(narrative_json())
         .assert()
@@ -182,9 +182,9 @@ fn provider_submission_is_promoted_by_the_next_hook() {
 set -euo pipefail
 if [[ ${{1:-}} == "--version" ]]; then printf '%s\n' 'fake-claude 1.0'; exit 0; fi
 cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
-printf '%s' '{{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}}' | "$SESH_HOOK_BIN" __hook claude >/dev/null
-printf '%s' '{}' | "$SESH_HOOK_BIN" checkpoint --format json --from-provider
-printf '%s' '{{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"Stop"}}' | "$SESH_HOOK_BIN" __hook claude >/dev/null
+printf '%s' '{{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}}' | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null
+printf '%s' '{}' | "$HANDOVER_HOOK_BIN" checkpoint --format json --from-provider
+printf '%s' '{{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"Stop"}}' | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null
 exit 0
 "#,
             narrative_json()
@@ -192,9 +192,9 @@ exit 0
     );
     let state = temp.path().join("state");
 
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", path_with(&bin))
         .args(["run", "claude"])
         .assert()
@@ -251,19 +251,19 @@ fn symlinked_provider_submission_is_refused_and_retained() {
 set -euo pipefail
 if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-claude 1.0'; exit 0; fi
 cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
-printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}' | "$SESH_HOOK_BIN" __hook claude >/dev/null
-printf '%s' 'not trusted' > "$SESH_CHECKPOINT_INBOX/payload.txt"
-chmod 600 "$SESH_CHECKPOINT_INBOX/payload.txt"
-ln -s payload.txt "$SESH_CHECKPOINT_INBOX/forged.json"
-printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"Stop"}' | "$SESH_HOOK_BIN" __hook claude >/dev/null
+printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}' | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null
+printf '%s' 'not trusted' > "$HANDOVER_CHECKPOINT_INBOX/payload.txt"
+chmod 600 "$HANDOVER_CHECKPOINT_INBOX/payload.txt"
+ln -s payload.txt "$HANDOVER_CHECKPOINT_INBOX/forged.json"
+printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"Stop"}' | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null
 exit 0
 "#,
     );
     let state = temp.path().join("state");
 
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", path_with(&bin))
         .args(["run", "claude"])
         .assert()

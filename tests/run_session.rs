@@ -23,20 +23,20 @@ fn run_captures_hooks_and_returns_the_provider_exit_code() {
 set -euo pipefail
 if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-claude 1.0'; exit 0; fi
 cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
-printf '%s' '{"session_id":"native-claude","transcript_path":null,"cwd":"'"$cwd_json"'","permission_mode":"default","hook_event_name":"SessionStart","source":"startup"}' | "$SESH_HOOK_BIN" __hook claude >/dev/null
-printf '%s' '{"session_id":"native-claude","transcript_path":null,"cwd":"'"$cwd_json"'","permission_mode":"default","hook_event_name":"UserPromptSubmit","prompt":"Implement OAuth"}' | "$SESH_HOOK_BIN" __hook claude >/dev/null
+printf '%s' '{"session_id":"native-claude","transcript_path":null,"cwd":"'"$cwd_json"'","permission_mode":"default","hook_event_name":"SessionStart","source":"startup"}' | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null
+printf '%s' '{"session_id":"native-claude","transcript_path":null,"cwd":"'"$cwd_json"'","permission_mode":"default","hook_event_name":"UserPromptSubmit","prompt":"Implement OAuth"}' | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null
 printf '%s\n' 'provider stdout is inherited'
 printf '%s\n' 'provider stderr is inherited' >&2
 exit 23
 "#,
     );
-    write_executable(&bin.join("sesh"), "#!/bin/sh\nexit 99\n");
+    write_executable(&bin.join("handover"), "#!/bin/sh\nexit 99\n");
     let path = path_with(&bin);
     let state = temp.path().join("state");
 
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&cwd)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", path)
         .arg("run")
         .arg("claude")
@@ -89,18 +89,18 @@ if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-claude 1.0'; exit 0; fi
 cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
 start='{"session_id":"native","transcript_path":null,"cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}'
 post='{"session_id":"native","transcript_path":null,"cwd":"'"$cwd_json"'","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"true"},"tool_response":{"stdout":"ok","stderr":"","exit_code":0},"tool_use_id":"tool-1"}'
-printf '%s' "$start" | "$SESH_HOOK_BIN" __hook claude >/dev/null
-printf '%s' "$start" | "$SESH_HOOK_BIN" __hook claude >/dev/null
-printf '%s' "$post" | "$SESH_HOOK_BIN" __hook claude >/dev/null
-printf '%s' "$post" | "$SESH_HOOK_BIN" __hook claude >/dev/null
+printf '%s' "$start" | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null
+printf '%s' "$start" | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null
+printf '%s' "$post" | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null
+printf '%s' "$post" | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null
 exit 0
 "#,
     );
     let state = temp.path().join("state");
 
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", path_with(&bin))
         .args(["run", "claude"])
         .assert()

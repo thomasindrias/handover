@@ -1,12 +1,12 @@
 [package]
-name = "sesh"
+name = "handover"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A local-first session layer for coding agents"
 license = "Apache-2.0"
-repository = "https://github.com/thomasindrias/sesh"
-homepage = "https://github.com/thomasindrias/sesh"
+repository = "https://github.com/thomasindrias/handover"
+homepage = "https://github.com/thomasindrias/handover"
 readme = "README.md"
 keywords = ["ai", "cli", "developer-tools", "git", "session"]
 categories = ["command-line-utilities", "development-tools"]

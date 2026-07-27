@@ -3,8 +3,10 @@ mod support;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::cargo::cargo_bin_cmd;
-use sesh::git::Git;
-use sesh::model::{EventEnvelope, EventKind, ForkOperation, ForkPhase, SessionMeta, WorktreeRef};
+use handover::git::Git;
+use handover::model::{
+    EventEnvelope, EventKind, ForkOperation, ForkPhase, SessionMeta, WorktreeRef,
+};
 use support::{
     add_linked_worktree, git, init_repo, path_with, repository_fingerprint, write_executable,
 };
@@ -32,7 +34,7 @@ fn forks_from_claude_to_codex_with_explicit_child_lineage_and_exact_state() {
         r#"#!/usr/bin/env bash
 set -euo pipefail
 if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-claude 1.0'; exit 0; fi
-hook() { printf '%s' "$1" | "$SESH_HOOK_BIN" __hook claude >/dev/null; }
+hook() { printf '%s' "$1" | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null; }
 cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
 hook '{"session_id":"claude-native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}'
 hook '{"session_id":"claude-native","cwd":"'"$cwd_json"'","hook_event_name":"UserPromptSubmit","prompt":"Implement OAuth callback with PKCE"}'
@@ -44,7 +46,7 @@ printf 'unstaged verifier\n' >> tracked.rs
 printf 'untracked state\n' > oauth_state.txt
 hook '{"session_id":"claude-native","cwd":"'"$cwd_json"'","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"cargo test oauth_integration"},"tool_use_id":"fail"}'
 hook '{"session_id":"claude-native","cwd":"'"$cwd_json"'","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"cargo test oauth_integration"},"tool_response":{"stdout":"0 passed; 1 failed","stderr":"assertion failed: callback state","exit_code":101},"tool_use_id":"fail"}'
-printf '%s' '{"objective":"Implement OAuth callback with PKCE","summary":"Callback is implemented; integration remains","decisions":[{"statement":"Keep verifier in the session cookie","reason":"Avoid server-side state"}],"assumptions":[],"constraints":[],"completed":["OAuth callback"],"in_progress":["PKCE integration"],"blockers":["integration test failure"],"next_steps":["Fix callback integration test"],"related_event_sequences":[]}' | "$SESH_HOOK_BIN" checkpoint --format json --from-provider
+printf '%s' '{"objective":"Implement OAuth callback with PKCE","summary":"Callback is implemented; integration remains","decisions":[{"statement":"Keep verifier in the session cookie","reason":"Avoid server-side state"}],"assumptions":[],"constraints":[],"completed":["OAuth callback"],"in_progress":["PKCE integration"],"blockers":["integration test failure"],"next_steps":["Fix callback integration test"],"related_event_sequences":[]}' | "$HANDOVER_HOOK_BIN" checkpoint --format json --from-provider
 hook '{"session_id":"claude-native","cwd":"'"$cwd_json"'","hook_event_name":"Stop"}'
 exit 75
 "#,
@@ -54,21 +56,21 @@ exit 75
         r#"#!/usr/bin/env bash
 set -euo pipefail
 if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-codex 1.0'; exit 0; fi
-printf '%s\n' "$PWD" > "$SESH_TEST_TRACE/codex.cwd"
-printf '%s\n' "$SESH_SESSION_ID" > "$SESH_TEST_TRACE/codex.session"
-git branch --show-current > "$SESH_TEST_TRACE/codex.branch"
-printf '%s\n' "$@" > "$SESH_TEST_TRACE/codex.args"
+printf '%s\n' "$PWD" > "$HANDOVER_TEST_TRACE/codex.cwd"
+printf '%s\n' "$HANDOVER_SESSION_ID" > "$HANDOVER_TEST_TRACE/codex.session"
+git branch --show-current > "$HANDOVER_TEST_TRACE/codex.branch"
+printf '%s\n' "$@" > "$HANDOVER_TEST_TRACE/codex.args"
 cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
-printf '%s' '{"session_id":"codex-native","turn_id":"turn-1","cwd":"'"$cwd_json"'","model":"gpt-test","hook_event_name":"SessionStart","source":"startup"}' | "$SESH_HOOK_BIN" __hook codex > "$SESH_TEST_TRACE/codex.context.json"
+printf '%s' '{"session_id":"codex-native","turn_id":"turn-1","cwd":"'"$cwd_json"'","model":"gpt-test","hook_event_name":"SessionStart","source":"startup"}' | "$HANDOVER_HOOK_BIN" __hook codex > "$HANDOVER_TEST_TRACE/codex.context.json"
 exit 0
 "#,
     );
     let path = path_with(&bin);
 
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&source_cwd)
-        .env("SESH_HOME", &state)
-        .env("SESH_TEST_TRACE", &trace)
+        .env("HANDOVER_HOME", &state)
+        .env("HANDOVER_TEST_TRACE", &trace)
         .env("PATH", &path)
         .args(["run", "claude"])
         .assert()
@@ -76,10 +78,10 @@ exit 0
     let source_before = repository_fingerprint(&source);
     let source_snapshot = Git::new().snapshot(&source_cwd).unwrap();
 
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&source)
-        .env("SESH_HOME", &state)
-        .env("SESH_TEST_TRACE", &trace)
+        .env("HANDOVER_HOME", &state)
+        .env("HANDOVER_TEST_TRACE", &trace)
         .env("PATH", &path)
         .args(["fork", "codex", "--", "--model", "gpt-test"])
         .assert()
@@ -99,14 +101,14 @@ exit 0
         .unwrap()
         .trim()
         .to_owned();
-    assert!(branch.starts_with("sesh/oauth-worktree-"));
+    assert!(branch.starts_with("handover/oauth-worktree-"));
     let child_id = std::fs::read_to_string(trace.join("codex.session"))
         .unwrap()
         .trim()
         .to_owned();
     let hook_output: serde_json::Value =
         serde_json::from_slice(&std::fs::read(trace.join("codex.context.json")).unwrap()).unwrap();
-    let handoff = hook_output["hookSpecificOutput"]["additionalContext"]
+    let handover = hook_output["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap();
     for expected in [
@@ -124,8 +126,8 @@ exit 0
         "apps/web/oauth_state.txt",
     ] {
         assert!(
-            handoff.contains(expected),
-            "child handoff is missing {expected:?}:\n{handoff}"
+            handover.contains(expected),
+            "child handover is missing {expected:?}:\n{handover}"
         );
     }
     let target_snapshot = Git::new().snapshot(&codex_cwd).unwrap();
@@ -249,7 +251,7 @@ fn assert_no_provider_state(root: &Path) {
         for entry in std::fs::read_dir(directory).unwrap() {
             let path = entry.unwrap().path();
             let name = path.file_name().unwrap().to_string_lossy();
-            assert!(!matches!(name.as_ref(), ".sesh" | ".claude" | ".codex"));
+            assert!(!matches!(name.as_ref(), ".handover" | ".claude" | ".codex"));
             if name != ".git" && std::fs::symlink_metadata(&path).unwrap().is_dir() {
                 pending.push(path);
             }

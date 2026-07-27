@@ -1,6 +1,6 @@
-# Sesh architecture
+# Handover architecture
 
-Sesh is a local session layer for coding agents. It keeps continuity independent
+Handover is a local session layer for coding agents. It keeps continuity independent
 of the provider while leaving source control to Git.
 
 This document describes the V1 model and its reliability boundaries. It is a
@@ -14,23 +14,23 @@ A session represents one line of work in one Git worktree. It owns:
 - append-only observed events;
 - explicit narrative and automatic transition checkpoints;
 - provider runs and their lifecycle;
-- optional parent or child lineage created by `sesh fork`.
+- optional parent or child lineage created by `handover fork`.
 
 The session is canonical. Provider-native conversation identifiers may be useful
-diagnostics, but Sesh never requires a provider transcript to resume work. Each
-new attachment starts from a deterministic Sesh handoff.
+diagnostics, but Handover never requires a provider transcript to resume work. Each
+new attachment starts from a deterministic handover.
 
-Facts and narrative remain separate. Sesh can observe a command, process exit,
+Facts and narrative remain separate. Handover can observe a command, process exit,
 Git status, path, hash, or timestamp. It cannot infer why a choice was made or
 what should happen next. That narrative enters the session only through an
 explicit human or provider checkpoint. Missing narrative is reported as missing.
 
 ## Components
 
-Sesh is one Rust binary with no daemon requirement.
+Handover is one Rust binary with no daemon requirement.
 
 - The session core defines stable identifiers, events, checkpoints, refs, and
-  handoff rendering without depending on provider payloads.
+  handover rendering without depending on provider payloads.
 - Storage owns paths, private permissions, locks, checksums, atomic refs, blobs,
   leases, fork operation records, and recovery.
 - The Git layer discovers repository and worktree identity, observes dirty state,
@@ -46,11 +46,11 @@ boundaries. Adding a provider must not require a new session or checkpoint model
 
 ## Local state
 
-`$SESH_HOME` selects the state root. Otherwise Sesh uses
-`$XDG_STATE_HOME/sesh`, then `~/.local/state/sesh`.
+`$HANDOVER_HOME` selects the state root. Otherwise Handover uses
+`$XDG_STATE_HOME/handover`, then `~/.local/state/handover`.
 
 ```text
-$SESH_HOME/
+$HANDOVER_HOME/
 ├── FORMAT
 ├── integrations/
 │   ├── claude/<adapter-version>/
@@ -73,12 +73,19 @@ $SESH_HOME/
 ```
 
 Canonical directories use mode `0700` and regular files use `0600`, independent
-of a permissive umask. Sesh rejects unexpected ownership, symlink traversal, and
-unsafe canonical-state permissions. Session state never belongs in the
-application repository.
+of a permissive umask. Handover rejects unexpected ownership, symlink traversal, and
+unsafe canonical-state permissions. Handover writes only regular files and
+directories into canonical state, so a symlink there is refused rather than
+followed.
+
+A provider's private home, such as the per-run Codex `CODEX_HOME`, is not
+canonical Handover state. Handover materializes it and then the provider writes its own
+files there with its own permissions, so Handover guarantees the `0700` directory
+that contains them — which is what keeps other users out — and does not police
+its contents. Session state never belongs in the application repository.
 
 V1 requires canonical repository, worktree, cwd, dirty, and symlink-target paths
-to be valid UTF-8. Unsupported paths fail before session or fork activation; Sesh
+to be valid UTF-8. Unsupported paths fail before session or fork activation; Handover
 does not record lossy replacements.
 
 Worktree refs are keyed by a SHA-256 digest of the canonical Git common directory
@@ -90,12 +97,12 @@ fail closed.
 
 `events.jsonl` is the canonical append-only journal. Each line contains a typed
 event and a SHA-256 checksum of its canonical JSON representation. Under a short
-lock, Sesh reads the last valid event, assigns the next sequence, appends one
+lock, Handover reads the last valid event, assigns the next sequence, appends one
 newline-terminated envelope, and flushes before returning success.
 
 An incomplete final line may be discarded during startup. A complete invalid
 line, checksum mismatch, sequence gap, or corruption earlier in the journal is a
-hard diagnostic; Sesh does not guess at repair.
+hard diagnostic; Handover does not guess at repair.
 
 Normalized event families cover session creation and lineage, switch requests,
 provider run lifecycle, saved cwd changes, prompts, tools, commands, Git
@@ -108,40 +115,40 @@ related event sequences. Transition checkpoints are created automatically at
 provider boundaries and point back to the latest verified narrative checkpoint;
 they never invent narrative.
 
-The handoff selects a committed journal prefix, verifies every referenced event
+The handover selects a committed journal prefix, verifies every referenced event
 and blob, refreshes Git facts, and renders bounded Markdown. Required facts are
 never silently truncated. If they do not fit, switching fails with a diagnostic.
 
 ## Run and switch transactions
 
-`sesh run` discovers the current worktree and cwd, refuses an existing binding,
+`handover run` discovers the current worktree and cwd, refuses an existing binding,
 creates the session and binding, writes the first run inbox, acquires a lease,
 and launches the provider. Setup failures roll back the new binding and session.
 Once the child launches, its exit is history rather than a setup rollback.
 
-`sesh switch` resolves the existing binding from anywhere inside the worktree,
+`handover switch` resolves the existing binding from anywhere inside the worktree,
 verifies journal and metadata consistency, refuses a live lease, records the
-request and transition checkpoint, and builds a handoff. The provider starts in
+request and transition checkpoint, and builds a handover. The provider starts in
 the latest saved cwd—not necessarily the directory from which `switch` was run.
 
 Normal run and switch paths are observational toward source. They do not create
 a worktree, commit, stash, reset, clean, checkout, or rewrite files.
 
 Run leases contain the process identity needed to distinguish a live provider
-from a stale record. Stale leases are recovered explicitly and recorded; Sesh
+from a stale record. Stale leases are recovered explicitly and recorded; Handover
 does not permit two live provider attachments to the same session.
 
-`sesh switch` surfaces this at two points: a live or foreign-host lease
+`handover switch` surfaces this at two points: a live or foreign-host lease
 refuses with the holding provider, pid, and start time; a same-host dead
 lease is recovered only after an explicit `[y/N]` prompt (or
-`--recover-lease` non-interactively), never silently. `sesh status` reports
+`--recover-lease` non-interactively), never silently. `handover status` reports
 a `switch_readiness` block — lease state, narrative checkpoint freshness,
-handoff renderability, and the suggested switch command — so this can be
+handover renderability, and the suggested switch command — so this can be
 checked before quitting the current provider.
 
 ## Fork transaction
 
-`sesh fork` deliberately creates a separate line of work. It is not an option on
+`handover fork` deliberately creates a separate line of work. It is not an option on
 `run` or `switch`, because copying worktree state has a different risk and
 recovery model.
 
@@ -152,7 +159,7 @@ Preflight rejects ambiguous or unsupported state before mutation, including:
 - invalid branch names, existing targets, and nested registered worktrees;
 - active or unresolved leases and non-UTF-8 canonical paths.
 
-Sesh captures tracked index state, staged and unstaged binary patches, deletions,
+Handover captures tracked index state, staged and unstaged binary patches, deletions,
 renames, executable bits, regular untracked files, and untracked symlinks.
 Ignored files are excluded. Clean initialized submodules are reconstructed only
 from proven local Git objects; fork never fetches.
@@ -170,11 +177,11 @@ Artifacts are hashed and source state is fingerprinted before and after capture.
 The target receives the artifacts, then must produce the same semantic
 fingerprint before lineage can commit.
 
-The verified parent `session.forked` event is the commit point. Before it, Sesh
+The verified parent `session.forked` event is the commit point. Before it, Handover
 may remove only branch/worktree artifacts that it can prove it created and that
 remain unchanged. After it, recovery is forward-only: doctor completes the
 child binding and launch state without deleting committed lineage. If proof is
-insufficient, Sesh preserves the artifacts and reports exact inspection steps.
+insufficient, Handover preserves the artifacts and reports exact inspection steps.
 
 The source worktree is never rewritten. The only source-repository mutation is
 the requested branch and worktree registration in shared Git metadata.
@@ -190,7 +197,7 @@ assets and reports interrupted fork operation ID, phase, source session, target,
 branch, and a shell-escaped Git inspection command. Repair never deletes a
 crash-left branch or worktree when safe ownership cannot be proven.
 
-`sesh delete` removes the complete local session and its binding, not source
+`handover delete` removes the complete local session and its binding, not source
 files, worktrees, or Git branches. Parent sessions with children are deleted
 child-first, and nonterminal fork operations block deletion. Logical deletion is
 not forensic erasure from storage media, snapshots, backups, or exported copies.
@@ -199,7 +206,7 @@ not forensic erasure from storage media, snapshots, backups, or exported copies.
 
 Private modes and path validation reduce accidental disclosure. They do not
 isolate processes running as the same Unix user. An unrestricted coding agent
-can access anything that user can access. Sesh does not provide sandboxing,
+can access anything that user can access. Handover does not provide sandboxing,
 encryption, automatic secret detection, or redaction.
 
 Provider hook inputs and run-inbox checkpoint files are untrusted. They are
@@ -222,21 +229,21 @@ These boundaries keep the core continuation path small and auditable.
 
 ## MCP server
 
-`sesh mcp-server` (`docs/mcp.md`) exposes `list`, `handoff`, and `status` as
+`handover mcp-server` (`docs/mcp.md`) exposes `list`, `handover`, and `status` as
 MCP tools over stdio. `provider_command_allowed` (src/app.rs) has one
 explicit exception for `Command::McpServer` so the subcommand can start even
-when `SESH_RUN_ID` is set — the situation it's built for, since an MCP client
-spawns the server as a subprocess of the very provider Sesh launched. No
+when `HANDOVER_RUN_ID` is set — the situation it's built for, since an MCP client
+spawns the server as a subprocess of the very provider Handover launched. No
 other command's behavior under that guard changes. Tool calls run the same
 value-producing code the CLI uses, entirely in-process — never a subprocess,
 never a second pass through the CLI dispatcher.
 
 This exception widens what an attached provider can read. Through the MCP
-tools it now receives the exact `list`, `handoff`, and `status` output that
+tools it now receives the exact `list`, `handover`, and `status` output that
 `provider_command_allowed` refuses it via the CLI. `list` in particular is
 not scoped to the attached session: it reports the repository path, worktree
 path, and branch for every session on the machine. This is acceptable
 because all three tools are pure reads with no mutation path, the guard is a
 soft guardrail against accidental misuse rather than an authorization
 boundary, and a provider process running as the same Unix user can already
-read `$SESH_HOME` directly (see "Security boundary" above).
+read `$HANDOVER_HOME` directly (see "Security boundary" above).

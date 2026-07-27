@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 
-use sesh::git::Git;
+use handover::git::Git;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 

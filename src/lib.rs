@@ -5,7 +5,7 @@ pub mod doctor;
 pub mod error;
 pub mod fork;
 pub mod git;
-pub mod handoff;
+pub mod handover;
 pub mod list;
 pub mod mcp;
 pub mod model;

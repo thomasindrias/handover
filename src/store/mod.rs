@@ -56,15 +56,17 @@ impl StateLayout {
     }
 
     pub fn from_environment_at(env: &Environment, cwd: &Path) -> Result<Self> {
-        if let Some(root) = env.get("SESH_HOME") {
+        if let Some(root) = env.get("HANDOVER_HOME") {
             if root.is_empty() {
-                return Err(Error::InvalidState("SESH_HOME must not be empty".into()));
+                return Err(Error::InvalidState(
+                    "HANDOVER_HOME must not be empty".into(),
+                ));
             }
             return Ok(Self::new(resolve_from(cwd, PathBuf::from(root))));
         }
         if let Some(root) = env.get("XDG_STATE_HOME").filter(|root| !root.is_empty()) {
             return Ok(Self::new(
-                resolve_from(cwd, PathBuf::from(root)).join("sesh"),
+                resolve_from(cwd, PathBuf::from(root)).join("handover"),
             ));
         }
         let home = env
@@ -72,7 +74,7 @@ impl StateLayout {
             .filter(|home| !home.is_empty())
             .ok_or(Error::StateHomeUnavailable)?;
         Ok(Self::new(
-            resolve_from(cwd, PathBuf::from(home)).join(".local/state/sesh"),
+            resolve_from(cwd, PathBuf::from(home)).join(".local/state/handover"),
         ))
     }
 
@@ -113,7 +115,7 @@ impl StateLayout {
         match std::fs::symlink_metadata(&format) {
             Ok(_) => validate_format(&format)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if atomic::create_private(&format, b"sesh-state 1\n").is_err() {
+                if atomic::create_private(&format, b"handover-state 1\n").is_err() {
                     validate_format(&format)?;
                 }
             }
@@ -132,9 +134,9 @@ impl StateLayout {
 }
 
 fn validate_format(path: &Path) -> Result<()> {
-    if atomic::read_private(path)? != b"sesh-state 1\n" {
+    if atomic::read_private(path)? != b"handover-state 1\n" {
         return Err(Error::InvalidState(
-            "unsupported Sesh state format; expected 1".into(),
+            "unsupported Handover state format; expected 1".into(),
         ));
     }
     Ok(())
@@ -206,9 +208,9 @@ mod tests {
     use super::{Environment, StateLayout, validate_format};
 
     #[test]
-    fn sesh_home_wins_over_xdg_and_home() {
+    fn handover_home_wins_over_xdg_and_home() {
         let env = Environment::from_pairs(HashMap::from([
-            ("SESH_HOME", OsString::from("/state/explicit")),
+            ("HANDOVER_HOME", OsString::from("/state/explicit")),
             ("XDG_STATE_HOME", OsString::from("/state/xdg")),
             ("HOME", OsString::from("/home/dev")),
         ]));
@@ -229,18 +231,18 @@ mod tests {
 
         assert_eq!(
             StateLayout::from_environment(&xdg).unwrap().root(),
-            std::path::Path::new("/state/xdg/sesh")
+            std::path::Path::new("/state/xdg/handover")
         );
         assert_eq!(
             StateLayout::from_environment(&home).unwrap().root(),
-            std::path::Path::new("/home/dev/.local/state/sesh")
+            std::path::Path::new("/home/dev/.local/state/handover")
         );
     }
 
     #[test]
     fn empty_environment_roots_are_never_treated_as_the_launch_directory() {
         let explicit = Environment::from_pairs(HashMap::from([
-            ("SESH_HOME", OsString::new()),
+            ("HANDOVER_HOME", OsString::new()),
             ("HOME", OsString::from("/home/dev")),
         ]));
         let xdg = Environment::from_pairs(HashMap::from([
@@ -251,7 +253,7 @@ mod tests {
         assert!(StateLayout::from_environment(&explicit).is_err());
         assert_eq!(
             StateLayout::from_environment(&xdg).unwrap().root(),
-            std::path::Path::new("/home/dev/.local/state/sesh")
+            std::path::Path::new("/home/dev/.local/state/handover")
         );
     }
 
@@ -312,12 +314,14 @@ mod tests {
     }
 
     #[test]
-    fn relative_sesh_home_is_resolved_once_against_the_launch_cwd() {
+    fn relative_handover_home_is_resolved_once_against_the_launch_cwd() {
         let temp = TempDir::new().unwrap();
         let cwd = temp.path().join("work");
         std::fs::create_dir(&cwd).unwrap();
-        let env =
-            Environment::from_pairs(HashMap::from([("SESH_HOME", OsString::from("../state"))]));
+        let env = Environment::from_pairs(HashMap::from([(
+            "HANDOVER_HOME",
+            OsString::from("../state"),
+        )]));
 
         let layout = StateLayout::from_environment_at(&env, &cwd).unwrap();
         layout.ensure().unwrap();
@@ -334,7 +338,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let layout = StateLayout::new(temp.path().join("state"));
         layout.ensure().unwrap();
-        std::fs::write(layout.root().join("FORMAT"), b"sesh-state 999\n").unwrap();
+        std::fs::write(layout.root().join("FORMAT"), b"handover-state 999\n").unwrap();
 
         assert!(layout.ensure().is_err());
     }

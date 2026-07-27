@@ -98,7 +98,8 @@ fn canonical(value: String) -> Result<PathBuf> {
 fn require_utf8<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) -> Result<()> {
     if paths.into_iter().any(|path| path.to_str().is_none()) {
         return Err(Error::InvalidState(
-            "Sesh V1 requires Git paths that are valid UTF-8; no path was recorded lossily".into(),
+            "Handover V1 requires Git paths that are valid UTF-8; no path was recorded lossily"
+                .into(),
         ));
     }
     Ok(())

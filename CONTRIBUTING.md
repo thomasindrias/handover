@@ -1,4 +1,4 @@
-# Contributing to Sesh
+# Contributing to Handover
 
 Thank you for helping make provider switching boringly reliable. Focused bug
 reports, tests, documentation improvements, and small changes are welcome.
@@ -15,12 +15,12 @@ reports, tests, documentation improvements, and small changes are welcome.
 Install stable Rust with `rustfmt` and `clippy`, then clone the repository:
 
 ```bash
-git clone https://github.com/thomasindrias/sesh.git
-cd sesh
+git clone https://github.com/thomasindrias/handover.git
+cd handover
 cargo build
 ```
 
-Sesh follows test-driven development. Add or adjust a focused test, observe the
+Handover follows test-driven development. Add or adjust a focused test, observe the
 failure, implement the smallest complete change, and refactor only while the
 suite stays green. Tests must not call a real model or require provider login.
 

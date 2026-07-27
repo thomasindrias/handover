@@ -49,7 +49,7 @@ pub fn adapter(provider: Provider) -> Box<dyn ProviderAdapter> {
 
 fn base_environment(hook_bin: &Path) -> BTreeMap<OsString, OsString> {
     BTreeMap::from([(
-        OsString::from("SESH_HOOK_BIN"),
+        OsString::from("HANDOVER_HOOK_BIN"),
         hook_bin.as_os_str().to_owned(),
     )])
 }
@@ -65,7 +65,7 @@ fn materialize_immutable(path: &Path, expected: &[u8]) -> Result<()> {
                 Ok(())
             } else {
                 Err(Error::InvalidState(format!(
-                    "immutable provider asset {} does not match this Sesh version",
+                    "immutable provider asset {} does not match this Handover version",
                     path.display()
                 )))
             }
@@ -80,7 +80,7 @@ fn verify_materialized(path: &Path, expected: &[u8]) -> Result<()> {
         Ok(())
     } else {
         Err(Error::InvalidState(format!(
-            "integration asset {} does not match this Sesh version",
+            "integration asset {} does not match this Handover version",
             path.display()
         )))
     }

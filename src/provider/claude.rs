@@ -76,7 +76,7 @@ mod tests {
                 cwd: Path::new("/work/oauth/apps/web"),
                 inbox: Path::new("/state/run/inbox"),
                 integration_root: Path::new("/state/integrations"),
-                hook_bin: Path::new("/usr/local/bin/sesh"),
+                hook_bin: Path::new("/usr/local/bin/handover"),
                 provider_args: &args,
                 bootstrap: None,
                 run_dir: Path::new("/state/run"),
@@ -100,8 +100,8 @@ mod tests {
         assert!(spec.args.ends_with(&args));
         assert_eq!(spec.cwd, Path::new("/work/oauth/apps/web"));
         assert_eq!(
-            spec.env.get(&OsString::from("SESH_HOOK_BIN")),
-            Some(&OsString::from("/usr/local/bin/sesh"))
+            spec.env.get(&OsString::from("HANDOVER_HOOK_BIN")),
+            Some(&OsString::from("/usr/local/bin/handover"))
         );
         assert_no_session_content(&spec.args);
     }
@@ -115,7 +115,7 @@ mod tests {
                 cwd: Path::new("/work"),
                 inbox: Path::new("/inbox"),
                 integration_root: Path::new("/integrations"),
-                hook_bin: Path::new("/bin/sesh"),
+                hook_bin: Path::new("/bin/handover"),
                 provider_args: &args,
                 bootstrap: Some("continue"),
                 run_dir: Path::new("/run"),
@@ -140,14 +140,14 @@ mod tests {
             );
         }
         let hooks_text = std::fs::read_to_string(&hooks).unwrap();
-        assert!(hooks_text.contains("\\\"$SESH_HOOK_BIN\\\" __hook claude"));
+        assert!(hooks_text.contains("\\\"$HANDOVER_HOOK_BIN\\\" __hook claude"));
         assert!(!hooks_text.contains("/work/"));
         let hooks_value: serde_json::Value = serde_json::from_str(&hooks_text).unwrap();
         let hooks_object = hooks_value["hooks"].as_object().unwrap();
         assert_eq!(hooks_object.len(), 6);
         for definitions in hooks_object.values() {
             let command = definitions[0]["hooks"][0]["command"].as_str().unwrap();
-            assert_eq!(command, "\"$SESH_HOOK_BIN\" __hook claude");
+            assert_eq!(command, "\"$HANDOVER_HOOK_BIN\" __hook claude");
             assert_eq!(command.matches('$').count(), 1);
         }
 

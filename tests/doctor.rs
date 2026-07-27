@@ -4,14 +4,16 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 
 use assert_cmd::cargo::cargo_bin_cmd;
+use handover::fork::{ForkOperationStore, capture_fork_artifacts};
+use handover::git::Git;
+use handover::git::fork::materialize;
+use handover::model::{
+    EventKind, ForkOperation, ForkPhase, OperationId, Provider, RunId, SessionId,
+};
+use handover::provider::adapter;
+use handover::runtime::Runtime;
+use handover::store::{SessionStore, StateLayout};
 use predicates::prelude::*;
-use sesh::fork::{ForkOperationStore, capture_fork_artifacts};
-use sesh::git::Git;
-use sesh::git::fork::materialize;
-use sesh::model::{EventKind, ForkOperation, ForkPhase, OperationId, Provider, RunId, SessionId};
-use sesh::provider::adapter;
-use sesh::runtime::Runtime;
-use sesh::store::{SessionStore, StateLayout};
 use tempfile::TempDir;
 
 use support::{git, init_repo, path_with, write_executable};
@@ -27,17 +29,17 @@ fn setup_is_inspectable_noninteractive_and_refuses_asset_drift() {
     let state = temp.path().join("state");
     let path = path_with(&bin);
 
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", &path)
         .args(["setup", "claude"])
         .assert()
         .code(2)
         .stdout(predicates::str::contains("claude --plugin-dir"));
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", &path)
         .args(["setup", "codex"])
         .assert()
@@ -45,10 +47,10 @@ fn setup_is_inspectable_noninteractive_and_refuses_asset_drift() {
         .stdout(predicates::str::contains("CODEX_HOME="))
         .stdout(predicates::str::contains("dangerously-bypass-hook-trust").not());
 
-    cargo_bin_cmd!("sesh")
-        .env_remove("SESH_HOME")
-        .env_remove("SESH_SESSION_ID")
-        .env_remove("SESH_RUN_ID")
+    cargo_bin_cmd!("handover")
+        .env_remove("HANDOVER_HOME")
+        .env_remove("HANDOVER_SESSION_ID")
+        .env_remove("HANDOVER_RUN_ID")
         .args(["__hook", "claude"])
         .write_stdin(r#"{"hook_event_name":"SessionStart"}"#)
         .assert()
@@ -57,9 +59,9 @@ fn setup_is_inspectable_noninteractive_and_refuses_asset_drift() {
 
     let plugin = state.join("integrations/claude/1/.claude-plugin/plugin.json");
     std::fs::write(&plugin, b"drift").unwrap();
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", &path)
         .args(["setup", "claude"])
         .assert()
@@ -102,9 +104,9 @@ fn doctor_reports_layered_diagnostics_as_stable_json_without_mutation() {
         .modified()
         .unwrap();
 
-    let output = cargo_bin_cmd!("sesh")
+    let output = cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", &bin)
         .args(["doctor", "--json"])
         .output()
@@ -139,9 +141,9 @@ fn doctor_reports_layered_diagnostics_as_stable_json_without_mutation() {
 
     let empty_path = temp.path().join("empty-path");
     std::fs::create_dir(&empty_path).unwrap();
-    let missing = cargo_bin_cmd!("sesh")
+    let missing = cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", &empty_path)
         .args(["doctor", "--json"])
         .output()
@@ -169,17 +171,17 @@ set -euo pipefail
 if [[ ${1:-} == "--help" ]]; then printf '%s\n' '--plugin-dir --add-dir'; exit 0; fi
 if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake 1'; exit 0; fi
 cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
-printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}' | "$SESH_HOOK_BIN" __hook claude >/dev/null
-printf '%s' '{"objective":"Repair","summary":"Checkpoint","decisions":[],"assumptions":[],"constraints":[],"completed":[],"in_progress":[],"blockers":[],"next_steps":["Continue"],"related_event_sequences":[]}' | "$SESH_HOOK_BIN" checkpoint --format json --from-provider
-printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"Stop"}' | "$SESH_HOOK_BIN" __hook claude >/dev/null
+printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}' | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null
+printf '%s' '{"objective":"Repair","summary":"Checkpoint","decisions":[],"assumptions":[],"constraints":[],"completed":[],"in_progress":[],"blockers":[],"next_steps":["Continue"],"related_event_sequences":[]}' | "$HANDOVER_HOOK_BIN" checkpoint --format json --from-provider
+printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"Stop"}' | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null
 exit 0
 "#,
     );
     let state = temp.path().join("state");
     let path = path_with(&bin);
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", &path)
         .args(["run", "claude"])
         .assert()
@@ -217,9 +219,9 @@ exit 0
     let before_plain = std::fs::read(&journal).unwrap();
     let before_modified = std::fs::metadata(&journal).unwrap().modified().unwrap();
 
-    let plain = cargo_bin_cmd!("sesh")
+    let plain = cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", &path)
         .args(["doctor", "--json"])
         .output()
@@ -227,7 +229,7 @@ exit 0
     let diagnostics: Vec<serde_json::Value> = serde_json::from_slice(&plain.stdout).unwrap();
     assert!(diagnostics.iter().any(|item| {
         item["code"] == "journal.partial_tail"
-            && item["repair_command"] == "sesh doctor --repair"
+            && item["repair_command"] == "handover doctor --repair"
             && item["message"].as_str().unwrap().contains("16")
     }));
     assert_eq!(std::fs::read(&journal).unwrap(), before_plain);
@@ -236,9 +238,9 @@ exit 0
         before_modified
     );
 
-    let repaired = cargo_bin_cmd!("sesh")
+    let repaired = cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", &path)
         .args(["doctor", "--json", "--repair"])
         .output()
@@ -276,9 +278,9 @@ exit 0
         b'a'
     };
     std::fs::write(&journal, corrupt).unwrap();
-    let output = cargo_bin_cmd!("sesh")
+    let output = cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", &path)
         .args(["doctor", "--json"])
         .output()
@@ -323,15 +325,15 @@ fn doctor_reports_precommit_forks_without_mutating_or_deleting_them() {
     let before_mtime = std::fs::metadata(&record).unwrap().modified().unwrap();
     let branch_before = git_output(
         &repo,
-        &["rev-parse", "--verify", "refs/heads/sesh/doctor-test"],
+        &["rev-parse", "--verify", "refs/heads/handover/doctor-test"],
     );
     let bin = temp.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     install_capable_providers(&bin);
 
-    let plain = cargo_bin_cmd!("sesh")
+    let plain = cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", path_with(&bin))
         .args(["doctor", "--json"])
         .output()
@@ -350,7 +352,7 @@ fn doctor_reports_precommit_forks_without_mutating_or_deleting_them() {
         diagnostic["message"]
             .as_str()
             .unwrap()
-            .contains("sesh/doctor-test")
+            .contains("handover/doctor-test")
     );
     assert_eq!(std::fs::read(&record).unwrap(), before_bytes);
     assert_eq!(
@@ -358,9 +360,9 @@ fn doctor_reports_precommit_forks_without_mutating_or_deleting_them() {
         before_mtime
     );
 
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", path_with(&bin))
         .args(["doctor", "--json", "--repair"])
         .assert()
@@ -370,15 +372,15 @@ fn doctor_reports_precommit_forks_without_mutating_or_deleting_them() {
     assert_eq!(
         git_output(
             &repo,
-            &["rev-parse", "--verify", "refs/heads/sesh/doctor-test"]
+            &["rev-parse", "--verify", "refs/heads/handover/doctor-test"]
         ),
         branch_before
     );
 
     std::fs::write(target.join("changed-after-crash.txt"), "preserve me\n").unwrap();
-    let changed = cargo_bin_cmd!("sesh")
+    let changed = cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", path_with(&bin))
         .args(["doctor", "--json", "--repair"])
         .output()
@@ -443,7 +445,7 @@ fn doctor_repairs_only_the_missing_binding_after_lineage_commit() {
                 child_session_id: child_id,
                 parent_checkpoint_sequence: transition.sequence,
                 target_worktree: target.clone(),
-                target_branch: "sesh/doctor-test".into(),
+                target_branch: "handover/doctor-test".into(),
             },
         )
         .unwrap();
@@ -456,9 +458,9 @@ fn doctor_repairs_only_the_missing_binding_after_lineage_commit() {
     std::fs::create_dir(&bin).unwrap();
     install_capable_providers(&bin);
 
-    let plain = cargo_bin_cmd!("sesh")
+    let plain = cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", path_with(&bin))
         .args(["doctor", "--json"])
         .output()
@@ -472,9 +474,9 @@ fn doctor_repairs_only_the_missing_binding_after_lineage_commit() {
     assert_eq!(store.operation().unwrap().phase, ForkPhase::ChildStaged);
     assert!(target.exists());
 
-    let repaired = cargo_bin_cmd!("sesh")
+    let repaired = cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", path_with(&bin))
         .args(["doctor", "--json", "--repair"])
         .output()
@@ -506,7 +508,7 @@ fn prepared_operation(repo: &std::path::Path, target: std::path::PathBuf) -> For
         source_worktree: source.identity,
         source_checkpoint_sequence: None,
         source_fingerprint: None,
-        target_branch: "sesh/doctor-test".into(),
+        target_branch: "handover/doctor-test".into(),
         target_worktree: target,
         target_head: source.head,
         child_session_id: None,
@@ -533,7 +535,7 @@ fn git_output(cwd: &std::path::Path, args: &[&str]) -> String {
 struct FixedRuntime;
 
 impl Runtime for FixedRuntime {
-    fn now(&self) -> sesh::error::Result<String> {
+    fn now(&self) -> handover::error::Result<String> {
         Ok("2026-07-19T10:00:00Z".into())
     }
 
