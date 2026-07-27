@@ -33,10 +33,11 @@ jobs:
         with:
           persist-credentials: false
       - name: Verify the tag matches Cargo.toml
+        # Read the manifest directly: this job runs only on a tag, so it never
+        # gets a pull request to prove a Rust toolchain is on the runner.
         run: |
           set -eu
-          manifest=$(cargo metadata --format-version 1 --no-deps \
-            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          manifest=$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]["version"])')
           if [ "$manifest" != "${GITHUB_REF_NAME#v}" ]; then
             echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest" >&2
             exit 1
@@ -93,8 +94,10 @@ jobs:
           persist-credentials: false
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Install the target
+        # rust-toolchain.toml pins the toolchain, so the target has to be added
+        # to that one rather than to whatever the action made default.
+        run: rustup target add ${{ matrix.target }}
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
         run: |
