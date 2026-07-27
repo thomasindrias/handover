@@ -53,6 +53,12 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
   symlink is now judged by its target, which must be a regular file owned by
   the current user with mode `0600`, and is never followed into a directory.
   The message names the target rather than the link.
+- `sesh doctor` no longer applies Sesh's canonical `0600`/`0700` permissions to
+  the contents of a provider's private home. A real Codex launch writes its own
+  databases and scratch directory into the per-run `CODEX_HOME`, which left
+  `doctor` reporting seven errors about files Sesh does not create and cannot
+  control. Sesh now guarantees the `0700` container and leaves its contents to
+  the provider.
 - `sesh doctor` now reports a provider that was never set up as
   `integration.missing` with the exact `sesh setup <provider>` command,
   instead of a raw "No such file or directory" I/O error.

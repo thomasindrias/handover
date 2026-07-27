@@ -82,11 +82,31 @@ pub fn check_format(layout: &StateLayout) -> Vec<Diagnostic> {
 
 pub fn check_permissions(layout: &StateLayout) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    check_permission_path(layout.root(), &mut diagnostics);
+    let root = layout.root();
+    check_permission_path(root, root, &mut diagnostics);
     diagnostics
 }
 
-fn check_permission_path(path: &Path, diagnostics: &mut Vec<Diagnostic>) {
+/// A provider's private home holds files the provider writes with its own
+/// permissions, so Sesh guarantees the `0700` container and stops there.
+fn is_provider_owned_home(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let Some(parts) = relative
+        .components()
+        .map(|part| part.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    matches!(
+        parts.as_slice(),
+        ["sessions", _, "runs", _, "codex_home"] | ["integrations", "codex", _, "review"]
+    )
+}
+
+fn check_permission_path(root: &Path, path: &Path, diagnostics: &mut Vec<Diagnostic>) {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) => {
@@ -141,11 +161,14 @@ fn check_permission_path(path: &Path, diagnostics: &mut Vec<Diagnostic>) {
         return;
     }
     if metadata.is_dir() {
+        if is_provider_owned_home(root, path) {
+            return;
+        }
         match std::fs::read_dir(path) {
             Ok(entries) => {
                 for entry in entries {
                     match entry {
-                        Ok(entry) => check_permission_path(&entry.path(), diagnostics),
+                        Ok(entry) => check_permission_path(root, &entry.path(), diagnostics),
                         Err(error) => diagnostics.push(Diagnostic::error(
                             "permissions.unavailable",
                             format!("cannot inspect {}: {error}", path.display()),
@@ -1039,6 +1062,34 @@ mod tests {
             check_permissions(&layout),
             Vec::new(),
             "a Codex run must not leave `sesh doctor` reporting its own state as insecure"
+        );
+    }
+
+    #[test]
+    fn permissions_leave_the_contents_of_a_provider_owned_home_to_the_provider() {
+        let (_temp, layout, store) = fixture();
+        let codex_home = store.session_dir().join("runs/run-1/codex_home");
+        crate::store::ensure_private_dir(&codex_home).unwrap();
+        // Real Codex writes these itself, with its own permissions.
+        let database = codex_home.join("state_5.sqlite");
+        std::fs::write(&database, b"x").unwrap();
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let scratch = codex_home.join("tmp");
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            check_permissions(&layout),
+            Vec::new(),
+            "Sesh guarantees the 0700 container, not files the provider writes inside it"
+        );
+
+        std::fs::set_permissions(&codex_home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            check_permissions(&layout)
+                .iter()
+                .any(|item| item.code == "permissions.insecure"),
+            "the container itself must still be private"
         );
     }
 
