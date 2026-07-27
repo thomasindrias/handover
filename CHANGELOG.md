@@ -46,19 +46,15 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 ### Fixed
 
 - `sesh doctor` no longer reports a correctly installed Codex integration as
-  insecure. The permission walk rejected every symlink under the state root,
-  but the Codex adapter deliberately links `hooks.json`, `config.toml`, and
-  `auth.json` into each run's private `CODEX_HOME`, so `sesh setup codex`
-  left `doctor` failing and every Codex run added three more errors. A
-  symlink is now judged by its target, which must be a regular file owned by
-  the current user with mode `0600`, and is never followed into a directory.
-  The message names the target rather than the link.
-- `sesh doctor` no longer applies Sesh's canonical `0600`/`0700` permissions to
-  the contents of a provider's private home. A real Codex launch writes its own
-  databases and scratch directory into the per-run `CODEX_HOME`, which left
-  `doctor` reporting seven errors about files Sesh does not create and cannot
-  control. Sesh now guarantees the `0700` container and leaves its contents to
-  the provider.
+  insecure. The permission walk applied Sesh's canonical `0600`/`0700` rules to
+  a provider's private home, which Sesh creates but does not own: the adapter
+  links `hooks.json`, `config.toml`, and `auth.json` into each run's
+  `CODEX_HOME`, and a real Codex launch then writes its own databases and
+  scratch directory alongside them. `sesh setup codex` therefore left `doctor`
+  failing, and every Codex run added more errors about files Sesh neither
+  creates nor controls. Sesh now guarantees the `0700` container that keeps
+  other users out and leaves its contents to the provider. An unexpected
+  symlink in canonical state is still refused, now with a message that says so.
 - `sesh doctor` now reports a provider that was never set up as
   `integration.missing` with the exact `sesh setup <provider>` command,
   instead of a raw "No such file or directory" I/O error.

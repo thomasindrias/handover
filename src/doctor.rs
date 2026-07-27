@@ -119,33 +119,15 @@ fn check_permission_path(root: &Path, path: &Path, diagnostics: &mut Vec<Diagnos
     };
     // SAFETY: geteuid has no preconditions and does not dereference pointers.
     let effective_uid = unsafe { libc::geteuid() };
-    // Provider adapters deliberately link private files into the state root, so a
-    // symlink is judged by its target and never followed into a directory.
+    // Sesh writes only regular files and directories here, so a link is anomalous.
     if metadata.file_type().is_symlink() {
-        let target = match std::fs::metadata(path) {
-            Ok(target) => target,
-            Err(error) => {
-                diagnostics.push(Diagnostic::error(
-                    "permissions.unavailable",
-                    format!("cannot resolve {}: {error}", path.display()),
-                ));
-                return;
-            }
-        };
-        if !target.file_type().is_file()
-            || target.uid() != effective_uid
-            || target.permissions().mode() & 0o777 != 0o600
-        {
-            let resolved = std::fs::read_link(path).unwrap_or_else(|_| path.to_path_buf());
-            diagnostics.push(Diagnostic::error(
-                "permissions.insecure",
-                format!(
-                    "{} links to {}, which must be a regular file owned by the current user with mode 0600",
-                    path.display(),
-                    resolved.display()
-                ),
-            ));
-        }
+        diagnostics.push(Diagnostic::error(
+            "permissions.insecure",
+            format!(
+                "{} is an unexpected symlink in canonical state",
+                path.display()
+            ),
+        ));
         return;
     }
     let mode = metadata.permissions().mode() & 0o777;
@@ -1002,42 +984,6 @@ mod tests {
     }
 
     #[test]
-    fn permissions_accept_private_symlink_targets_and_reject_exposed_ones() {
-        let (temp, layout, _store) = fixture();
-        let outside = temp.path().join("outside");
-        std::fs::create_dir(&outside).unwrap();
-
-        let private_target = outside.join("auth.json");
-        std::fs::write(&private_target, b"{}").unwrap();
-        std::fs::set_permissions(&private_target, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let link = layout.root().join("auth.json");
-        std::os::unix::fs::symlink(&private_target, &link).unwrap();
-        assert!(
-            check_permissions(&layout).is_empty(),
-            "a symlink to a user-owned 0600 file is how the Codex adapter wires CODEX_HOME"
-        );
-
-        std::fs::set_permissions(&private_target, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(
-            check_permissions(&layout)
-                .iter()
-                .any(|item| item.code == "permissions.insecure"),
-            "a symlink to a world-readable file must still fail closed"
-        );
-        std::fs::remove_file(&link).unwrap();
-
-        let directory_target = outside.join("nested");
-        std::fs::create_dir(&directory_target).unwrap();
-        std::os::unix::fs::symlink(&directory_target, layout.root().join("nested")).unwrap();
-        assert!(
-            check_permissions(&layout)
-                .iter()
-                .any(|item| item.code == "permissions.insecure"),
-            "only regular files may be linked, so traversal cannot escape the state root"
-        );
-    }
-
-    #[test]
     fn permissions_accept_a_materialized_codex_home_under_the_state_root() {
         let (temp, layout, store) = fixture();
         crate::provider::adapter(Provider::Codex)
@@ -1094,17 +1040,18 @@ mod tests {
     }
 
     #[test]
-    fn permissions_reject_a_dangling_symlink() {
+    fn permissions_reject_a_symlink_in_canonical_state() {
         let (temp, layout, _store) = fixture();
-        std::os::unix::fs::symlink(
-            temp.path().join("missing"),
-            layout.root().join("dangling.json"),
-        )
-        .unwrap();
+        let target = temp.path().join("elsewhere.json");
+        std::fs::write(&target, b"{}").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, layout.root().join("linked.json")).unwrap();
+
         assert!(
             check_permissions(&layout)
                 .iter()
-                .any(|item| item.code == "permissions.unavailable")
+                .any(|item| item.code == "permissions.insecure"),
+            "Sesh writes only regular files and directories into canonical state"
         );
     }
 

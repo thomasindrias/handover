@@ -74,16 +74,15 @@ $SESH_HOME/
 
 Canonical directories use mode `0700` and regular files use `0600`, independent
 of a permissive umask. Sesh rejects unexpected ownership, symlink traversal, and
-unsafe canonical-state permissions. Where an adapter deliberately links a private
-file into the state root, the link is judged by its target, which must be a
-regular file with the same ownership and mode; a link to a directory is still
-refused, so a walk cannot escape the state root.
+unsafe canonical-state permissions. Sesh writes only regular files and
+directories into canonical state, so a symlink there is refused rather than
+followed.
 
 A provider's private home, such as the per-run Codex `CODEX_HOME`, is not
-canonical Sesh state. The provider writes its own files there with its own
-permissions, so Sesh guarantees the `0700` directory that contains them — which
-is what keeps other users out — and does not police its contents. Session state
-never belongs in the application repository.
+canonical Sesh state. Sesh materializes it and then the provider writes its own
+files there with its own permissions, so Sesh guarantees the `0700` directory
+that contains them — which is what keeps other users out — and does not police
+its contents. Session state never belongs in the application repository.
 
 V1 requires canonical repository, worktree, cwd, dirty, and symlink-target paths
 to be valid UTF-8. Unsupported paths fail before session or fork activation; Sesh
