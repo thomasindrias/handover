@@ -7,7 +7,7 @@ use crate::model::Provider;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "sesh",
+    name = "handover",
     version,
     about = "Switch coding providers without losing your place"
 )]
@@ -30,7 +30,7 @@ pub enum Command {
         #[arg(last = true, allow_hyphen_values = true)]
         provider_args: Vec<OsString>,
     },
-    Handoff {
+    Preview {
         provider: Provider,
         #[arg(long)]
         json: bool,

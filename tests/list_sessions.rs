@@ -12,9 +12,9 @@ fn an_empty_state_lists_no_sessions_from_any_directory() {
     let cwd = temp.path().join("anywhere");
     std::fs::create_dir_all(&cwd).unwrap();
 
-    let output = cargo_bin_cmd!("sesh")
+    let output = cargo_bin_cmd!("handover")
         .current_dir(&cwd)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .args(["list", "--json"])
         .output()
         .unwrap();
@@ -23,9 +23,9 @@ fn an_empty_state_lists_no_sessions_from_any_directory() {
     assert_eq!(value["schema_version"], 1);
     assert_eq!(value["sessions"].as_array().unwrap().len(), 0);
 
-    let pretty = cargo_bin_cmd!("sesh")
+    let pretty = cargo_bin_cmd!("handover")
         .current_dir(&cwd)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .args(["list"])
         .output()
         .unwrap();
@@ -37,10 +37,10 @@ fn an_empty_state_lists_no_sessions_from_any_directory() {
 #[test]
 fn an_attached_provider_cannot_list_sessions() {
     let temp = TempDir::new().unwrap();
-    let output = cargo_bin_cmd!("sesh")
+    let output = cargo_bin_cmd!("handover")
         .current_dir(temp.path())
-        .env("SESH_HOME", temp.path().join("state"))
-        .env("SESH_RUN_ID", "22222222-2222-4222-8222-222222222222")
+        .env("HANDOVER_HOME", temp.path().join("state"))
+        .env("HANDOVER_RUN_ID", "22222222-2222-4222-8222-222222222222")
         .args(["list", "--json"])
         .output()
         .unwrap();
@@ -51,7 +51,7 @@ fn an_attached_provider_cannot_list_sessions() {
 fn fake_claude(bin: &std::path::Path, checkpoint_json: Option<&str>) {
     let checkpoint_line = checkpoint_json.map_or(String::new(), |json| {
         format!(
-            "printf '%s' '{json}' | \"$SESH_HOOK_BIN\" checkpoint --format json --from-provider\n"
+            "printf '%s' '{json}' | \"$HANDOVER_HOOK_BIN\" checkpoint --format json --from-provider\n"
         )
     });
     write_executable(
@@ -61,7 +61,7 @@ fn fake_claude(bin: &std::path::Path, checkpoint_json: Option<&str>) {
 set -euo pipefail
 if [[ ${{1:-}} == "--version" ]]; then printf '%s\n' 'fake-claude 1.0'; exit 0; fi
 cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
-hook() {{ printf '%s' "$1" | "$SESH_HOOK_BIN" __hook claude >/dev/null; }}
+hook() {{ printf '%s' "$1" | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null; }}
 hook '{{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}}'
 {checkpoint_line}hook '{{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"Stop"}}'
 exit 0
@@ -73,9 +73,9 @@ exit 0
 const ALPHA_CHECKPOINT: &str = r#"{"objective":"List sessions","summary":"Alpha work is captured","decisions":[],"assumptions":[],"constraints":[],"completed":[],"in_progress":[],"blockers":[],"next_steps":["Continue"],"related_event_sequences":[]}"#;
 
 fn run_fake_session(repo: &std::path::Path, state: &std::path::Path, bin: &std::path::Path) {
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(repo)
-        .env("SESH_HOME", state)
+        .env("HANDOVER_HOME", state)
         .env("PATH", path_with(bin))
         .args(["run", "claude"])
         .assert()
@@ -101,9 +101,9 @@ fn every_session_is_listed_with_facts_newest_first() {
 
     let outside = temp.path().join("outside");
     std::fs::create_dir(&outside).unwrap();
-    let output = cargo_bin_cmd!("sesh")
+    let output = cargo_bin_cmd!("handover")
         .current_dir(&outside)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .args(["list", "--json"])
         .output()
         .unwrap();
@@ -183,9 +183,9 @@ fn corrupt_sessions_degrade_to_diagnostic_rows_without_failing_the_listing() {
 
     std::fs::create_dir(state.join("sessions/not-a-session")).unwrap();
 
-    let output = cargo_bin_cmd!("sesh")
+    let output = cargo_bin_cmd!("handover")
         .current_dir(temp.path())
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .args(["list", "--json"])
         .output()
         .unwrap();
@@ -205,7 +205,12 @@ fn corrupt_sessions_degrade_to_diagnostic_rows_without_failing_the_listing() {
     for row in &degraded {
         let diagnostics = row["diagnostics"].as_array().unwrap();
         assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].as_str().unwrap().contains("run sesh doctor"));
+        assert!(
+            diagnostics[0]
+                .as_str()
+                .unwrap()
+                .contains("run handover doctor")
+        );
         assert!(row["last_activity"].is_null());
         assert_eq!(row["bound"], false);
     }

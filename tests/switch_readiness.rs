@@ -1,8 +1,8 @@
 mod support;
 
 use assert_cmd::cargo::cargo_bin_cmd;
-use sesh::model::{Provider, RunId, SessionId};
-use sesh::store::lease::{LeaseStore, ProcessIdentity, RunLease};
+use handover::model::{Provider, RunId, SessionId};
+use handover::store::lease::{LeaseStore, ProcessIdentity, RunLease};
 use tempfile::TempDir;
 
 use support::{init_repo, path_with, write_executable};
@@ -11,7 +11,7 @@ use support::{init_repo, path_with, write_executable};
 /// provider checkpoint, then Stop.
 fn fake_claude(bin: &std::path::Path, cycles: u32, checkpoint_before_stop: bool) {
     let checkpoint_line = if checkpoint_before_stop {
-        r#"printf '%s' '{"objective":"Ship it","summary":"On track.","decisions":[],"assumptions":[],"constraints":[],"completed":[],"in_progress":[],"blockers":[],"next_steps":["Finish"],"related_event_sequences":[]}' | "$SESH_HOOK_BIN" checkpoint --format json --from-provider"#.to_owned()
+        r#"printf '%s' '{"objective":"Ship it","summary":"On track.","decisions":[],"assumptions":[],"constraints":[],"completed":[],"in_progress":[],"blockers":[],"next_steps":["Finish"],"related_event_sequences":[]}' | "$HANDOVER_HOOK_BIN" checkpoint --format json --from-provider"#.to_owned()
     } else {
         String::new()
     };
@@ -20,7 +20,7 @@ fn fake_claude(bin: &std::path::Path, cycles: u32, checkpoint_before_stop: bool)
 set -euo pipefail
 if [[ ${{1:-}} == "--version" ]]; then printf '%s\n' 'fake-claude 1.0'; exit 0; fi
 cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
-hook() {{ printf '%s' "$1" | "$SESH_HOOK_BIN" __hook claude >/dev/null; }}
+hook() {{ printf '%s' "$1" | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null; }}
 hook '{{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}}'
 for i in $(seq 1 {cycles}); do
   hook '{{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{{"command":"cargo test case-'"$i"'"}},"tool_use_id":"tool-'"$i"'"}}'
@@ -49,9 +49,9 @@ fn run_fake_claude(
     let state = temp.path().join("state");
     let path = path_with(&bin);
 
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&cwd)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", &path)
         .args(["run", "claude"])
         .assert()
@@ -61,9 +61,9 @@ fn run_fake_claude(
 }
 
 fn status_json(repo: &std::path::Path, state: &std::path::Path) -> serde_json::Value {
-    let output = cargo_bin_cmd!("sesh")
+    let output = cargo_bin_cmd!("handover")
         .current_dir(repo)
-        .env("SESH_HOME", state)
+        .env("HANDOVER_HOME", state)
         .args(["status", "--json"])
         .output()
         .unwrap();
@@ -80,8 +80,8 @@ fn a_fresh_checkpointed_session_reports_ready() {
     assert_eq!(readiness["lease"], "free");
     assert!(readiness["lease_reason"].is_null());
     assert_eq!(readiness["checkpoint_fresh"], true);
-    assert_eq!(readiness["handoff_renderable"], true);
-    assert!(readiness["handoff_error"].is_null());
+    assert_eq!(readiness["handover_renderable"], true);
+    assert!(readiness["handover_error"].is_null());
 }
 
 #[test]
@@ -89,7 +89,10 @@ fn status_includes_the_exact_switch_command_to_run() {
     let (_temp, repo, state) = run_fake_claude(1, true);
     let status = status_json(&repo, &state);
     let readiness = &status["switch_readiness"];
-    assert_eq!(readiness["suggested_switch_command"], "sesh switch codex");
+    assert_eq!(
+        readiness["suggested_switch_command"],
+        "handover switch codex"
+    );
 }
 
 #[test]

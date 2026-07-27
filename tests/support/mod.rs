@@ -33,8 +33,8 @@ pub fn git(cwd: &Path, args: &[&str]) {
 pub fn init_repo(path: &Path) {
     std::fs::create_dir_all(path).unwrap();
     git(path, &["init", "-b", "main"]);
-    git(path, &["config", "user.name", "Sesh Test"]);
-    git(path, &["config", "user.email", "sesh@example.invalid"]);
+    git(path, &["config", "user.name", "Handover Test"]);
+    git(path, &["config", "user.email", "handover@example.invalid"]);
     std::fs::write(path.join("README.md"), "initial\n").unwrap();
     git(path, &["add", "README.md"]);
     git(path, &["commit", "-m", "initial"]);

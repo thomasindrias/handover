@@ -10,8 +10,8 @@ use crate::model::{
     SessionId,
 };
 
-const HEADING: &str = "# Sesh handoff\n\n";
-pub const BOOTSTRAP: &str = "Continue the active Sesh session from its injected handoff. Verify the current worktree state, then proceed with the recorded next action.";
+const HEADING: &str = "# Handover\n\n";
+pub const BOOTSTRAP: &str = "Continue the active Handover session from its injected handover. Verify the current worktree state, then proceed with the recorded next action.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandFact {
@@ -37,7 +37,7 @@ pub struct ParentLineage {
 }
 
 #[derive(Clone, Debug)]
-pub struct HandoffInput {
+pub struct HandoverInput {
     pub session_id: SessionId,
     pub parent_lineage: Option<ParentLineage>,
     pub from_provider: Option<Provider>,
@@ -54,7 +54,7 @@ pub struct HandoffInput {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RenderedHandoff {
+pub struct RenderedHandover {
     pub markdown: String,
     pub recent_event_sequences: Vec<u64>,
     pub omitted: bool,
@@ -77,11 +77,11 @@ struct OmittedPaths {
     dirty_submodules: usize,
 }
 
-pub fn render(input: HandoffInput, max_bytes: usize) -> Result<String> {
+pub fn render(input: HandoverInput, max_bytes: usize) -> Result<String> {
     render_with_selection(input, max_bytes).map(|rendered| rendered.markdown)
 }
 
-pub fn render_with_selection(input: HandoffInput, max_bytes: usize) -> Result<RenderedHandoff> {
+pub fn render_with_selection(input: HandoverInput, max_bytes: usize) -> Result<RenderedHandover> {
     input.validate()?;
     let mut events = input.recent_events.clone();
     let mut commands = input.recent_commands.clone();
@@ -108,7 +108,7 @@ pub fn render_with_selection(input: HandoffInput, max_bytes: usize) -> Result<Re
             &omitted_gaps,
         )?;
         if output.len() <= max_bytes && recent_event_bytes(&events) <= max_bytes {
-            return Ok(RenderedHandoff {
+            return Ok(RenderedHandover {
                 markdown: output,
                 recent_event_sequences: events.iter().map(|item| item.0).collect(),
                 omitted: !omitted_events.is_empty()
@@ -168,7 +168,7 @@ pub fn render_with_selection(input: HandoffInput, max_bytes: usize) -> Result<Re
             continue;
         }
         return Err(Error::InvalidState(
-            "required handoff facts exceed configured byte limit".into(),
+            "required handover facts exceed configured byte limit".into(),
         ));
     }
 }
@@ -242,7 +242,7 @@ fn is_environment_assignment(token: &str) -> bool {
         && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
-impl HandoffInput {
+impl HandoverInput {
     fn validate(&self) -> Result<()> {
         if self.transition_sequence == 0
             || self.transition_checkpoint.schema_version != 1
@@ -252,7 +252,7 @@ impl HandoffInput {
             || self.transition_checkpoint.narrative.is_some()
         {
             return Err(Error::InvalidState(
-                "handoff transition checkpoint is inconsistent".into(),
+                "handover transition checkpoint is inconsistent".into(),
             ));
         }
         match &self.narrative_checkpoint {
@@ -267,7 +267,7 @@ impl HandoffInput {
                     || self.transition_checkpoint.narrative_checkpoint_sequence != Some(*sequence)
                 {
                     return Err(Error::InvalidState(
-                        "handoff narrative checkpoint is inconsistent".into(),
+                        "handover narrative checkpoint is inconsistent".into(),
                     ));
                 }
                 checkpoint
@@ -282,7 +282,7 @@ impl HandoffInput {
                 .is_some() =>
             {
                 return Err(Error::InvalidState(
-                    "handoff is missing its referenced narrative checkpoint".into(),
+                    "handover is missing its referenced narrative checkpoint".into(),
                 ));
             }
             None => {}
@@ -295,7 +295,7 @@ impl HandoffInput {
                     != self.narrative_checkpoint.as_ref().map(|item| item.0))
         {
             return Err(Error::InvalidState(
-                "handoff parent lineage is inconsistent".into(),
+                "handover parent lineage is inconsistent".into(),
             ));
         }
         validate_snapshot_paths(&self.snapshot)?;
@@ -319,7 +319,7 @@ impl HandoffInput {
         {
             if sequence == 0 {
                 return Err(Error::InvalidState(
-                    "handoff fact sequence must be positive".into(),
+                    "handover fact sequence must be positive".into(),
                 ));
             }
         }
@@ -401,7 +401,7 @@ impl HandoffInput {
 
 #[allow(clippy::too_many_arguments)]
 fn render_sections(
-    input: &HandoffInput,
+    input: &HandoverInput,
     git: &GitSummary,
     snapshot: &GitSnapshot,
     events: &[(u64, String)],
@@ -447,11 +447,13 @@ fn render_sections(
         input.parent_lineage.is_some(),
         &mut output,
     );
-    output.push_str("## Inspect the complete session\n\n- `sesh log --json`\n- `sesh inspect`\n");
+    output.push_str(
+        "## Inspect the complete session\n\n- `handover log --json`\n- `handover inspect`\n",
+    );
     Ok(output)
 }
 
-fn render_transition(input: &HandoffInput, output: &mut String) {
+fn render_transition(input: &HandoverInput, output: &mut String) {
     let from = input.from_provider.map_or("none", Provider::executable);
     writeln!(
         output,
@@ -486,7 +488,7 @@ fn render_repository(snapshot: &GitSnapshot, output: &mut String) -> Result<()> 
     Ok(())
 }
 
-fn render_checkpoint_boundaries(input: &HandoffInput, output: &mut String) {
+fn render_checkpoint_boundaries(input: &HandoverInput, output: &mut String) {
     writeln!(
         output,
         "## Transition checkpoint\n\n- Event sequence: {}\n- Includes committed facts through sequence: {}\n",
@@ -809,7 +811,7 @@ fn validate_fact_sequences(label: &str, values: impl Iterator<Item = u64>) -> Re
     for sequence in values {
         if previous.is_some_and(|prior| sequence <= prior) {
             return Err(Error::InvalidState(format!(
-                "handoff {label} must be sorted with unique sequences"
+                "handover {label} must be sorted with unique sequences"
             )));
         }
         previous = Some(sequence);
@@ -819,7 +821,7 @@ fn validate_fact_sequences(label: &str, values: impl Iterator<Item = u64>) -> Re
 
 fn path_text(path: &Path) -> Result<&str> {
     path.to_str()
-        .ok_or_else(|| Error::InvalidState("handoff paths must be valid UTF-8".into()))
+        .ok_or_else(|| Error::InvalidState("handover paths must be valid UTF-8".into()))
 }
 
 fn author_text(author: &CheckpointAuthor) -> &'static str {
@@ -943,14 +945,14 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        HandoffInput, ParentLineage, head_tail_excerpt, is_recognized_test_command, render,
+        HandoverInput, ParentLineage, head_tail_excerpt, is_recognized_test_command, render,
         render_ranges, render_with_selection,
     };
     use crate::model::{DirtyPath, Provider};
 
     #[test]
     fn facts_and_narrative_are_labeled_separately() {
-        let output = render(HandoffInput::fixture(), 65_536).unwrap();
+        let output = render(HandoverInput::fixture(), 65_536).unwrap();
         let checkpoint = output.find("## Narrative checkpoint").unwrap();
         let worktree = output.find("## Observed worktree facts").unwrap();
         let failure = output.find("## Latest failed command").unwrap();
@@ -960,7 +962,7 @@ mod tests {
 
     #[test]
     fn oversized_history_reports_exact_omitted_range() {
-        let mut input = HandoffInput::fixture();
+        let mut input = HandoverInput::fixture();
         input.recent_events = (20..=120)
             .map(|sequence| (sequence, "x".repeat(256)))
             .collect();
@@ -974,7 +976,7 @@ mod tests {
 
     #[test]
     fn huge_dirty_path_set_keeps_counts_and_fingerprint_within_limit() {
-        let mut input = HandoffInput::fixture();
+        let mut input = HandoverInput::fixture();
         input.snapshot.untracked = (0..10_000)
             .map(|index| DirtyPath {
                 path: PathBuf::from(format!("generated/{index:05}.txt")),
@@ -994,7 +996,7 @@ mod tests {
 
     #[test]
     fn no_narrative_checkpoint_is_explicit() {
-        let mut input = HandoffInput::fixture();
+        let mut input = HandoverInput::fixture();
         input.narrative_checkpoint = None;
         input.transition_checkpoint.narrative_checkpoint_sequence = None;
 
@@ -1007,7 +1009,7 @@ mod tests {
 
     #[test]
     fn path_order_does_not_change_the_fingerprint_or_output() {
-        let mut left = HandoffInput::fixture();
+        let mut left = HandoverInput::fixture();
         left.snapshot.untracked = vec![
             DirtyPath {
                 path: PathBuf::from("z-last"),
@@ -1033,15 +1035,15 @@ mod tests {
 
     #[test]
     fn sequence_inputs_must_be_sorted_and_unique() {
-        let mut input = HandoffInput::fixture();
+        let mut input = HandoverInput::fixture();
         input.recent_events = vec![(2, "later".into()), (1, "earlier".into())];
         assert!(render(input, 65_536).is_err());
 
-        let mut input = HandoffInput::fixture();
+        let mut input = HandoverInput::fixture();
         input.recent_commands.push(input.recent_commands[0].clone());
         assert!(render(input, 65_536).is_err());
 
-        let mut input = HandoffInput::fixture();
+        let mut input = HandoverInput::fixture();
         input.capture_gaps = vec![
             super::CaptureGap {
                 sequence: 5,
@@ -1064,7 +1066,7 @@ mod tests {
 
     #[test]
     fn latest_capture_gap_survives_bounded_selection() {
-        let mut input = HandoffInput::fixture();
+        let mut input = HandoverInput::fixture();
         input.capture_gaps = (1..=100)
             .map(|sequence| super::CaptureGap {
                 sequence,
@@ -1094,7 +1096,7 @@ mod tests {
 
     #[test]
     fn provider_transition_is_provider_neutral_data() {
-        let mut input = HandoffInput::fixture();
+        let mut input = HandoverInput::fixture();
         input.from_provider = Some(Provider::Codex);
         input.to_provider = Provider::Claude;
         let output = render(input, 65_536).unwrap();
@@ -1103,7 +1105,7 @@ mod tests {
 
     #[test]
     fn fork_lineage_keeps_parent_facts_explicitly_scoped() {
-        let mut input = HandoffInput::fixture();
+        let mut input = HandoverInput::fixture();
         input.session_id =
             crate::model::SessionId::parse("22222222-2222-4222-8222-222222222222").unwrap();
         input.parent_lineage = Some(ParentLineage {
@@ -1165,7 +1167,7 @@ mod tests {
 
     #[test]
     fn renderer_reports_the_exact_events_selected_for_the_bounded_copy() {
-        let mut input = HandoffInput::fixture();
+        let mut input = HandoverInput::fixture();
         input.recent_events = (1..=20)
             .map(|sequence| (sequence, "x".repeat(512)))
             .collect();
@@ -1185,10 +1187,10 @@ mod tests {
 
     #[test]
     fn omitted_flag_reflects_whether_the_bounded_selection_dropped_anything() {
-        let fits = render_with_selection(HandoffInput::fixture(), 65_536).unwrap();
+        let fits = render_with_selection(HandoverInput::fixture(), 65_536).unwrap();
         assert!(!fits.omitted);
 
-        let mut input = HandoffInput::fixture();
+        let mut input = HandoverInput::fixture();
         input.recent_events = (20..=120)
             .map(|sequence| (sequence, "x".repeat(256)))
             .collect();

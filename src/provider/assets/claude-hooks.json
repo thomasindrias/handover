@@ -1,10 +1,10 @@
 {
   "hooks": {
-    "SessionStart": [{"matcher":"startup|resume|clear|compact","hooks":[{"type":"command","command":"\"$SESH_HOOK_BIN\" __hook claude","timeout":30}]}],
-    "UserPromptSubmit": [{"hooks":[{"type":"command","command":"\"$SESH_HOOK_BIN\" __hook claude","timeout":30}]}],
-    "PreToolUse": [{"hooks":[{"type":"command","command":"\"$SESH_HOOK_BIN\" __hook claude","timeout":30}]}],
-    "PostToolUse": [{"hooks":[{"type":"command","command":"\"$SESH_HOOK_BIN\" __hook claude","timeout":120}]}],
-    "PostToolUseFailure": [{"hooks":[{"type":"command","command":"\"$SESH_HOOK_BIN\" __hook claude","timeout":120}]}],
-    "Stop": [{"hooks":[{"type":"command","command":"\"$SESH_HOOK_BIN\" __hook claude","timeout":120}]}]
+    "SessionStart": [{"matcher":"startup|resume|clear|compact","hooks":[{"type":"command","command":"\"$HANDOVER_HOOK_BIN\" __hook claude","timeout":30}]}],
+    "UserPromptSubmit": [{"hooks":[{"type":"command","command":"\"$HANDOVER_HOOK_BIN\" __hook claude","timeout":30}]}],
+    "PreToolUse": [{"hooks":[{"type":"command","command":"\"$HANDOVER_HOOK_BIN\" __hook claude","timeout":30}]}],
+    "PostToolUse": [{"hooks":[{"type":"command","command":"\"$HANDOVER_HOOK_BIN\" __hook claude","timeout":120}]}],
+    "PostToolUseFailure": [{"hooks":[{"type":"command","command":"\"$HANDOVER_HOOK_BIN\" __hook claude","timeout":120}]}],
+    "Stop": [{"hooks":[{"type":"command","command":"\"$HANDOVER_HOOK_BIN\" __hook claude","timeout":120}]}]
   }
 }

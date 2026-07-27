@@ -21,8 +21,8 @@ use crate::fork::{
 };
 use crate::git::Git;
 use crate::git::fork::{ForkRequest, materialize};
-use crate::handoff::{
-    BOOTSTRAP, CaptureGap, CommandFact, HandoffInput, ParentLineage, is_recognized_test_command,
+use crate::handover::{
+    BOOTSTRAP, CaptureGap, CommandFact, HandoverInput, ParentLineage, is_recognized_test_command,
     render_with_selection,
 };
 use crate::model::{
@@ -44,13 +44,14 @@ use crate::store::{Environment, SessionStore, StateLayout};
 use crate::supervisor::{ExitFacts, Supervisor};
 
 const MAX_HOOK_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_HANDOFF_BYTES: usize = 65_536;
+const MAX_HANDOVER_BYTES: usize = 65_536;
 const STALE_NARRATIVE_EVENT_THRESHOLD: u64 = 20;
 
 pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result<i32> {
-    if environment.get("SESH_RUN_ID").is_some() && !provider_command_allowed(&cli.command) {
+    if environment.get("HANDOVER_RUN_ID").is_some() && !provider_command_allowed(&cli.command) {
         return Err(Error::InvalidState(
-            "an attached provider may only invoke Sesh hooks or submit provider checkpoints".into(),
+            "an attached provider may only invoke Handover hooks or submit provider checkpoints"
+                .into(),
         ));
     }
     match cli.command {
@@ -75,7 +76,7 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
                 input_is_terminal,
             )
         }
-        Command::Handoff { provider, json } => handoff_command(provider, json, environment),
+        Command::Preview { provider, json } => handover_command(provider, json, environment),
         Command::Fork {
             provider,
             branch,
@@ -126,7 +127,7 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
         Command::Doctor { json, repair } => doctor_command(json, repair, environment),
         Command::McpServer => crate::mcp::mcp_server_command(environment),
         Command::Hook { provider } => {
-            if ["SESH_HOME", "SESH_SESSION_ID", "SESH_RUN_ID"]
+            if ["HANDOVER_HOME", "HANDOVER_SESSION_ID", "HANDOVER_RUN_ID"]
                 .into_iter()
                 .all(|key| environment.get(key).is_none())
             {
@@ -292,7 +293,7 @@ fn fork_command(
         let (recent_commands, latest_test, latest_failure, capture_gaps) =
             command_facts(&parent, &parent_events)?;
         let rendered = render_with_selection(
-            HandoffInput {
+            HandoverInput {
                 session_id: child_id.clone(),
                 parent_lineage: Some(ParentLineage {
                     session_id: parent.id().clone(),
@@ -311,11 +312,11 @@ fn fork_command(
                 latest_failure,
                 capture_gaps,
             },
-            MAX_HANDOFF_BYTES,
+            MAX_HANDOVER_BYTES,
         )?;
         let recent_events_jsonl =
             selected_event_lines(&envelopes, &rendered.recent_event_sequences)?;
-        if recent_events_jsonl.len() > MAX_HANDOFF_BYTES {
+        if recent_events_jsonl.len() > MAX_HANDOVER_BYTES {
             return Err(Error::InvalidState(
                 "selected parent events exceed 64 KiB".into(),
             ));
@@ -497,7 +498,7 @@ fn setup_command(
         .collect::<Vec<_>>()
         .join(" ");
     let mut equivalent = format!(
-        "SESH_HOOK_BIN={} {command}",
+        "HANDOVER_HOOK_BIN={} {command}",
         shell_words::quote(&hook_bin.to_string_lossy())
     );
     for (key, value) in &extra_env {
@@ -512,23 +513,23 @@ fn setup_command(
     }
     match provider {
         Provider::Claude => println!(
-            "Review the Sesh plugin and hook commands, then exit without submitting a prompt."
+            "Review the Handover plugin and hook commands, then exit without submitting a prompt."
         ),
         Provider::Codex => println!(
-            "Open /hooks, review commands equal to '\"$SESH_HOOK_BIN\" __hook codex', trust them, then exit."
+            "Open /hooks, review commands equal to '\"$HANDOVER_HOOK_BIN\" __hook codex', trust them, then exit."
         ),
     }
     let mut command = std::process::Command::new(provider.executable());
     command
         .args(&arguments)
-        .env("SESH_HOOK_BIN", &hook_bin)
-        .env_remove("SESH_HOME")
-        .env_remove("SESH_SESSION_ID")
-        .env_remove("SESH_RUN_ID")
-        .env_remove("SESH_PROVIDER")
-        .env_remove("SESH_PROVIDER_VERSION")
-        .env_remove("SESH_HANDOFF_PATH")
-        .env_remove("SESH_CHECKPOINT_INBOX");
+        .env("HANDOVER_HOOK_BIN", &hook_bin)
+        .env_remove("HANDOVER_HOME")
+        .env_remove("HANDOVER_SESSION_ID")
+        .env_remove("HANDOVER_RUN_ID")
+        .env_remove("HANDOVER_PROVIDER")
+        .env_remove("HANDOVER_PROVIDER_VERSION")
+        .env_remove("HANDOVER_DOCUMENT_PATH")
+        .env_remove("HANDOVER_CHECKPOINT_INBOX");
     for (key, value) in &extra_env {
         command.env(key, value);
     }
@@ -592,7 +593,7 @@ pub fn run_command(
     let snapshot = Git::new().snapshot(&cwd)?;
     if let Some(existing) = SessionStore::find_for_worktree(&layout, &snapshot.identity)? {
         return Err(Error::InvalidState(format!(
-            "worktree already belongs to session {}; use sesh switch",
+            "worktree already belongs to session {}; use handover switch",
             existing.id()
         )));
     }
@@ -612,7 +613,7 @@ pub fn run_command(
     let run_paths = prepare_run_directory(
         &store,
         &run_id,
-        b"# Sesh handoff\n\nThis is the first provider run in this session. Continue from the current Git worktree and user prompt.\n",
+        b"# Handover\n\nThis is the first provider run in this session. Continue from the current Git worktree and user prompt.\n",
         b"",
     )?;
     let hook_bin = std::env::current_exe()
@@ -655,14 +656,17 @@ pub fn run_command(
         provider_home: provider_home.as_deref(),
     })?;
     for (key, value) in [
-        ("SESH_HOME", layout.root().as_os_str()),
-        ("SESH_SESSION_ID", OsStr::new(&store.id().to_string())),
-        ("SESH_RUN_ID", OsStr::new(&run_id.to_string())),
-        ("SESH_PROVIDER", OsStr::new(provider.executable())),
-        ("SESH_PROVIDER_VERSION", OsStr::new(&provider_version)),
-        ("SESH_HOOK_BIN", hook_bin.as_os_str()),
-        ("SESH_HANDOFF_PATH", run_paths.handoff.as_os_str()),
-        ("SESH_CHECKPOINT_INBOX", run_paths.checkpoints.as_os_str()),
+        ("HANDOVER_HOME", layout.root().as_os_str()),
+        ("HANDOVER_SESSION_ID", OsStr::new(&store.id().to_string())),
+        ("HANDOVER_RUN_ID", OsStr::new(&run_id.to_string())),
+        ("HANDOVER_PROVIDER", OsStr::new(provider.executable())),
+        ("HANDOVER_PROVIDER_VERSION", OsStr::new(&provider_version)),
+        ("HANDOVER_HOOK_BIN", hook_bin.as_os_str()),
+        ("HANDOVER_DOCUMENT_PATH", run_paths.handover.as_os_str()),
+        (
+            "HANDOVER_CHECKPOINT_INBOX",
+            run_paths.checkpoints.as_os_str(),
+        ),
     ] {
         spec.env.insert(OsString::from(key), value.to_owned());
     }
@@ -721,7 +725,7 @@ pub fn switch_command(
     let layout = resolve_layout(environment, &invocation_cwd)?;
     let invocation_snapshot = Git::new().snapshot(&invocation_cwd)?;
     let store = SessionStore::find_for_worktree(&layout, &invocation_snapshot.identity)?
-        .ok_or_else(|| Error::InvalidState("this worktree has no Sesh session".into()))?;
+        .ok_or_else(|| Error::InvalidState("this worktree has no Handover session".into()))?;
     let operation = SessionOperationLock::acquire(&store.session_dir())?;
     let leases = LeaseStore::new(&store.session_dir());
     let locked_snapshot = Git::new().snapshot(&invocation_cwd)?;
@@ -776,7 +780,7 @@ pub fn switch_command(
     let (recent_commands, latest_test, latest_failure, capture_gaps) =
         command_facts(&store, &events)?;
     let rendered = render_with_selection(
-        HandoffInput {
+        HandoverInput {
             session_id: store.id().clone(),
             parent_lineage: None,
             from_provider: previous_provider,
@@ -791,10 +795,10 @@ pub fn switch_command(
             latest_failure,
             capture_gaps,
         },
-        MAX_HANDOFF_BYTES,
+        MAX_HANDOVER_BYTES,
     )?;
     let recent_events_jsonl = selected_event_lines(&envelopes, &rendered.recent_event_sequences)?;
-    if recent_events_jsonl.len() > MAX_HANDOFF_BYTES {
+    if recent_events_jsonl.len() > MAX_HANDOVER_BYTES {
         return Err(Error::InvalidState(
             "selected recent events exceed 64 KiB".into(),
         ));
@@ -935,27 +939,27 @@ fn collect_recent_events(
     Ok(recent_events)
 }
 
-struct HandoffPreview {
+struct HandoverPreview {
     events: Vec<Event>,
     from_provider: Option<Provider>,
     transition_sequence: u64,
     through_sequence: u64,
     narrative_checkpoint: Option<(u64, Checkpoint)>,
     capture_gaps: Vec<CaptureGap>,
-    rendered: crate::handoff::RenderedHandoff,
+    rendered: crate::handover::RenderedHandover,
 }
 
-/// Dry-run of the same handoff a `switch` to `to_provider` would build:
+/// Dry-run of the same handover a `switch` to `to_provider` would build:
 /// resolves the saved cwd, verifies it against `invocation_snapshot`, and
 /// renders — a pure read with no mutation, no lease/journal writes. Used
-/// by `handoff_command` (`sesh handoff`) and by `status_command`'s
+/// by `handover_command` (`handover preview`) and by `status_command`'s
 /// `switch_readiness` check so both report the exact same verdict
 /// `switch` itself will produce.
-fn preview_handoff(
+fn preview_handover(
     store: &SessionStore,
     invocation_snapshot: &GitSnapshot,
     to_provider: Provider,
-) -> Result<HandoffPreview> {
+) -> Result<HandoverPreview> {
     let (saved_cwd_relative, saved_cwd) = resolve_saved_cwd(store)?;
     let switch_snapshot = Git::new().snapshot(&saved_cwd)?;
     verify_switch_snapshot(
@@ -988,7 +992,7 @@ fn preview_handoff(
     };
 
     let rendered = render_with_selection(
-        HandoffInput {
+        HandoverInput {
             session_id: store.id().clone(),
             parent_lineage: None,
             from_provider,
@@ -1003,16 +1007,16 @@ fn preview_handoff(
             latest_failure,
             capture_gaps: capture_gaps.clone(),
         },
-        MAX_HANDOFF_BYTES,
+        MAX_HANDOVER_BYTES,
     )?;
     let recent_events_jsonl = selected_event_lines(&envelopes, &rendered.recent_event_sequences)?;
-    if recent_events_jsonl.len() > MAX_HANDOFF_BYTES {
+    if recent_events_jsonl.len() > MAX_HANDOVER_BYTES {
         return Err(Error::InvalidState(
             "selected recent events exceed 64 KiB".into(),
         ));
     }
 
-    Ok(HandoffPreview {
+    Ok(HandoverPreview {
         events,
         from_provider,
         transition_sequence,
@@ -1023,17 +1027,17 @@ fn preview_handoff(
     })
 }
 
-fn handoff_command(provider: Provider, json: bool, environment: &Environment) -> Result<i32> {
+fn handover_command(provider: Provider, json: bool, environment: &Environment) -> Result<i32> {
     let invocation_cwd = std::env::current_dir().map_err(|source| io(".", source))?;
     let layout = resolve_layout(environment, &invocation_cwd)?;
     let invocation_snapshot = Git::new().snapshot(&invocation_cwd)?;
     let store = SessionStore::find_for_worktree(&layout, &invocation_snapshot.identity)?
-        .ok_or_else(|| Error::InvalidState("this worktree has no Sesh session".into()))?;
+        .ok_or_else(|| Error::InvalidState("this worktree has no Handover session".into()))?;
 
-    let preview = preview_handoff(&store, &invocation_snapshot, provider)?;
+    let preview = preview_handover(&store, &invocation_snapshot, provider)?;
 
     if json {
-        write_handoff_projection(
+        write_handover_projection(
             &store,
             preview.from_provider,
             provider,
@@ -1053,7 +1057,7 @@ fn handoff_command(provider: Provider, json: bool, environment: &Environment) ->
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_handoff_value(
+fn build_handover_value(
     store: &SessionStore,
     from_provider: Option<Provider>,
     to_provider: Provider,
@@ -1062,7 +1066,7 @@ fn build_handoff_value(
     events: &[Event],
     narrative_checkpoint: Option<(u64, Checkpoint)>,
     capture_gaps: Vec<CaptureGap>,
-    rendered: &crate::handoff::RenderedHandoff,
+    rendered: &crate::handover::RenderedHandover,
 ) -> serde_json::Value {
     serde_json::json!({
         "schema_version": 1,
@@ -1093,7 +1097,7 @@ fn build_handoff_value(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_handoff_projection(
+fn write_handover_projection(
     store: &SessionStore,
     from_provider: Option<Provider>,
     to_provider: Provider,
@@ -1102,9 +1106,9 @@ fn write_handoff_projection(
     events: &[Event],
     narrative_checkpoint: Option<(u64, Checkpoint)>,
     capture_gaps: Vec<CaptureGap>,
-    rendered: &crate::handoff::RenderedHandoff,
+    rendered: &crate::handover::RenderedHandover,
 ) -> Result<i32> {
-    let value = build_handoff_value(
+    let value = build_handover_value(
         store,
         from_provider,
         to_provider,
@@ -1119,13 +1123,13 @@ fn write_handoff_projection(
     Ok(0)
 }
 
-pub(crate) fn mcp_handoff_value(
+pub(crate) fn mcp_handover_value(
     provider: Provider,
     environment: &Environment,
 ) -> Result<serde_json::Value> {
     let (_layout, snapshot, store) = current_session(environment)?;
-    let preview = preview_handoff(&store, &snapshot, provider)?;
-    Ok(build_handoff_value(
+    let preview = preview_handover(&store, &snapshot, provider)?;
+    Ok(build_handover_value(
         &store,
         preview.from_provider,
         provider,
@@ -1151,7 +1155,7 @@ fn confirm_lease_recovery(
     let holder = lease.child.as_ref().unwrap_or(&lease.supervisor);
     if !input_is_terminal {
         return Err(Error::InvalidState(format!(
-            "session has a stale {} lease ({}); rerun with `sesh switch {} --recover-lease`, or run `sesh switch {}` in a terminal to confirm",
+            "session has a stale {} lease ({}); rerun with `handover switch {} --recover-lease`, or run `handover switch {}` in a terminal to confirm",
             lease.provider.executable(),
             holder.describe(),
             target.executable(),
@@ -1190,12 +1194,12 @@ fn confirm_lease_recovery(
     Ok("recovery confirmed interactively")
 }
 
-/// Stale-lease recovery for `sesh switch`: refuses a live or foreign-host
+/// Stale-lease recovery for `handover switch`: refuses a live or foreign-host
 /// lease with holder detail (provider, pid, started-when), and recovers a
 /// same-host dead lease only after explicit consent (an interactive
 /// `[y/N]` prompt or `--recover-lease`) via `confirm_lease_recovery`.
 ///
-/// `sesh fork` has its own, unrelated `recover_stale_lease` below: fork's
+/// `handover fork` has its own, unrelated `recover_stale_lease` below: fork's
 /// UX is out of scope for this consent gate and keeps its original,
 /// unprompted, generically-worded behavior unchanged.
 #[allow(clippy::too_many_arguments)]
@@ -1431,14 +1435,14 @@ fn latest_narrative_checkpoint(
     Ok(Some((sequence, checkpoint)))
 }
 
-type HandoffFacts = (
+type HandoverFacts = (
     Vec<CommandFact>,
     Option<CommandFact>,
     Option<CommandFact>,
     Vec<CaptureGap>,
 );
 
-fn command_facts(store: &SessionStore, events: &[Event]) -> Result<HandoffFacts> {
+fn command_facts(store: &SessionStore, events: &[Event]) -> Result<HandoverFacts> {
     let blobs = BlobStore::new(&store.session_dir());
     let mut requests = BTreeMap::new();
     let mut commands = Vec::new();
@@ -1553,7 +1557,7 @@ fn selected_event_lines(envelopes: &[EventEnvelope], sequences: &[u64]) -> Resul
     }
     if selected.next().is_some() {
         return Err(Error::InvalidState(
-            "handoff selected an event absent from the committed journal".into(),
+            "handover selected an event absent from the committed journal".into(),
         ));
     }
     Ok(output)
@@ -1571,14 +1575,17 @@ fn add_run_environment(
     run_paths: &RunPaths,
 ) {
     for (key, value) in [
-        ("SESH_HOME", layout.root().as_os_str()),
-        ("SESH_SESSION_ID", OsStr::new(&store.id().to_string())),
-        ("SESH_RUN_ID", OsStr::new(&run_id.to_string())),
-        ("SESH_PROVIDER", OsStr::new(provider.executable())),
-        ("SESH_PROVIDER_VERSION", OsStr::new(provider_version)),
-        ("SESH_HOOK_BIN", hook_bin.as_os_str()),
-        ("SESH_HANDOFF_PATH", run_paths.handoff.as_os_str()),
-        ("SESH_CHECKPOINT_INBOX", run_paths.checkpoints.as_os_str()),
+        ("HANDOVER_HOME", layout.root().as_os_str()),
+        ("HANDOVER_SESSION_ID", OsStr::new(&store.id().to_string())),
+        ("HANDOVER_RUN_ID", OsStr::new(&run_id.to_string())),
+        ("HANDOVER_PROVIDER", OsStr::new(provider.executable())),
+        ("HANDOVER_PROVIDER_VERSION", OsStr::new(provider_version)),
+        ("HANDOVER_HOOK_BIN", hook_bin.as_os_str()),
+        ("HANDOVER_DOCUMENT_PATH", run_paths.handover.as_os_str()),
+        (
+            "HANDOVER_CHECKPOINT_INBOX",
+            run_paths.checkpoints.as_os_str(),
+        ),
     ] {
         target.insert(OsString::from(key), value.to_owned());
     }
@@ -1653,12 +1660,12 @@ pub(crate) fn build_status_value(environment: &Environment) -> Result<serde_json
     let (lease_state, lease_reason) = classify_lease(&leases)?;
     let checkpoint_fresh = events_since < STALE_NARRATIVE_EVENT_THRESHOLD;
     let target_provider = provider.map(Provider::other).unwrap_or(Provider::Claude);
-    let (handoff_renderable, handoff_error) =
-        match preview_handoff(&store, &snapshot, target_provider) {
+    let (handover_renderable, handover_error) =
+        match preview_handover(&store, &snapshot, target_provider) {
             Ok(_) => (true, None),
             Err(error) => (false, Some(error.to_string())),
         };
-    let ready = lease_state == "free" && handoff_renderable;
+    let ready = lease_state == "free" && handover_renderable;
     Ok(serde_json::json!({
         "schema_version": 1,
         "session_id": store.id(),
@@ -1686,9 +1693,9 @@ pub(crate) fn build_status_value(environment: &Environment) -> Result<serde_json
             "lease": lease_state,
             "lease_reason": lease_reason,
             "checkpoint_fresh": checkpoint_fresh,
-            "handoff_renderable": handoff_renderable,
-            "handoff_error": handoff_error,
-            "suggested_switch_command": format!("sesh switch {}", target_provider.executable()),
+            "handover_renderable": handover_renderable,
+            "handover_error": handover_error,
+            "suggested_switch_command": format!("handover switch {}", target_provider.executable()),
         },
     }))
 }
@@ -1828,7 +1835,7 @@ fn delete_command(
     if !yes {
         if !input_is_terminal {
             return Err(Error::InvalidState(
-                "deletion requires a terminal confirmation or `sesh delete --yes`".into(),
+                "deletion requires a terminal confirmation or `handover delete --yes`".into(),
             ));
         }
         let short_id = store.id().to_string()[..8].to_owned();
@@ -2036,7 +2043,7 @@ fn current_session(environment: &Environment) -> Result<(StateLayout, GitSnapsho
     let layout = resolve_layout(environment, &cwd)?;
     let snapshot = Git::new().snapshot(&cwd)?;
     let store = SessionStore::find_for_worktree(&layout, &snapshot.identity)?
-        .ok_or_else(|| Error::InvalidState("this worktree has no Sesh session".into()))?;
+        .ok_or_else(|| Error::InvalidState("this worktree has no Handover session".into()))?;
     Ok((layout, snapshot, store))
 }
 
@@ -2211,16 +2218,17 @@ fn checkpoint_command(
         submit_provider_narrative(environment, &narrative)?;
         return Ok(0);
     }
-    if environment.get("SESH_RUN_ID").is_some() {
+    if environment.get("HANDOVER_RUN_ID").is_some() {
         return Err(Error::InvalidState(
-            "an attached provider must use `sesh checkpoint --format json --from-provider`".into(),
+            "an attached provider must use `handover checkpoint --format json --from-provider`"
+                .into(),
         ));
     }
     let cwd = std::env::current_dir().map_err(|source| io(".", source))?;
     let layout = resolve_layout(environment, &cwd)?;
     let snapshot = Git::new().snapshot(&cwd)?;
     let store = SessionStore::find_for_worktree(&layout, &snapshot.identity)?
-        .ok_or_else(|| Error::InvalidState("this worktree has no Sesh session".into()))?;
+        .ok_or_else(|| Error::InvalidState("this worktree has no Handover session".into()))?;
     let _operation = SessionOperationLock::acquire(&store.session_dir())?;
     let narrative = if input_is_terminal {
         edit_narrative(layout.root(), environment)?
@@ -2278,10 +2286,10 @@ fn ingest_hook_inner(
     }
     let process_cwd = std::env::current_dir().map_err(|source| io(".", source))?;
     let layout = resolve_layout(environment, &process_cwd)?;
-    let session_id = SessionId::parse(required_env_utf8(environment, "SESH_SESSION_ID")?)
-        .map_err(|error| Error::InvalidState(format!("invalid SESH_SESSION_ID: {error}")))?;
-    let run_id = RunId::parse(required_env_utf8(environment, "SESH_RUN_ID")?)
-        .map_err(|error| Error::InvalidState(format!("invalid SESH_RUN_ID: {error}")))?;
+    let session_id = SessionId::parse(required_env_utf8(environment, "HANDOVER_SESSION_ID")?)
+        .map_err(|error| Error::InvalidState(format!("invalid HANDOVER_SESSION_ID: {error}")))?;
+    let run_id = RunId::parse(required_env_utf8(environment, "HANDOVER_RUN_ID")?)
+        .map_err(|error| Error::InvalidState(format!("invalid HANDOVER_RUN_ID: {error}")))?;
     let store = SessionStore::open(&layout, session_id)?;
     let lease = LeaseStore::new(&store.session_dir())
         .read()?
@@ -2307,7 +2315,7 @@ fn ingest_hook_inner(
     ) && capture_failure_exists(&store, &run_id)?
     {
         return Err(Error::InvalidState(
-            "a previous capture failure requires sesh doctor --repair".into(),
+            "a previous capture failure requires handover doctor --repair".into(),
         ));
     }
     if matches!(normalized.event, HookEvent::SessionStarted { .. }) {
@@ -2331,11 +2339,11 @@ fn ingest_hook_inner(
     let blobs = BlobStore::new(&store.session_dir());
     ensure_outcome_request(&store, runtime, &run_id, provider, &normalized.event)?;
     let provider_version = environment
-        .get("SESH_PROVIDER_VERSION")
+        .get("HANDOVER_PROVIDER_VERSION")
         .and_then(OsStr::to_str)
         .map(str::to_owned);
     let is_stop = matches!(normalized.event, HookEvent::Stopped { .. });
-    let (outcome, follow_snapshot, handoff) = map_and_append_hook(
+    let (outcome, follow_snapshot, handover) = map_and_append_hook(
         &store,
         runtime,
         &run_id,
@@ -2353,16 +2361,16 @@ fn ingest_hook_inner(
             EventKind::GitSnapshot { snapshot },
         )?;
     }
-    if handoff {
+    if handover {
         let path = store
             .session_dir()
-            .join(format!("runs/{run_id}/inbox/handoff.md"));
+            .join(format!("runs/{run_id}/inbox/handover.md"));
         let bytes = read_private(&path)?;
-        if bytes.len() > MAX_HANDOFF_BYTES {
-            return Err(Error::InvalidState("handoff exceeds 64 KiB".into()));
+        if bytes.len() > MAX_HANDOVER_BYTES {
+            return Err(Error::InvalidState("handover exceeds 64 KiB".into()));
         }
         let text = std::str::from_utf8(&bytes)
-            .map_err(|_| Error::InvalidState("handoff is not valid UTF-8".into()))?;
+            .map_err(|_| Error::InvalidState("handover is not valid UTF-8".into()))?;
         return Ok(session_start_output(text));
     }
     if is_stop
@@ -2393,7 +2401,7 @@ fn map_and_append_hook(
     blobs: &BlobStore,
     provider_version: Option<String>,
 ) -> Result<(AppendOutcome, bool, bool)> {
-    let (key, kind, snapshot, handoff) = match normalized.event {
+    let (key, kind, snapshot, handover) = match normalized.event {
         HookEvent::SessionStarted { native_session_id } => (
             Some(format!("handshake:{native_session_id}")),
             EventKind::RunHandshake {
@@ -2491,7 +2499,7 @@ fn map_and_append_hook(
             EventJournal::new(&store.session_dir(), store.id().clone()).append(pending)?,
         )
     };
-    Ok((outcome, snapshot, handoff))
+    Ok((outcome, snapshot, handover))
 }
 
 fn ensure_outcome_request(
@@ -2574,13 +2582,13 @@ struct RunPaths {
     root: PathBuf,
     inbox: PathBuf,
     checkpoints: PathBuf,
-    handoff: PathBuf,
+    handover: PathBuf,
 }
 
 fn prepare_run_directory(
     store: &SessionStore,
     run_id: &RunId,
-    handoff_contents: &[u8],
+    handover_contents: &[u8],
     recent_events_contents: &[u8],
 ) -> Result<RunPaths> {
     let runs = store.session_dir().join("runs");
@@ -2601,8 +2609,8 @@ fn prepare_run_directory(
     let inbox = temporary.join("inbox");
     let checkpoints = inbox.join("checkpoints");
     crate::store::ensure_private_dir(&checkpoints)?;
-    let handoff = inbox.join("handoff.md");
-    create_private(&handoff, handoff_contents)?;
+    let handover = inbox.join("handover.md");
+    create_private(&handover, handover_contents)?;
     create_private(&inbox.join("recent-events.jsonl"), recent_events_contents)?;
     sync_directory(&checkpoints)?;
     sync_directory(&inbox)?;
@@ -2618,7 +2626,7 @@ fn prepare_run_directory(
         root: final_path,
         inbox: final_inbox.clone(),
         checkpoints: final_checkpoints,
-        handoff: final_inbox.join("handoff.md"),
+        handover: final_inbox.join("handover.md"),
     })
 }
 
@@ -2672,10 +2680,10 @@ fn record_capture_failure(
 ) -> Result<()> {
     let cwd = std::env::current_dir().map_err(|source| io(".", source))?;
     let layout = resolve_layout(environment, &cwd)?;
-    let session = SessionId::parse(required_env_utf8(environment, "SESH_SESSION_ID")?)
-        .map_err(|error| Error::InvalidState(format!("invalid SESH_SESSION_ID: {error}")))?;
-    let run = RunId::parse(required_env_utf8(environment, "SESH_RUN_ID")?)
-        .map_err(|error| Error::InvalidState(format!("invalid SESH_RUN_ID: {error}")))?;
+    let session = SessionId::parse(required_env_utf8(environment, "HANDOVER_SESSION_ID")?)
+        .map_err(|error| Error::InvalidState(format!("invalid HANDOVER_SESSION_ID: {error}")))?;
+    let run = RunId::parse(required_env_utf8(environment, "HANDOVER_RUN_ID")?)
+        .map_err(|error| Error::InvalidState(format!("invalid HANDOVER_RUN_ID: {error}")))?;
     let path = layout
         .sessions()
         .join(session.to_string())
@@ -2717,12 +2725,12 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        build_handoff_value, classify_lease, command_facts, confirm_lease_recovery,
+        build_handover_value, classify_lease, command_facts, confirm_lease_recovery,
         latest_narrative_checkpoint, recover_stale_lease_for_switch, resolve_provider_home,
         stop_nudge, with_rename_rollback,
     };
     use crate::error::Error;
-    use crate::handoff::{CaptureGap, RenderedHandoff};
+    use crate::handover::{CaptureGap, RenderedHandover};
     use crate::model::{
         Checkpoint, CheckpointAuthor, CheckpointKind, ContentRef, Event, EventKind, GitSnapshot,
         NarrativeInput, Provider, RunId, SessionId, WorktreeIdentity,
@@ -2792,7 +2800,7 @@ mod tests {
     }
 
     #[test]
-    fn build_handoff_value_embeds_the_rendered_markdown_and_metadata() {
+    fn build_handover_value_embeds_the_rendered_markdown_and_metadata() {
         let (_temp, store) = store_fixture();
         let events = vec![observed_event(
             1,
@@ -2808,8 +2816,8 @@ mod tests {
             narrative: None,
             narrative_checkpoint_sequence: None,
         };
-        let rendered = RenderedHandoff {
-            markdown: "# Handoff\n".into(),
+        let rendered = RenderedHandover {
+            markdown: "# Handover\n".into(),
             recent_event_sequences: vec![1],
             omitted: false,
         };
@@ -2819,7 +2827,7 @@ mod tests {
             message: "gap".into(),
         }];
 
-        let value = build_handoff_value(
+        let value = build_handover_value(
             &store,
             Some(Provider::Claude),
             Provider::Codex,
@@ -2833,8 +2841,8 @@ mod tests {
 
         assert_eq!(value["from_provider"], "claude");
         assert_eq!(value["to_provider"], "codex");
-        assert_eq!(value["markdown"], "# Handoff\n");
-        assert_eq!(value["markdown_bytes"], "# Handoff\n".len());
+        assert_eq!(value["markdown"], "# Handover\n");
+        assert_eq!(value["markdown_bytes"], "# Handover\n".len());
         assert_eq!(value["omitted"], false);
         assert_eq!(value["narrative_checkpoint"]["sequence"], 1);
         assert_eq!(value["narrative_checkpoint"]["events_since"], 0);
@@ -3002,7 +3010,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("--recover-lease"));
-        assert!(error.contains("sesh switch codex --recover-lease"));
+        assert!(error.contains("handover switch codex --recover-lease"));
         assert!(error.contains("claude"));
     }
 

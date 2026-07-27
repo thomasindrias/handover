@@ -290,6 +290,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "handover"
+version = "0.1.0"
+dependencies = [
+ "assert_cmd",
+ "clap",
+ "fs2",
+ "hex",
+ "libc",
+ "predicates",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shell-words",
+ "signal-hook",
+ "tempfile",
+ "thiserror",
+ "time",
+ "uuid",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -549,28 +571,6 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
-]
-
-[[package]]
-name = "sesh"
-version = "0.1.0"
-dependencies = [
- "assert_cmd",
- "clap",
- "fs2",
- "hex",
- "libc",
- "predicates",
- "pretty_assertions",
- "serde",
- "serde_json",
- "sha2",
- "shell-words",
- "signal-hook",
- "tempfile",
- "thiserror",
- "time",
- "uuid",
 ]
 
 [[package]]

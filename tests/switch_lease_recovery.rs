@@ -1,9 +1,9 @@
 mod support;
 
 use assert_cmd::cargo::cargo_bin_cmd;
+use handover::model::{EventEnvelope, EventKind, Provider, RunId, SessionId};
+use handover::store::lease::{LeaseStore, ProcessIdentity, RunLease};
 use predicates::prelude::*;
-use sesh::model::{EventEnvelope, EventKind, Provider, RunId, SessionId};
-use sesh::store::lease::{LeaseStore, ProcessIdentity, RunLease};
 use tempfile::TempDir;
 
 use support::{init_repo, path_with, write_executable};
@@ -12,7 +12,7 @@ const FAKE_CLAUDE: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-claude 1.0'; exit 0; fi
 cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
-printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}' | "$SESH_HOOK_BIN" __hook claude >/dev/null
+printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}' | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null
 exit 0
 "#;
 
@@ -20,14 +20,14 @@ const FAKE_CODEX: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-codex 1.0'; exit 0; fi
 cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
-printf '%s' '{"session_id":"codex-native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}' | "$SESH_HOOK_BIN" __hook codex >/dev/null
+printf '%s' '{"session_id":"codex-native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}' | "$HANDOVER_HOOK_BIN" __hook codex >/dev/null
 exit 0
 "#;
 
 fn run_claude(repo: &std::path::Path, state: &std::path::Path, path: &std::ffi::OsStr) {
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(repo)
-        .env("SESH_HOME", state)
+        .env("HANDOVER_HOME", state)
         .env("PATH", path)
         .args(["run", "claude"])
         .assert()
@@ -76,9 +76,9 @@ fn switch_refuses_a_live_or_foreign_host_lease_with_actionable_detail() {
     )
     .unwrap();
     leases.create(&live).unwrap();
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .args(["switch", "codex"])
         .assert()
         .failure()
@@ -104,9 +104,9 @@ fn switch_refuses_a_live_or_foreign_host_lease_with_actionable_detail() {
     .unwrap();
     foreign.host = "different-host".into();
     leases.create(&foreign).unwrap();
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .args(["switch", "codex"])
         .assert()
         .failure()
@@ -144,15 +144,15 @@ fn switch_recovers_a_stale_lease_only_with_explicit_consent() {
     .unwrap();
     leases.create(&stale).unwrap();
 
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", &path)
         .args(["switch", "codex"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "sesh switch codex --recover-lease",
+            "handover switch codex --recover-lease",
         ));
     assert_eq!(leases.read().unwrap().unwrap().run_id, stale.run_id);
     assert!(
@@ -161,9 +161,9 @@ fn switch_recovers_a_stale_lease_only_with_explicit_consent() {
             .any(|envelope| matches!(envelope.event.kind, EventKind::RunRecovered { .. }))
     );
 
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", &path)
         .args(["switch", "codex", "--recover-lease"])
         .assert()

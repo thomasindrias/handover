@@ -103,7 +103,7 @@ mod tests {
                 cwd: temp.path(),
                 inbox: &temp.path().join("inbox"),
                 integration_root: &integration_root,
-                hook_bin: Path::new("/usr/local/bin/sesh"),
+                hook_bin: Path::new("/usr/local/bin/handover"),
                 provider_args: &args,
                 bootstrap: None,
                 run_dir: &run_dir,
@@ -166,7 +166,7 @@ mod tests {
                 cwd: temp.path(),
                 inbox: &temp.path().join("inbox"),
                 integration_root: &integration_root,
-                hook_bin: Path::new("/usr/local/bin/sesh"),
+                hook_bin: Path::new("/usr/local/bin/handover"),
                 provider_args: &[],
                 bootstrap: None,
                 run_dir: &run_dir,
@@ -205,7 +205,7 @@ mod tests {
                 cwd: temp.path(),
                 inbox: &temp.path().join("inbox"),
                 integration_root: &integration_root,
-                hook_bin: Path::new("/usr/local/bin/sesh"),
+                hook_bin: Path::new("/usr/local/bin/handover"),
                 provider_args: &[],
                 bootstrap: None,
                 run_dir: &run_dir,
@@ -250,7 +250,7 @@ mod tests {
                 cwd: temp.path(),
                 inbox: &temp.path().join("inbox"),
                 integration_root: &integration_root,
-                hook_bin: Path::new("/bin/sesh"),
+                hook_bin: Path::new("/bin/handover"),
                 provider_args: &args,
                 bootstrap: Some("continue"),
                 run_dir: &run_dir,
@@ -272,14 +272,14 @@ mod tests {
             0o600
         );
         let text = std::fs::read_to_string(&hooks).unwrap();
-        assert!(text.contains("\\\"$SESH_HOOK_BIN\\\" __hook codex"));
+        assert!(text.contains("\\\"$HANDOVER_HOOK_BIN\\\" __hook codex"));
         assert!(!text.contains("/work/"));
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         let hooks_object = value["hooks"].as_object().unwrap();
         assert_eq!(hooks_object.len(), 5);
         for definitions in hooks_object.values() {
             let command = definitions[0]["hooks"][0]["command"].as_str().unwrap();
-            assert_eq!(command, "\"$SESH_HOOK_BIN\" __hook codex");
+            assert_eq!(command, "\"$HANDOVER_HOOK_BIN\" __hook codex");
             assert_eq!(command.matches('$').count(), 1);
         }
 

@@ -3,7 +3,7 @@ mod support;
 use std::os::unix::fs::PermissionsExt;
 
 use assert_cmd::cargo::cargo_bin_cmd;
-use sesh::model::EventEnvelope;
+use handover::model::EventEnvelope;
 use tempfile::TempDir;
 
 use support::{init_repo, path_with, write_executable};
@@ -23,30 +23,30 @@ fn status_log_and_inspect_are_verified_stable_json_projections() {
 set -euo pipefail
 if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-claude 1.0'; exit 0; fi
 cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
-hook() { printf '%s' "$1" | "$SESH_HOOK_BIN" __hook claude >/dev/null; }
+hook() { printf '%s' "$1" | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null; }
 hook '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}'
 hook '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"cargo test"},"tool_use_id":"tool-1"}'
 large=$(printf '%09000d' 0)
 hook '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"cargo test"},"tool_response":{"stdout":"'"$large"'","stderr":"","exit_code":0},"tool_use_id":"tool-1"}'
 printf '%s\n' 'dirty' > changed.txt
-printf '%s' '{"objective":"Inspect session","summary":"Read surfaces are ready","decisions":[],"assumptions":[],"constraints":[],"completed":["capture"],"in_progress":[],"blockers":[],"next_steps":["Inspect output"],"related_event_sequences":[]}' | "$SESH_HOOK_BIN" checkpoint --format json --from-provider
+printf '%s' '{"objective":"Inspect session","summary":"Read surfaces are ready","decisions":[],"assumptions":[],"constraints":[],"completed":["capture"],"in_progress":[],"blockers":[],"next_steps":["Inspect output"],"related_event_sequences":[]}' | "$HANDOVER_HOOK_BIN" checkpoint --format json --from-provider
 hook '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"Stop"}'
 exit 0
 "#,
     );
     let state = temp.path().join("state");
     let path = path_with(&bin);
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&cwd)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", &path)
         .args(["run", "claude"])
         .assert()
         .success();
 
-    let status_output = cargo_bin_cmd!("sesh")
+    let status_output = cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .args(["status", "--json"])
         .output()
         .unwrap();
@@ -82,9 +82,9 @@ exit 0
         "expected a small post-checkpoint tail, got {events_since}"
     );
 
-    let list_output = cargo_bin_cmd!("sesh")
+    let list_output = cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .args(["list", "--json"])
         .output()
         .unwrap();
@@ -105,9 +105,9 @@ exit 0
         status["events_since_narrative"]
     );
 
-    let log_output = cargo_bin_cmd!("sesh")
+    let log_output = cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .args(["log", "--json"])
         .output()
         .unwrap();
@@ -125,9 +125,9 @@ exit 0
             .all(|pair| pair[0].event.sequence + 1 == pair[1].event.sequence)
     );
 
-    let from_output = cargo_bin_cmd!("sesh")
+    let from_output = cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .args(["log", "--from", "5"])
         .output()
         .unwrap();
@@ -137,9 +137,9 @@ exit 0
         assert!(sequence >= 5);
     }
 
-    let inspect_output = cargo_bin_cmd!("sesh")
+    let inspect_output = cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .args(["inspect", "--json"])
         .output()
         .unwrap();
@@ -180,14 +180,14 @@ exit 0
         vec!["inspect", "--json"],
         vec!["delete", "--yes"],
         vec!["switch", "codex"],
-        vec!["handoff", "codex"],
+        vec!["preview", "codex"],
         vec!["run", "codex"],
         vec!["checkpoint", "--format", "json"],
     ] {
-        let output = cargo_bin_cmd!("sesh")
+        let output = cargo_bin_cmd!("handover")
             .current_dir(&repo)
-            .env("SESH_HOME", &state)
-            .env("SESH_RUN_ID", "22222222-2222-4222-8222-222222222222")
+            .env("HANDOVER_HOME", &state)
+            .env("HANDOVER_RUN_ID", "22222222-2222-4222-8222-222222222222")
             .args(arguments)
             .output()
             .unwrap();

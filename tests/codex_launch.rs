@@ -11,10 +11,10 @@ fn fake_codex(bin: &std::path::Path) {
         r#"#!/usr/bin/env bash
 set -euo pipefail
 if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-codex 1.0'; exit 0; fi
-printf '%s\n' "$@" > "$SESH_TEST_TRACE/codex.args"
-printf '%s\n' "${CODEX_HOME:-unset}" > "$SESH_TEST_TRACE/codex.home"
+printf '%s\n' "$@" > "$HANDOVER_TEST_TRACE/codex.args"
+printf '%s\n' "${CODEX_HOME:-unset}" > "$HANDOVER_TEST_TRACE/codex.home"
 cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
-hook() { printf '%s' "$1" | "$SESH_HOOK_BIN" __hook codex >/dev/null; }
+hook() { printf '%s' "$1" | "$HANDOVER_HOOK_BIN" __hook codex >/dev/null; }
 hook '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}'
 hook '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"Stop"}'
 exit 0
@@ -35,10 +35,10 @@ fn codex_launch_uses_a_private_codex_home_with_no_config_overlay_flags() {
     std::fs::create_dir(&trace).unwrap();
     let path = path_with(&bin);
 
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
-        .env("SESH_TEST_TRACE", &trace)
+        .env("HANDOVER_HOME", &state)
+        .env("HANDOVER_TEST_TRACE", &trace)
         .env("PATH", &path)
         .args(["run", "codex"])
         .assert()

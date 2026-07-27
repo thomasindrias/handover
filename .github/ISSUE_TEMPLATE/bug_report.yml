@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible problem in Sesh
+description: Report a reproducible problem in Handover
 title: "bug: "
 labels:
   - bug
@@ -7,13 +7,13 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for helping improve Sesh. Do not include secrets or private session data. Report vulnerabilities through the private path in SECURITY.md.
+        Thanks for helping improve Handover. Do not include secrets or private session data. Report vulnerabilities through the private path in SECURITY.md.
   - type: input
     id: version
     attributes:
-      label: Sesh version
-      description: Paste `sesh --version` or the commit SHA.
-      placeholder: sesh 0.1.0
+      label: Handover version
+      description: Paste `handover --version` or the commit SHA.
+      placeholder: handover 0.1.0
     validations:
       required: true
   - type: dropdown
@@ -49,7 +49,7 @@ body:
     id: diagnostics
     attributes:
       label: Redacted diagnostics
-      description: Add relevant `sesh doctor --json` output after removing paths, prompts, credentials, and private context.
+      description: Add relevant `handover doctor --json` output after removing paths, prompts, credentials, and private context.
       render: json
   - type: checkboxes
     id: safety

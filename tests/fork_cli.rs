@@ -11,20 +11,20 @@ use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
-use sesh::git::fork::default_target;
-use sesh::model::{Provider, RunId, SessionId};
-use sesh::store::lease::{ProcessIdentity, RunLease};
+use handover::git::fork::default_target;
+use handover::model::{Provider, RunId, SessionId};
+use handover::store::lease::{ProcessIdentity, RunLease};
 use support::{add_linked_worktree, git, init_repo, path_with, write_executable};
 
 #[test]
 fn fork_is_a_discoverable_git_like_command() {
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .arg("--help")
         .assert()
         .success()
         .stdout(predicate::str::contains("fork"));
 
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .args(["fork", "--help"])
         .assert()
         .success()
@@ -41,10 +41,10 @@ fn default_target_is_stable_and_git_like() {
     )
     .unwrap();
 
-    assert_eq!(target.branch, "sesh/acme-platform-12345678");
+    assert_eq!(target.branch, "handover/acme-platform-12345678");
     assert_eq!(
         target.worktree,
-        std::path::Path::new("/work/acme platform-sesh-12345678")
+        std::path::Path::new("/work/acme platform-handover-12345678")
     );
 }
 
@@ -56,10 +56,10 @@ fn repository_name_sanitization_never_creates_an_invalid_component() {
     )
     .unwrap();
 
-    assert_eq!(target.branch, "sesh/repo-aaaaaaaa");
+    assert_eq!(target.branch, "handover/repo-aaaaaaaa");
     assert_eq!(
         target.worktree,
-        std::path::Path::new("/work/@@@-sesh-aaaaaaaa")
+        std::path::Path::new("/work/@@@-handover-aaaaaaaa")
     );
 }
 
@@ -227,9 +227,9 @@ fn existing_target_branch_or_path_is_refused_without_replacement() {
 fn relative_targets_resolve_from_the_callers_cwd() {
     let fixture = ForkFixture::new();
     let resolved = fixture.temp.path().join("relative-target");
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&fixture.repo)
-        .env("SESH_HOME", &fixture.state)
+        .env("HANDOVER_HOME", &fixture.state)
         .env("PATH", &fixture.path)
         .args([
             "fork",
@@ -249,9 +249,9 @@ fn relative_targets_resolve_from_the_callers_cwd() {
 fn a_dangling_target_symlink_is_existing_state_and_is_never_followed() {
     let fixture = ForkFixture::new();
     symlink("missing-destination", &fixture.target).unwrap();
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&fixture.repo)
-        .env("SESH_HOME", &fixture.state)
+        .env("HANDOVER_HOME", &fixture.state)
         .arg("fork")
         .arg("codex")
         .arg("--branch")
@@ -294,7 +294,7 @@ impl ForkFixture {
 set -euo pipefail
 if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-claude 1.0'; exit 0; fi
 cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
-printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}' | "$SESH_HOOK_BIN" __hook claude >/dev/null
+printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}' | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null
 exit 0
 "#,
         );
@@ -304,14 +304,14 @@ exit 0
 set -euo pipefail
 if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-codex 1.0'; exit 0; fi
 cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
-printf '%s' '{"session_id":"native","turn_id":"turn-1","cwd":"'"$cwd_json"'","model":"test","hook_event_name":"SessionStart"}' | "$SESH_HOOK_BIN" __hook codex >/dev/null
+printf '%s' '{"session_id":"native","turn_id":"turn-1","cwd":"'"$cwd_json"'","model":"test","hook_event_name":"SessionStart"}' | "$HANDOVER_HOOK_BIN" __hook codex >/dev/null
 exit 0
 "#,
         );
         let path = path_with(&bin);
-        cargo_bin_cmd!("sesh")
+        cargo_bin_cmd!("handover")
             .current_dir(&repo)
-            .env("SESH_HOME", &state)
+            .env("HANDOVER_HOME", &state)
             .env("PATH", &path)
             .args(["run", "claude"])
             .assert()
@@ -322,7 +322,7 @@ exit 0
         assert_eq!(source_ref_count, 1);
         Self {
             target: temp.path().join("fork-target"),
-            branch: "sesh/fork-test".into(),
+            branch: "handover/fork-test".into(),
             temp,
             repo,
             state,
@@ -336,9 +336,9 @@ exit 0
     }
 
     fn assert_refusal_at(&self, target: &Path, message: &str, branch_already_exists: bool) {
-        cargo_bin_cmd!("sesh")
+        cargo_bin_cmd!("handover")
             .current_dir(&self.repo)
-            .env("SESH_HOME", &self.state)
+            .env("HANDOVER_HOME", &self.state)
             .env("PATH", &self.path)
             .arg("fork")
             .arg("codex")
@@ -363,9 +363,9 @@ exit 0
     }
 
     fn assert_refusal_preserving_existing_path(&self, message: &str) {
-        cargo_bin_cmd!("sesh")
+        cargo_bin_cmd!("handover")
             .current_dir(&self.repo)
-            .env("SESH_HOME", &self.state)
+            .env("HANDOVER_HOME", &self.state)
             .env("PATH", &self.path)
             .args(["fork", "codex", "--branch", &self.branch, "--worktree"])
             .arg(&self.target)
@@ -395,9 +395,9 @@ exit 0
     }
 
     fn assert_success_at(&self, target: &Path) {
-        cargo_bin_cmd!("sesh")
+        cargo_bin_cmd!("handover")
             .current_dir(&self.repo)
-            .env("SESH_HOME", &self.state)
+            .env("HANDOVER_HOME", &self.state)
             .env("PATH", &self.path)
             .arg("fork")
             .arg("codex")

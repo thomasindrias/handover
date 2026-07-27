@@ -1,12 +1,12 @@
 #!/bin/sh
-# One-command build-from-source installer for sesh.
+# One-command build-from-source installer for handover.
 #
-#   curl -fsSL https://raw.githubusercontent.com/thomasindrias/sesh/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/thomasindrias/handover/main/install.sh | sh
 #
-# Or, from inside a sesh checkout: ./install.sh
+# Or, from inside a handover checkout: ./install.sh
 set -eu
 
-REPO_URL="https://github.com/thomasindrias/sesh.git"
+REPO_URL="https://github.com/thomasindrias/handover.git"
 
 log() {
     printf '%s\n' "$*"
@@ -24,8 +24,8 @@ require_cmd() {
 require_cmd git "git is required but was not found. Install it with your platform's package manager, then re-run this script."
 require_cmd cargo "cargo (Rust) is required but was not found. Install Rust via https://rustup.rs, then re-run this script."
 
-is_sesh_checkout() {
-    [ -f Cargo.toml ] && grep -q '^name = "sesh"' Cargo.toml
+is_handover_checkout() {
+    [ -f Cargo.toml ] && grep -q '^name = "handover"' Cargo.toml
 }
 
 CLEANUP_DIR=""
@@ -36,16 +36,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if is_sesh_checkout; then
-    log "Building sesh from the current checkout..."
+if is_handover_checkout; then
+    log "Building handover from the current checkout..."
 else
     CLEANUP_DIR=$(mktemp -d)
-    log "Cloning sesh into a temporary directory..."
-    git clone --depth 1 "$REPO_URL" "$CLEANUP_DIR/sesh"
-    cd "$CLEANUP_DIR/sesh"
+    log "Cloning handover into a temporary directory..."
+    git clone --depth 1 "$REPO_URL" "$CLEANUP_DIR/handover"
+    cd "$CLEANUP_DIR/handover"
 fi
 
-log "Installing sesh (this compiles from source, it may take a minute)..."
+log "Installing handover (this compiles from source, it may take a minute)..."
 cargo install --path . --locked --force
 
 cargo_base="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}"
@@ -61,6 +61,6 @@ case ":$PATH:" in
 esac
 
 log ""
-log "sesh is installed. Next steps:"
-log "    sesh setup claude"
-log "    sesh setup codex"
+log "handover is installed. Next steps:"
+log "    handover setup claude"
+log "    handover setup codex"

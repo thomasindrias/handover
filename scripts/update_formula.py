@@ -4,7 +4,7 @@
 Usage: update_formula.py <version> <sha256sums-file>
 
 The checksum file is `sha256sum` output over the release archives, so each line
-is "<digest>  ./sesh-<version>-<target>.tar.gz". Every target the formula
+is "<digest>  ./handover-<version>-<target>.tar.gz". Every target the formula
 declares must be present, otherwise the formula would point at an archive that
 does not exist and `brew install` would fail after the release is published.
 """
@@ -16,7 +16,7 @@ import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-FORMULA = ROOT / "Formula" / "sesh.rb"
+FORMULA = ROOT / "Formula" / "handover.rb"
 
 TARGETS = (
     "aarch64-apple-darwin",
@@ -25,7 +25,7 @@ TARGETS = (
     "x86_64-unknown-linux-musl",
 )
 
-DOWNLOAD = "https://github.com/thomasindrias/sesh/releases/download"
+DOWNLOAD = "https://github.com/thomasindrias/handover/releases/download"
 
 
 def read_digests(path: pathlib.Path, version: str) -> dict[str, str]:
@@ -36,7 +36,7 @@ def read_digests(path: pathlib.Path, version: str) -> dict[str, str]:
             continue
         digest, name = parts[0], pathlib.PurePath(parts[1]).name
         for target in TARGETS:
-            if name == f"sesh-{version}-{target}.tar.gz":
+            if name == f"handover-{version}-{target}.tar.gz":
                 digests[target] = digest
     missing = [target for target in TARGETS if target not in digests]
     if missing:
@@ -58,7 +58,7 @@ def rewrite(text: str, version: str, digests: dict[str, str]) -> str:
     # Each url line ends in its own target, so both the URL and the sha256 on
     # the following line are rebuilt from that target rather than by position.
     for target, digest in digests.items():
-        archive = f"sesh-{version}-{target}.tar.gz"
+        archive = f"handover-{version}-{target}.tar.gz"
         pattern = (
             rf'(url\s+")[^"]*-{re.escape(target)}\.tar\.gz("\s*\n\s*sha256\s+")[0-9a-f]{{64}}(")'
         )

@@ -179,7 +179,7 @@ fn validate_checkpoint_shape(event_sequence: u64, checkpoint: &Checkpoint) -> Re
 
 fn render_markdown(event_sequence: u64, checkpoint: &Checkpoint) -> Result<String> {
     let mut output = format!(
-        "# Sesh checkpoint {event_sequence:012}\n\nKind: {}\n\nThrough event sequence: {}\n\n",
+        "# Handover checkpoint {event_sequence:012}\n\nKind: {}\n\nThrough event sequence: {}\n\n",
         match checkpoint.checkpoint_kind {
             CheckpointKind::Narrative => "narrative",
             CheckpointKind::Transition => "transition",
@@ -269,16 +269,16 @@ pub fn submit_provider_narrative(
     narrative: &NarrativeInput,
 ) -> Result<PathBuf> {
     narrative.validate(u64::MAX)?;
-    let root = required_path(environment, "SESH_HOME")?;
+    let root = required_path(environment, "HANDOVER_HOME")?;
     let root = resolve_from_current_dir(root)?;
     validate_private_directory(&root)?;
     let root = root
         .canonicalize()
-        .map_err(|source| crate::error::io("SESH_HOME", source))?;
-    let session_id = SessionId::parse(required_utf8(environment, "SESH_SESSION_ID")?)
-        .map_err(|error| Error::InvalidState(format!("invalid SESH_SESSION_ID: {error}")))?;
-    let run_id = RunId::parse(required_utf8(environment, "SESH_RUN_ID")?)
-        .map_err(|error| Error::InvalidState(format!("invalid SESH_RUN_ID: {error}")))?;
+        .map_err(|source| crate::error::io("HANDOVER_HOME", source))?;
+    let session_id = SessionId::parse(required_utf8(environment, "HANDOVER_SESSION_ID")?)
+        .map_err(|error| Error::InvalidState(format!("invalid HANDOVER_SESSION_ID: {error}")))?;
+    let run_id = RunId::parse(required_utf8(environment, "HANDOVER_RUN_ID")?)
+        .map_err(|error| Error::InvalidState(format!("invalid HANDOVER_RUN_ID: {error}")))?;
     let expected = root
         .join("sessions")
         .join(session_id.to_string())
@@ -289,12 +289,13 @@ pub fn submit_provider_narrative(
     let expected = expected
         .canonicalize()
         .map_err(|source| crate::error::io(&expected, source))?;
-    let supplied = resolve_from_current_dir(required_path(environment, "SESH_CHECKPOINT_INBOX")?)?
-        .canonicalize()
-        .map_err(|source| crate::error::io("SESH_CHECKPOINT_INBOX", source))?;
+    let supplied =
+        resolve_from_current_dir(required_path(environment, "HANDOVER_CHECKPOINT_INBOX")?)?
+            .canonicalize()
+            .map_err(|source| crate::error::io("HANDOVER_CHECKPOINT_INBOX", source))?;
     if supplied != expected {
         return Err(Error::InvalidState(
-            "SESH_CHECKPOINT_INBOX does not match the active run inbox".into(),
+            "HANDOVER_CHECKPOINT_INBOX does not match the active run inbox".into(),
         ));
     }
 
@@ -333,7 +334,7 @@ pub fn edit_narrative(state_root: &Path, environment: &Environment) -> Result<Na
         .or_else(|| environment.get("EDITOR").filter(|value| !value.is_empty()))
         .ok_or_else(|| {
             Error::InvalidState(
-                "no editor configured; pipe JSON to `sesh checkpoint --format json`".into(),
+                "no editor configured; pipe JSON to `handover checkpoint --format json`".into(),
             )
         })?;
     let editor = editor
@@ -485,7 +486,7 @@ fn validate_private_directory(path: &Path) -> Result<()> {
 fn validate_private_directory_chain(root: &Path, leaf: &Path) -> Result<()> {
     let relative = leaf
         .strip_prefix(root)
-        .map_err(|_| Error::InvalidState("checkpoint inbox is outside SESH_HOME".into()))?;
+        .map_err(|_| Error::InvalidState("checkpoint inbox is outside HANDOVER_HOME".into()))?;
     validate_private_directory(root)?;
     let mut current = root.to_path_buf();
     for component in relative.components() {
@@ -704,7 +705,7 @@ mod tests {
         let error = edit_narrative(temp.path(), &Environment::default())
             .unwrap_err()
             .to_string();
-        assert!(error.contains("pipe JSON to `sesh checkpoint --format json`"));
+        assert!(error.contains("pipe JSON to `handover checkpoint --format json`"));
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
     }
 

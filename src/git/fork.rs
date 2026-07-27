@@ -244,10 +244,10 @@ pub fn default_target(source_worktree: &Path, operation_id: &str) -> Result<Fork
     let parent = source_worktree
         .parent()
         .ok_or_else(|| Error::InvalidState("source worktree has no parent directory".into()))?;
-    let worktree = parent.join(format!("{basename_utf8}-sesh-{short_id}"));
+    let worktree = parent.join(format!("{basename_utf8}-handover-{short_id}"));
 
     Ok(ForkTarget {
-        branch: format!("sesh/{branch_component}-{short_id}"),
+        branch: format!("handover/{branch_component}-{short_id}"),
         worktree,
     })
 }

@@ -1,5 +1,5 @@
-use sesh::model::Provider;
-use sesh::provider::hook::{
+use handover::model::Provider;
+use handover::provider::hook::{
     HookEvent, capture_failure_output, normalize, session_start_output, stale_narrative_output,
 };
 
@@ -111,7 +111,7 @@ fn capture_failure_blocks_before_work_for_both_providers() {
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
                     "permissionDecision": "deny",
-                    "permissionDecisionReason": "Sesh capture failed: disk full"
+                    "permissionDecisionReason": "Handover capture failed: disk full"
                 }
             })
         );
@@ -121,7 +121,7 @@ fn capture_failure_blocks_before_work_for_both_providers() {
             serde_json::from_str::<serde_json::Value>(&prompt.stdout).unwrap(),
             serde_json::json!({
                 "decision": "block",
-                "reason": "Sesh capture failed: disk full"
+                "reason": "Handover capture failed: disk full"
             })
         );
 
@@ -130,7 +130,7 @@ fn capture_failure_blocks_before_work_for_both_providers() {
             serde_json::from_str::<serde_json::Value>(&post_tool.stdout).unwrap(),
             serde_json::json!({
                 "continue": false,
-                "stopReason": "Sesh capture failed: disk full"
+                "stopReason": "Handover capture failed: disk full"
             })
         );
     }
@@ -347,8 +347,8 @@ fn stale_narrative_output_is_exactly_one_system_message() {
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&stale.stdout).unwrap(),
         serde_json::json!({
-            "systemMessage": "Sesh: 27 events since the last narrative checkpoint. \
-             Ask the agent to checkpoint, or run `sesh checkpoint`."
+            "systemMessage": "Handover: 27 events since the last narrative checkpoint. \
+             Ask the agent to checkpoint, or run `handover checkpoint`."
         })
     );
 
@@ -356,8 +356,8 @@ fn stale_narrative_output_is_exactly_one_system_message() {
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&never.stdout).unwrap(),
         serde_json::json!({
-            "systemMessage": "Sesh: 27 events and no narrative checkpoint yet. \
-             Ask the agent to checkpoint, or run `sesh checkpoint`."
+            "systemMessage": "Handover: 27 events and no narrative checkpoint yet. \
+             Ask the agent to checkpoint, or run `handover checkpoint`."
         })
     );
 

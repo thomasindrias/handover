@@ -23,19 +23,19 @@ set -euo pipefail
 if [[ ${1:-} == "--help" ]]; then printf '%s\n' '--plugin-dir --add-dir'; exit 0; fi
 if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake 1'; exit 0; fi
 cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
-printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}' | "$SESH_HOOK_BIN" __hook claude >/dev/null
+printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}' | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null
 sleep 0.5
-journal="$SESH_HOME/sessions/$SESH_SESSION_ID/events.jsonl"
+journal="$HANDOVER_HOME/sessions/$HANDOVER_SESSION_ID/events.jsonl"
 chmod 0400 "$journal"
-first=$(printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"touch intended"},"tool_use_id":"tool-1"}' | "$SESH_HOOK_BIN" __hook claude)
-printf '%s' "$first" > "$SESH_TEST_TRACE/first.json"
-if [[ $first != *permissionDecision*deny* ]]; then touch "$SESH_TEST_TRACE/intended"; fi
+first=$(printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"touch intended"},"tool_use_id":"tool-1"}' | "$HANDOVER_HOOK_BIN" __hook claude)
+printf '%s' "$first" > "$HANDOVER_TEST_TRACE/first.json"
+if [[ $first != *permissionDecision*deny* ]]; then touch "$HANDOVER_TEST_TRACE/intended"; fi
 chmod 0600 "$journal"
-touch "$SESH_TEST_TRACE/ready"
-while [[ ! -e "$SESH_TEST_TRACE/continue" ]]; do sleep 0.05; done
-second=$(printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"touch intended"},"tool_use_id":"tool-2"}' | "$SESH_HOOK_BIN" __hook claude)
-printf '%s' "$second" > "$SESH_TEST_TRACE/second.json"
-if [[ -z $second ]]; then touch "$SESH_TEST_TRACE/intended"; fi
+touch "$HANDOVER_TEST_TRACE/ready"
+while [[ ! -e "$HANDOVER_TEST_TRACE/continue" ]]; do sleep 0.05; done
+second=$(printf '%s' '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"touch intended"},"tool_use_id":"tool-2"}' | "$HANDOVER_HOOK_BIN" __hook claude)
+printf '%s' "$second" > "$HANDOVER_TEST_TRACE/second.json"
+if [[ -z $second ]]; then touch "$HANDOVER_TEST_TRACE/intended"; fi
 exit 0
 "#,
     );
@@ -45,10 +45,10 @@ exit 0
     );
     let state = temp.path().join("state");
     let path = path_with(&bin);
-    let mut run = Command::new(env!("CARGO_BIN_EXE_sesh"))
+    let mut run = Command::new(env!("CARGO_BIN_EXE_handover"))
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
-        .env("SESH_TEST_TRACE", &trace)
+        .env("HANDOVER_HOME", &state)
+        .env("HANDOVER_TEST_TRACE", &trace)
         .env("PATH", &path)
         .args(["run", "claude"])
         .stdout(Stdio::null())
@@ -77,9 +77,9 @@ exit 0
         .path();
     assert!(run_dir.join("capture-failed.json").exists());
 
-    let repair = Command::new(env!("CARGO_BIN_EXE_sesh"))
+    let repair = Command::new(env!("CARGO_BIN_EXE_handover"))
         .current_dir(&repo)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", &path)
         .args(["doctor", "--json", "--repair"])
         .output()

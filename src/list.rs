@@ -79,7 +79,7 @@ fn degraded_row(name: &str, diagnostic: &str) -> serde_json::Value {
     serde_json::json!({
         "session_id": name,
         "degraded": true,
-        "diagnostics": [format!("{diagnostic}; run sesh doctor")],
+        "diagnostics": [format!("{diagnostic}; run handover doctor")],
         "repository": null,
         "worktree": null,
         "branch": null,

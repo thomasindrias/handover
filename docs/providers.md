@@ -1,12 +1,12 @@
 # Provider integrations
 
-Sesh V1 supports Claude Code and Codex as interchangeable clients of the same
+Handover V1 supports Claude Code and Codex as interchangeable clients of the same
 local session. Provider adapters translate lifecycle details; they do not own
 session history or narrative.
 
 ## Prerequisites
 
-Install and authenticate the provider CLI using its official instructions. Sesh
+Install and authenticate the provider CLI using its official instructions. Handover
 does not manage provider credentials.
 
 Confirm the executables you intend to use are available:
@@ -16,15 +16,15 @@ claude --version
 codex --version
 ```
 
-Then materialize and review Sesh's integration assets:
+Then materialize and review Handover's integration assets:
 
 ```bash
-sesh setup claude
-sesh setup codex
-sesh doctor
+handover setup claude
+handover setup codex
+handover doctor
 ```
 
-Setup writes versioned, inspectable assets under Sesh's private state directory.
+Setup writes versioned, inspectable assets under Handover's private state directory.
 For provider trust steps it opens the provider interactively for review without
 supplying a task prompt. It does not edit an application repository, replace
 global user configuration, bypass managed policy, or silently grant trust.
@@ -35,22 +35,22 @@ Provider arguments after `--` are passed directly as an argument vector, never
 through a shell:
 
 ```bash
-sesh run claude -- --model sonnet
-sesh switch codex -- --model gpt-5
+handover run claude -- --model sonnet
+handover switch codex -- --model gpt-5
 ```
 
 The adapter launches with the caller's terminal and a verified cwd. It receives
-private paths through environment variables, including `SESH_HOOK_BIN` and the
-current run inbox. A switch or fork also receives Sesh's fixed bootstrap message
-and a deterministic handoff. Do not provide a second positional task prompt on
+private paths through environment variables, including `HANDOVER_HOOK_BIN` and the
+current run inbox. A switch or fork also receives Handover's fixed bootstrap message
+and a deterministic handover. Do not provide a second positional task prompt on
 those commands.
 
-The handoff includes the last explicit narrative checkpoint, current verified
+The handover includes the last explicit narrative checkpoint, current verified
 Git facts, recent activity and failures, provider transition, fork lineage when
 present, omissions, and the expected next action. It is generated from committed
-Sesh state rather than a provider transcript.
+Handover state rather than a provider transcript.
 
-`sesh handoff <provider> [--json]` renders this same content without
+`handover preview <provider> [--json]` renders this same content without
 switching: no event is appended, no checkpoint is committed, and no
 provider launches. It applies the same fail-closed snapshot verification as
 `switch`, so a missing or stale narrative checkpoint is visible before a
@@ -60,7 +60,7 @@ switch is spent.
 
 A checkpoint is the portable narrative that observed activity cannot supply.
 Providers should write one after a meaningful unit of work and before a likely
-handoff. Humans can create the same checkpoint directly.
+handover. Humans can create the same checkpoint directly.
 
 The JSON shape is:
 
@@ -87,20 +87,20 @@ The JSON shape is:
 For a human-authored checkpoint:
 
 ```bash
-sesh checkpoint --format json < checkpoint.json
+handover checkpoint --format json < checkpoint.json
 ```
 
-With terminal stdin, `sesh checkpoint` opens a private temporary JSON template
+With terminal stdin, `handover checkpoint` opens a private temporary JSON template
 using `$VISUAL`, then `$EDITOR`. The temporary file is removed after parsing.
 
 An attached provider must submit through its run-scoped inbox:
 
 ```bash
 printf '%s' "$CHECKPOINT_JSON" \
-  | "$SESH_HOOK_BIN" checkpoint --format json --from-provider
+  | "$HANDOVER_HOOK_BIN" checkpoint --format json --from-provider
 ```
 
-Sesh requires a nonempty objective and summary, at least one next step, bounded
+Handover requires a nonempty objective and summary, at least one next step, bounded
 fields and item counts, and sorted unique event references that already exist.
 Unknown fields and oversized payloads are rejected.
 
@@ -126,7 +126,7 @@ or fields do not become canonical data automatically. Hook input is size-bounded
 sensitive environment values are not copied, and canonical writes still pass
 through session locks and schema validation.
 
-On `Stop`, Sesh may reply with a single `systemMessage` warning when 20 or
+On `Stop`, Handover may reply with a single `systemMessage` warning when 20 or
 more events have been observed since the latest narrative checkpoint. The
 shape follows Claude Code's documented Stop-hook output contract, which
 validates Stop output strictly; the warning never blocks the stop and a
@@ -144,9 +144,9 @@ definitions, loaded per session via `--plugin-dir`. Codex assets are stored
 as a versioned `hooks.json`; each launch gives the child process a private,
 per-run `CODEX_HOME` containing that file plus best-effort symlinks to the
 user's real `config.toml`/`auth.json`, so login and preferences carry over
-without Sesh ever writing to the user's actual `~/.codex` or the target
-repository. `sesh doctor` checks that materialized assets still match the
-Sesh version.
+without Handover ever writing to the user's actual `~/.codex` or the target
+repository. `handover doctor` checks that materialized assets still match the
+Handover version.
 
 ## Optional smoke tests
 
@@ -158,7 +158,7 @@ integration asset without starting a model conversation:
 
 ```bash
 cargo test --test provider_smoke -- --ignored --exact \
-  claude_validates_the_materialized_sesh_plugin_without_opening_a_session
+  claude_validates_the_materialized_handover_plugin_without_opening_a_session
 ```
 
 It runs plugin validation against a temporary materialization. Codex has no
@@ -172,11 +172,11 @@ the hooks requires a real, manually run session.
 
 Provider releases can change their CLI or hook contracts. When an optional smoke
 test fails, inspect the installed provider version and adapter assets before
-changing Sesh's provider-neutral session model.
+changing Handover's provider-neutral session model.
 
 ## Adding a provider
 
 A new adapter must be able to probe the executable, prepare a launch without
 replacing user configuration, normalize supported hooks, and inject the current
-Sesh protocol and handoff. It must preserve the same storage, Git, checkpoint,
-lease, and handoff contracts and must be testable without calling a real model.
+Handover protocol and handover. It must preserve the same storage, Git, checkpoint,
+lease, and handover contracts and must be testable without calling a real model.

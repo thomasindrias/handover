@@ -47,7 +47,7 @@ impl Diagnostic {
             code: code.into(),
             severity: "warning".into(),
             message: message.into(),
-            repair_command: repairable.then(|| "sesh doctor --repair".into()),
+            repair_command: repairable.then(|| "handover doctor --repair".into()),
             command: None,
             command_argv: None,
         }
@@ -68,10 +68,10 @@ impl Diagnostic {
 pub fn check_format(layout: &StateLayout) -> Vec<Diagnostic> {
     let path = layout.root().join("FORMAT");
     match read_private(&path) {
-        Ok(bytes) if bytes == b"sesh-state 1\n" => Vec::new(),
+        Ok(bytes) if bytes == b"handover-state 1\n" => Vec::new(),
         Ok(_) => vec![Diagnostic::error(
             "format.unsupported",
-            format!("{} does not contain `sesh-state 1`", path.display()),
+            format!("{} does not contain `handover-state 1`", path.display()),
         )],
         Err(error) => vec![Diagnostic::error(
             "format.unavailable",
@@ -88,7 +88,7 @@ pub fn check_permissions(layout: &StateLayout) -> Vec<Diagnostic> {
 }
 
 /// A provider's private home holds files the provider writes with its own
-/// permissions, so Sesh guarantees the `0700` container and stops there.
+/// permissions, so Handover guarantees the `0700` container and stops there.
 fn is_provider_owned_home(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return false;
@@ -119,7 +119,7 @@ fn check_permission_path(root: &Path, path: &Path, diagnostics: &mut Vec<Diagnos
     };
     // SAFETY: geteuid has no preconditions and does not dereference pointers.
     let effective_uid = unsafe { libc::geteuid() };
-    // Sesh writes only regular files and directories here, so a link is anomalous.
+    // Handover writes only regular files and directories here, so a link is anomalous.
     if metadata.file_type().is_symlink() {
         diagnostics.push(Diagnostic::error(
             "permissions.insecure",
@@ -264,7 +264,7 @@ pub fn check_integrations(layout: &StateLayout) -> Vec<Diagnostic> {
                 let executable = provider.executable();
                 // Never running setup is the ordinary first-run state, not corruption.
                 if !integrations.join(executable).exists() {
-                    let setup = format!("sesh setup {executable}");
+                    let setup = format!("handover setup {executable}");
                     return Diagnostic {
                         code: "integration.missing".into(),
                         severity: "error".into(),
@@ -648,7 +648,7 @@ fn fork_diagnostic(
             operation.target_worktree.display(),
             operation.target_branch,
         ),
-        repair_command: repairable.then(|| "sesh doctor --repair".into()),
+        repair_command: repairable.then(|| "handover doctor --repair".into()),
         command: Some(display),
         command_argv: Some(argv),
     }
@@ -711,7 +711,7 @@ fn check_handshake_timeout(envelopes: &[EventEnvelope], diagnostics: &mut Vec<Di
         return;
     }
     let described = run_id.map_or_else(|| "a run".to_owned(), |id| format!("run {id}"));
-    // An earlier handshake proves the provider's hooks reach Sesh, so this run
+    // An earlier handshake proves the provider's hooks reach Handover, so this run
     // died for its own reasons. Without one, the integration itself is suspect.
     if envelopes
         .iter()
@@ -727,7 +727,7 @@ fn check_handshake_timeout(envelopes: &[EventEnvelope], diagnostics: &mut Vec<Di
             "run.session_start_timeout",
             format!(
                 "{described} stopped without a SessionStart handshake, and no run in this session \
-                 has ever handshaken; check the provider integration with `sesh setup <provider>`"
+                 has ever handshaken; check the provider integration with `handover setup <provider>`"
             ),
         ));
     }
@@ -1062,8 +1062,11 @@ mod tests {
             .iter()
             .find(|item| item.code == "integration.missing")
             .expect("claude was never set up");
-        assert!(missing.message.contains("sesh setup claude"));
-        assert_eq!(missing.repair_command.as_deref(), Some("sesh setup claude"));
+        assert!(missing.message.contains("handover setup claude"));
+        assert_eq!(
+            missing.repair_command.as_deref(),
+            Some("handover setup claude")
+        );
         assert!(
             !diagnostics
                 .iter()
@@ -1096,7 +1099,7 @@ mod tests {
         assert_eq!(
             check_permissions(&layout),
             Vec::new(),
-            "a Codex run must not leave `sesh doctor` reporting its own state as insecure"
+            "a Codex run must not leave `handover doctor` reporting its own state as insecure"
         );
     }
 
@@ -1116,7 +1119,7 @@ mod tests {
         assert_eq!(
             check_permissions(&layout),
             Vec::new(),
-            "Sesh guarantees the 0700 container, not files the provider writes inside it"
+            "Handover guarantees the 0700 container, not files the provider writes inside it"
         );
 
         std::fs::set_permissions(&codex_home, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1140,7 +1143,7 @@ mod tests {
             check_permissions(&layout)
                 .iter()
                 .any(|item| item.code == "permissions.insecure"),
-            "Sesh writes only regular files and directories into canonical state"
+            "Handover writes only regular files and directories into canonical state"
         );
     }
 

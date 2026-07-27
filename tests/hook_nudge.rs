@@ -13,7 +13,7 @@ const CHECKPOINT_JSON: &str = r#"{"objective":"Implement OAuth callback","summar
 fn fake_claude(bin: &std::path::Path, cycles: u32, checkpoint_before_stop: bool) {
     let checkpoint_line = if checkpoint_before_stop {
         format!(
-            r#"printf '%s' '{CHECKPOINT_JSON}' | "$SESH_HOOK_BIN" checkpoint --format json --from-provider"#
+            r#"printf '%s' '{CHECKPOINT_JSON}' | "$HANDOVER_HOOK_BIN" checkpoint --format json --from-provider"#
         )
     } else {
         String::new()
@@ -23,14 +23,14 @@ fn fake_claude(bin: &std::path::Path, cycles: u32, checkpoint_before_stop: bool)
 set -euo pipefail
 if [[ ${{1:-}} == "--version" ]]; then printf '%s\n' 'fake-claude 1.0'; exit 0; fi
 cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
-hook() {{ printf '%s' "$1" | "$SESH_HOOK_BIN" __hook claude >/dev/null; }}
+hook() {{ printf '%s' "$1" | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null; }}
 hook '{{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}}'
 for i in $(seq 1 {cycles}); do
   hook '{{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{{"command":"cargo test case-'"$i"'"}},"tool_use_id":"tool-'"$i"'"}}'
   hook '{{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{{"command":"cargo test case-'"$i"'"}},"tool_response":{{"stdout":"ok","stderr":"","exit_code":0}},"tool_use_id":"tool-'"$i"'"}}'
 done
 {checkpoint_line}
-printf '%s' '{{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"Stop"}}' | "$SESH_HOOK_BIN" __hook claude > "$NUDGE_CAPTURE"
+printf '%s' '{{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"Stop"}}' | "$HANDOVER_HOOK_BIN" __hook claude > "$NUDGE_CAPTURE"
 exit 0
 "#
     );
@@ -57,9 +57,9 @@ fn run_fake_claude(cycles: u32, checkpoint_before_stop: bool) -> NudgeRun {
     let capture = temp.path().join("stop-output.json");
     let path = path_with(&bin);
 
-    cargo_bin_cmd!("sesh")
+    cargo_bin_cmd!("handover")
         .current_dir(&cwd)
-        .env("SESH_HOME", &state)
+        .env("HANDOVER_HOME", &state)
         .env("PATH", &path)
         .env("NUDGE_CAPTURE", &capture)
         .args(["run", "claude"])
@@ -75,9 +75,9 @@ fn run_fake_claude(cycles: u32, checkpoint_before_stop: bool) -> NudgeRun {
 }
 
 fn status_json(run: &NudgeRun) -> serde_json::Value {
-    let output = cargo_bin_cmd!("sesh")
+    let output = cargo_bin_cmd!("handover")
         .current_dir(&run.repo)
-        .env("SESH_HOME", &run.state)
+        .env("HANDOVER_HOME", &run.state)
         .args(["status", "--json"])
         .output()
         .unwrap();
@@ -98,8 +98,8 @@ fn stop_warns_with_a_single_system_message_once_twenty_events_are_stale() {
         message.contains("events and no narrative checkpoint yet"),
         "unexpected message: {message}"
     );
-    assert!(message.starts_with("Sesh: "));
-    assert!(message.ends_with("run `sesh checkpoint`."));
+    assert!(message.starts_with("Handover: "));
+    assert!(message.ends_with("run `handover checkpoint`."));
 
     let status = status_json(&run);
     assert!(status["latest_narrative_checkpoint"].is_null());

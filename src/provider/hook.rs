@@ -161,12 +161,12 @@ pub fn normalize(provider: Provider, bytes: &[u8]) -> Result<NormalizedHook> {
     })
 }
 
-pub fn session_start_output(handoff: &str) -> HookOutput {
+pub fn session_start_output(handover: &str) -> HookOutput {
     HookOutput {
         stdout: serde_json::json!({
             "hookSpecificOutput": {
                 "hookEventName": "SessionStart",
-                "additionalContext": handoff
+                "additionalContext": handover
             }
         })
         .to_string(),
@@ -178,13 +178,13 @@ pub fn session_start_output(handoff: &str) -> HookOutput {
 pub fn stale_narrative_output(events_since: u64, has_narrative_checkpoint: bool) -> HookOutput {
     let message = if has_narrative_checkpoint {
         format!(
-            "Sesh: {events_since} events since the last narrative checkpoint. \
-             Ask the agent to checkpoint, or run `sesh checkpoint`."
+            "Handover: {events_since} events since the last narrative checkpoint. \
+             Ask the agent to checkpoint, or run `handover checkpoint`."
         )
     } else {
         format!(
-            "Sesh: {events_since} events and no narrative checkpoint yet. \
-             Ask the agent to checkpoint, or run `sesh checkpoint`."
+            "Handover: {events_since} events and no narrative checkpoint yet. \
+             Ask the agent to checkpoint, or run `handover checkpoint`."
         )
     };
     HookOutput {
@@ -196,7 +196,7 @@ pub fn stale_narrative_output(events_since: u64, has_narrative_checkpoint: bool)
 
 pub fn capture_failure_output(_provider: Provider, event: &str, message: &str) -> HookOutput {
     let reason = format!(
-        "Sesh capture failed: {}",
+        "Handover capture failed: {}",
         truncate_utf8(message, MAX_FAILURE_MESSAGE_BYTES)
     );
     let stdout = match event {

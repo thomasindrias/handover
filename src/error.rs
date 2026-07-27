@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("HOME is not set and neither SESH_HOME nor XDG_STATE_HOME is available")]
+    #[error("HOME is not set and neither HANDOVER_HOME nor XDG_STATE_HOME is available")]
     StateHomeUnavailable,
     #[error("I/O error at {path}: {source}")]
     Io {

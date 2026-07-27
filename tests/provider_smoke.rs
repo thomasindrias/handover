@@ -1,13 +1,13 @@
 use std::process::Command;
 
-use sesh::model::Provider;
-use sesh::provider::adapter;
-use sesh::store::StateLayout;
+use handover::model::Provider;
+use handover::provider::adapter;
+use handover::store::StateLayout;
 use tempfile::TempDir;
 
 #[test]
 #[ignore = "requires the provider CLI to be installed"]
-fn claude_validates_the_materialized_sesh_plugin_without_opening_a_session() {
+fn claude_validates_the_materialized_handover_plugin_without_opening_a_session() {
     let temp = TempDir::new().unwrap();
     let layout = StateLayout::new(temp.path().join("state"));
     layout.ensure().unwrap();
@@ -17,7 +17,7 @@ fn claude_validates_the_materialized_sesh_plugin_without_opening_a_session() {
     let plugin = layout.integrations().join("claude/1");
 
     let output = Command::new("claude")
-        .env("SESH_HOME", layout.root())
+        .env("HANDOVER_HOME", layout.root())
         .args(["plugin", "validate"])
         .arg(&plugin)
         .output()
