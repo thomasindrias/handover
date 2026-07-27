@@ -106,7 +106,9 @@ a new Git worktree. Ignored files are intentionally excluded.
 
 The [architecture](docs/architecture.md) documents the storage model,
 transactions, and guarantees. [Provider integrations](docs/providers.md)
-explains setup, checkpoints, handoffs, and smoke tests.
+explains setup, checkpoints, handoffs, and smoke tests. The
+[MCP server](docs/mcp.md) documents `sesh mcp-server` for programmatic tool
+access from an attached provider.
 
 ## Security
 

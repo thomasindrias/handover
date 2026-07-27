@@ -12,6 +12,7 @@ pub struct RepositoryFingerprint {
     index: String,
 }
 
+#[allow(dead_code)]
 pub fn git(cwd: &Path, args: &[&str]) {
     let output = Command::new("git")
         .arg("--no-pager")
@@ -28,6 +29,7 @@ pub fn git(cwd: &Path, args: &[&str]) {
     );
 }
 
+#[allow(dead_code)]
 pub fn init_repo(path: &Path) {
     std::fs::create_dir_all(path).unwrap();
     git(path, &["init", "-b", "main"]);

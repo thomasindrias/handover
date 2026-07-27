@@ -136,8 +136,8 @@ refuses with the holding provider, pid, and start time; a same-host dead
 lease is recovered only after an explicit `[y/N]` prompt (or
 `--recover-lease` non-interactively), never silently. `sesh status` reports
 a `switch_readiness` block — lease state, narrative checkpoint freshness,
-and handoff renderability — so this can be checked before quitting the
-current provider.
+handoff renderability, and the suggested switch command — so this can be
+checked before quitting the current provider.
 
 ## Fork transaction
 
@@ -209,9 +209,34 @@ identifiers and an inbox path inherited by launched provider descendants. This
 does not prove process ancestry and is not a same-user authorization boundary.
 Human checkpoints use a separate path.
 
+The MCP server guard exception ("MCP server" below) is a concrete instance of
+this boundary: it lets an attached provider read, through a different path,
+what same-user access already permits.
+
 ## V1 non-goals
 
 V1 does not include cloud or multi-machine synchronization, remote MCP, team
 sharing, embeddings, semantic retrieval, transcript scraping, autonomous agent
 orchestration, Windows support, or worktree creation during normal switching.
 These boundaries keep the core continuation path small and auditable.
+
+## MCP server
+
+`sesh mcp-server` (`docs/mcp.md`) exposes `list`, `handoff`, and `status` as
+MCP tools over stdio. `provider_command_allowed` (src/app.rs) has one
+explicit exception for `Command::McpServer` so the subcommand can start even
+when `SESH_RUN_ID` is set — the situation it's built for, since an MCP client
+spawns the server as a subprocess of the very provider Sesh launched. No
+other command's behavior under that guard changes. Tool calls run the same
+value-producing code the CLI uses, entirely in-process — never a subprocess,
+never a second pass through the CLI dispatcher.
+
+This exception widens what an attached provider can read. Through the MCP
+tools it now receives the exact `list`, `handoff`, and `status` output that
+`provider_command_allowed` refuses it via the CLI. `list` in particular is
+not scoped to the attached session: it reports the repository path, worktree
+path, and branch for every session on the machine. This is acceptable
+because all three tools are pure reads with no mutation path, the guard is a
+soft guardrail against accidental misuse rather than an authorization
+boundary, and a provider process running as the same Unix user can already
+read `$SESH_HOME` directly (see "Security boundary" above).

@@ -124,6 +124,7 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
             setup_command(provider, environment, stdin.is_terminal())
         }
         Command::Doctor { json, repair } => doctor_command(json, repair, environment),
+        Command::McpServer => crate::mcp::mcp_server_command(environment),
         Command::Hook { provider } => {
             if ["SESH_HOME", "SESH_SESSION_ID", "SESH_RUN_ID"]
                 .into_iter()
@@ -151,6 +152,7 @@ fn provider_command_allowed(command: &Command) -> bool {
                 from_provider: true,
                 ..
             }
+            | Command::McpServer
     )
 }
 
@@ -1051,7 +1053,7 @@ fn handoff_command(provider: Provider, json: bool, environment: &Environment) ->
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_handoff_projection(
+fn build_handoff_value(
     store: &SessionStore,
     from_provider: Option<Provider>,
     to_provider: Provider,
@@ -1061,8 +1063,8 @@ fn write_handoff_projection(
     narrative_checkpoint: Option<(u64, Checkpoint)>,
     capture_gaps: Vec<CaptureGap>,
     rendered: &crate::handoff::RenderedHandoff,
-) -> Result<i32> {
-    let value = serde_json::json!({
+) -> serde_json::Value {
+    serde_json::json!({
         "schema_version": 1,
         "session_id": store.id(),
         "from_provider": from_provider,
@@ -1087,9 +1089,53 @@ fn write_handoff_projection(
         "omitted": rendered.omitted,
         "markdown_bytes": rendered.markdown.len(),
         "markdown": rendered.markdown,
-    });
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_handoff_projection(
+    store: &SessionStore,
+    from_provider: Option<Provider>,
+    to_provider: Provider,
+    transition_sequence: u64,
+    through_sequence: u64,
+    events: &[Event],
+    narrative_checkpoint: Option<(u64, Checkpoint)>,
+    capture_gaps: Vec<CaptureGap>,
+    rendered: &crate::handoff::RenderedHandoff,
+) -> Result<i32> {
+    let value = build_handoff_value(
+        store,
+        from_provider,
+        to_provider,
+        transition_sequence,
+        through_sequence,
+        events,
+        narrative_checkpoint,
+        capture_gaps,
+        rendered,
+    );
     write_projection(&value, true)?;
     Ok(0)
+}
+
+pub(crate) fn mcp_handoff_value(
+    provider: Provider,
+    environment: &Environment,
+) -> Result<serde_json::Value> {
+    let (_layout, snapshot, store) = current_session(environment)?;
+    let preview = preview_handoff(&store, &snapshot, provider)?;
+    Ok(build_handoff_value(
+        &store,
+        preview.from_provider,
+        provider,
+        preview.transition_sequence,
+        preview.through_sequence,
+        &preview.events,
+        preview.narrative_checkpoint,
+        preview.capture_gaps,
+        &preview.rendered,
+    ))
 }
 
 fn confirm_lease_recovery(
@@ -1589,7 +1635,7 @@ fn classify_lease(leases: &LeaseStore) -> Result<(&'static str, Option<String>)>
     ))
 }
 
-fn status_command(json: bool, environment: &Environment) -> Result<i32> {
+pub(crate) fn build_status_value(environment: &Environment) -> Result<serde_json::Value> {
     let (_layout, snapshot, store) = current_session(environment)?;
     let events = store.events()?;
     let provider = previous_provider(&events)?;
@@ -1613,7 +1659,7 @@ fn status_command(json: bool, environment: &Environment) -> Result<i32> {
             Err(error) => (false, Some(error.to_string())),
         };
     let ready = lease_state == "free" && handoff_renderable;
-    let value = serde_json::json!({
+    Ok(serde_json::json!({
         "schema_version": 1,
         "session_id": store.id(),
         "provider": provider,
@@ -1642,8 +1688,19 @@ fn status_command(json: bool, environment: &Environment) -> Result<i32> {
             "checkpoint_fresh": checkpoint_fresh,
             "handoff_renderable": handoff_renderable,
             "handoff_error": handoff_error,
+            "suggested_switch_command": format!("sesh switch {}", target_provider.executable()),
         },
-    });
+    }))
+}
+
+pub(crate) fn mcp_list_value(environment: &Environment) -> Result<serde_json::Value> {
+    let cwd = std::env::current_dir().map_err(|source| io(".", source))?;
+    let layout = resolve_layout(environment, &cwd)?;
+    crate::list::build_list_value(&layout)
+}
+
+fn status_command(json: bool, environment: &Environment) -> Result<i32> {
+    let value = build_status_value(environment)?;
     write_projection(&value, json)?;
     Ok(0)
 }
@@ -2660,12 +2717,14 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        classify_lease, command_facts, confirm_lease_recovery, latest_narrative_checkpoint,
-        recover_stale_lease_for_switch, resolve_provider_home, stop_nudge, with_rename_rollback,
+        build_handoff_value, classify_lease, command_facts, confirm_lease_recovery,
+        latest_narrative_checkpoint, recover_stale_lease_for_switch, resolve_provider_home,
+        stop_nudge, with_rename_rollback,
     };
     use crate::error::Error;
+    use crate::handoff::{CaptureGap, RenderedHandoff};
     use crate::model::{
-        CheckpointAuthor, CheckpointKind, ContentRef, Event, EventKind, GitSnapshot,
+        Checkpoint, CheckpointAuthor, CheckpointKind, ContentRef, Event, EventKind, GitSnapshot,
         NarrativeInput, Provider, RunId, SessionId, WorktreeIdentity,
     };
     use crate::runtime::Runtime;
@@ -2730,6 +2789,56 @@ mod tests {
         assert!(latest_narrative_checkpoint(&store, &store.events().unwrap()).is_err());
         std::fs::remove_file(store.session_dir().join("refs/latest-narrative-checkpoint")).unwrap();
         assert!(latest_narrative_checkpoint(&store, &store.events().unwrap()).is_err());
+    }
+
+    #[test]
+    fn build_handoff_value_embeds_the_rendered_markdown_and_metadata() {
+        let (_temp, store) = store_fixture();
+        let events = vec![observed_event(
+            1,
+            EventKind::ProviderStopObserved {
+                native_session_id: "native".into(),
+            },
+        )];
+        let checkpoint = Checkpoint {
+            schema_version: 1,
+            checkpoint_kind: CheckpointKind::Narrative,
+            through_sequence: 0,
+            author: CheckpointAuthor::Human,
+            narrative: None,
+            narrative_checkpoint_sequence: None,
+        };
+        let rendered = RenderedHandoff {
+            markdown: "# Handoff\n".into(),
+            recent_event_sequences: vec![1],
+            omitted: false,
+        };
+        let gaps = vec![CaptureGap {
+            sequence: 1,
+            phase: "capture".into(),
+            message: "gap".into(),
+        }];
+
+        let value = build_handoff_value(
+            &store,
+            Some(Provider::Claude),
+            Provider::Codex,
+            2,
+            1,
+            &events,
+            Some((1, checkpoint)),
+            gaps,
+            &rendered,
+        );
+
+        assert_eq!(value["from_provider"], "claude");
+        assert_eq!(value["to_provider"], "codex");
+        assert_eq!(value["markdown"], "# Handoff\n");
+        assert_eq!(value["markdown_bytes"], "# Handoff\n".len());
+        assert_eq!(value["omitted"], false);
+        assert_eq!(value["narrative_checkpoint"]["sequence"], 1);
+        assert_eq!(value["narrative_checkpoint"]["events_since"], 0);
+        assert_eq!(value["capture_gaps"][0]["message"], "gap");
     }
 
     #[test]
