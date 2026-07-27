@@ -1,0 +1,169 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Building the matrix on changes to the pipeline itself proves the release
+  # works before a tag is spent, without rebuilding on every source change.
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "Formula/**"
+      - "scripts/update_formula.py"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  create:
+    name: create draft release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Verify the tag matches Cargo.toml
+        run: |
+          set -eu
+          manifest=$(cargo metadata --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          if [ "$manifest" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest" >&2
+            exit 1
+          fi
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release already exists"
+            exit 0
+          fi
+          python3 - "${GITHUB_REF_NAME#v}" <<'PY' > notes.md
+          import pathlib, re, sys
+          section = re.search(
+              rf"^## \[{re.escape(sys.argv[1])}\][^\n]*\n(.*?)(?=^## \[|\Z)",
+              pathlib.Path("CHANGELOG.md").read_text(),
+              re.M | re.S,
+          )
+          print((section.group(1) if section else "").strip())
+          PY
+          if [ -s notes.md ]; then
+            gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes
+          fi
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: [create]
+    # `create` is skipped on pull requests, where this job still proves the build.
+    if: always() && needs.create.result != 'failure' && needs.create.result != 'cancelled'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Verify the binary reports a version
+        # A cross-compiled binary cannot run on the builder, so only check native ones.
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: ./target/${{ matrix.target }}/release/sesh --version
+      - name: Package
+        id: package
+        run: |
+          set -eu
+          version=$(cargo metadata --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          archive="sesh-${version}-${{ matrix.target }}.tar.gz"
+          tar czf "$archive" -C "target/${{ matrix.target }}/release" sesh
+          printf 'archive=%s\n' "$archive" >> "$GITHUB_OUTPUT"
+      - name: Upload to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" "${{ steps.package.outputs.archive }}" --clobber
+
+  publish:
+    name: publish
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      # The formula commit lands on main, so check that out rather than the tag.
+      - name: Check out main
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+      - name: Collect release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          mkdir -p dist
+          gh release download "$GITHUB_REF_NAME" --dir dist --pattern '*.tar.gz'
+          cd dist
+          sha256sum ./*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/SHA256SUMS --clobber
+      - name: Update the Homebrew formula
+        run: python3 scripts/update_formula.py "${GITHUB_REF_NAME#v}" dist/SHA256SUMS
+      - name: Commit the formula
+        run: |
+          set -eu
+          if git diff --quiet -- Formula/sesh.rb; then
+            echo "formula already current"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/sesh.rb
+          git commit -m "chore: update Homebrew formula for $GITHUB_REF_NAME"
+          git push origin main
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest

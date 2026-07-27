@@ -1,3 +1,4 @@
 /target/
 /.sesh-test/
 /.superpowers/
+__pycache__/

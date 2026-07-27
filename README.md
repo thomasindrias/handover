@@ -28,11 +28,30 @@ service.
 
 ## Quick start
 
-Sesh V1 supports macOS and Linux. It requires Git, Rust 1.88 or newer, and an
-installed Claude Code or Codex CLI. There are no prebuilt binaries yet, so
-every install method compiles from source.
+Sesh V1 supports macOS and Linux, and needs Git plus an installed Claude Code or
+Codex CLI.
 
-Install with one command:
+With Homebrew:
+
+```bash
+brew tap thomasindrias/sesh https://github.com/thomasindrias/sesh
+brew install thomasindrias/sesh/sesh
+```
+
+The fully qualified name matters: an unrelated `sesh` already exists in
+homebrew-core, so a bare `brew install sesh` installs that one instead.
+
+Or download a prebuilt binary from the
+[latest release](https://github.com/thomasindrias/sesh/releases/latest) —
+macOS and Linux, Apple silicon and x86-64. Each release publishes a
+`SHA256SUMS` file to verify against:
+
+```bash
+tar xzf sesh-*.tar.gz
+install -m 755 sesh /usr/local/bin/sesh
+```
+
+Building from source needs Rust 1.88 or newer:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/thomasindrias/sesh/main/install.sh | sh
@@ -133,8 +152,8 @@ release.
 
 Planned, in rough order:
 
-- **Easier installs** — prebuilt binaries, a Homebrew formula, and a short
-  tutorial, so trying Sesh no longer requires a Rust toolchain.
+- **A short tutorial** — a walkthrough of a real switch, beyond the command
+  reference above.
 - **More providers** — Gemini CLI, opencode, Cursor CLI. Not every CLI exposes
   lifecycle hooks, so provider support will be tiered and documented honestly.
 - **Multi-machine** — sync through a private Git remote you control, and
