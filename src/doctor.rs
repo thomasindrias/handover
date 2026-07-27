@@ -707,10 +707,28 @@ fn check_handshake_timeout(envelopes: &[EventEnvelope], diagnostics: &mut Vec<Di
         item.event.run_id.as_ref() == run_id
             && matches!(item.event.kind, EventKind::RunStopped { .. })
     });
-    if !handshook && stopped {
+    if handshook || !stopped {
+        return;
+    }
+    let described = run_id.map_or_else(|| "a run".to_owned(), |id| format!("run {id}"));
+    // An earlier handshake proves the provider's hooks reach Sesh, so this run
+    // died for its own reasons. Without one, the integration itself is suspect.
+    if envelopes
+        .iter()
+        .any(|item| matches!(item.event.kind, EventKind::RunHandshake { .. }))
+    {
+        diagnostics.push(Diagnostic::warning(
+            "run.session_start_timeout",
+            format!("{described} stopped without a SessionStart handshake"),
+            false,
+        ));
+    } else {
         diagnostics.push(Diagnostic::error(
             "run.session_start_timeout",
-            format!("run {run_id:?} stopped without a SessionStart handshake"),
+            format!(
+                "{described} stopped without a SessionStart handshake, and no run in this session \
+                 has ever handshaken; check the provider integration with `sesh setup <provider>`"
+            ),
         ));
     }
 }
@@ -958,6 +976,77 @@ mod tests {
             check_sessions(&layout)
                 .iter()
                 .any(|item| item.code == "lease.live_orphan_child")
+        );
+    }
+
+    #[test]
+    fn a_failed_run_is_a_warning_once_the_session_has_proven_its_hooks_fire() {
+        let (_temp, layout, store) = fixture();
+        let working = RunId::new();
+        for kind in [
+            EventKind::RunStarted {
+                cwd: "/repo".into(),
+                args: Vec::new(),
+                supervisor_pid: u32::MAX,
+            },
+            EventKind::RunHandshake {
+                native_session_id: "native-1".into(),
+                provider_version: Some("1.0.0".into()),
+            },
+            EventKind::RunStopped {
+                exit_code: Some(0),
+                signal: None,
+            },
+        ] {
+            store
+                .append(
+                    &FixedRuntime,
+                    Some(working.clone()),
+                    Some(Provider::Claude),
+                    kind,
+                )
+                .unwrap();
+        }
+
+        let crashed = RunId::new();
+        for kind in [
+            EventKind::RunStarted {
+                cwd: "/repo".into(),
+                args: Vec::new(),
+                supervisor_pid: u32::MAX,
+            },
+            EventKind::RunStopped {
+                exit_code: Some(1),
+                signal: None,
+            },
+        ] {
+            store
+                .append(
+                    &FixedRuntime,
+                    Some(crashed.clone()),
+                    Some(Provider::Codex),
+                    kind,
+                )
+                .unwrap();
+        }
+
+        let diagnostic = check_sessions(&layout)
+            .into_iter()
+            .find(|item| item.code == "run.session_start_timeout")
+            .expect("the latest run never handshook");
+        assert_eq!(
+            diagnostic.severity, "warning",
+            "an earlier successful handshake proves hooks fire, so one dead run is not a broken install"
+        );
+        assert!(
+            diagnostic.message.contains(&crashed.to_string()),
+            "the message must name the run plainly, got: {}",
+            diagnostic.message
+        );
+        assert!(
+            !diagnostic.message.contains("Some("),
+            "raw Rust debug formatting must not reach a user, got: {}",
+            diagnostic.message
         );
     }
 

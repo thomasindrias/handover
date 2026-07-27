@@ -33,6 +33,10 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
   silently auto-recovering; and `sesh status` reports a `switch_readiness`
   block (lease state, checkpoint freshness, handoff renderability) so a
   switch's success can be seen before quitting the current provider.
+- Prebuilt binaries for macOS and Linux on both Apple silicon and x86-64,
+  published on each tagged release with a `SHA256SUMS` file, plus a Homebrew
+  formula that the release pipeline keeps current. Installing Sesh no longer
+  requires a Rust toolchain.
 - A one-command `install.sh` script that builds and installs sesh from
   source (`curl -fsSL .../install.sh | sh`), safe to re-run as an upgrade,
   with a `PATH` check and next-step guidance on success.
@@ -58,6 +62,13 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 - `sesh doctor` now reports a provider that was never set up as
   `integration.missing` with the exact `sesh setup <provider>` command,
   instead of a raw "No such file or directory" I/O error.
+- A run that stopped without a SessionStart handshake is now a warning, rather
+  than an error that pinned `sesh doctor` to a failing exit code, once some run
+  in that session has handshaken — an earlier handshake proves the provider's
+  hooks reach Sesh, so that run died for its own reasons. When no run in the
+  session has ever handshaken the integration itself is suspect, so it stays an
+  error and now names the provider setup command. The message also no longer
+  prints a raw `Some(RunId(...))` debug value.
 - Codex hook delivery: hooks registered via `-c` config overlays never
   actually fired against real Codex CLI builds. Each Codex launch now gets
   a private, per-run `CODEX_HOME` with a materialized `hooks.json` and
