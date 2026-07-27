@@ -99,9 +99,38 @@ fn check_permission_path(path: &Path, diagnostics: &mut Vec<Diagnostic>) {
     };
     // SAFETY: geteuid has no preconditions and does not dereference pointers.
     let effective_uid = unsafe { libc::geteuid() };
+    // Provider adapters deliberately link private files into the state root, so a
+    // symlink is judged by its target and never followed into a directory.
+    if metadata.file_type().is_symlink() {
+        let target = match std::fs::metadata(path) {
+            Ok(target) => target,
+            Err(error) => {
+                diagnostics.push(Diagnostic::error(
+                    "permissions.unavailable",
+                    format!("cannot resolve {}: {error}", path.display()),
+                ));
+                return;
+            }
+        };
+        if !target.file_type().is_file()
+            || target.uid() != effective_uid
+            || target.permissions().mode() & 0o777 != 0o600
+        {
+            let resolved = std::fs::read_link(path).unwrap_or_else(|_| path.to_path_buf());
+            diagnostics.push(Diagnostic::error(
+                "permissions.insecure",
+                format!(
+                    "{} links to {}, which must be a regular file owned by the current user with mode 0600",
+                    path.display(),
+                    resolved.display()
+                ),
+            ));
+        }
+        return;
+    }
     let mode = metadata.permissions().mode() & 0o777;
     let expected = if metadata.is_dir() { 0o700 } else { 0o600 };
-    if metadata.file_type().is_symlink() || metadata.uid() != effective_uid || mode != expected {
+    if metadata.uid() != effective_uid || mode != expected {
         diagnostics.push(Diagnostic::error(
             "permissions.insecure",
             format!(
@@ -225,15 +254,26 @@ pub fn check_integrations(layout: &StateLayout) -> Vec<Diagnostic> {
     [Provider::Claude, Provider::Codex]
         .into_iter()
         .filter_map(|provider| {
-            adapter(provider)
-                .verify(&layout.integrations())
-                .err()
-                .map(|error| {
-                    Diagnostic::error(
-                        "integration.invalid",
-                        format!("{} integration: {error}", provider.executable()),
-                    )
-                })
+            let integrations = layout.integrations();
+            adapter(provider).verify(&integrations).err().map(|error| {
+                let executable = provider.executable();
+                // Never running setup is the ordinary first-run state, not corruption.
+                if !integrations.join(executable).exists() {
+                    let setup = format!("sesh setup {executable}");
+                    return Diagnostic {
+                        code: "integration.missing".into(),
+                        severity: "error".into(),
+                        message: format!("{executable} integration is not set up; run `{setup}`"),
+                        repair_command: Some(setup),
+                        command: None,
+                        command_argv: None,
+                    };
+                }
+                Diagnostic::error(
+                    "integration.invalid",
+                    format!("{executable} integration: {error}"),
+                )
+            })
         })
         .collect()
 }
@@ -811,11 +851,12 @@ fn repair_capture_sentinels(session_dir: &Path, diagnostics: &mut Vec<Diagnostic
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     use tempfile::TempDir;
 
-    use super::check_sessions;
+    use super::{check_integrations, check_permissions, check_sessions};
     use crate::model::{EventKind, GitSnapshot, Provider, RunId, SessionId, WorktreeIdentity};
     use crate::runtime::Runtime;
     use crate::store::lease::{LeaseStore, ProcessIdentity, RunLease};
@@ -912,6 +953,107 @@ mod tests {
             check_sessions(&layout)
                 .iter()
                 .any(|item| item.code == "lease.live_orphan_child")
+        );
+    }
+
+    #[test]
+    fn integrations_name_the_setup_command_when_a_provider_was_never_set_up() {
+        let (_temp, layout, _store) = fixture();
+        crate::provider::adapter(Provider::Codex)
+            .setup(&layout.integrations())
+            .unwrap();
+
+        let diagnostics = check_integrations(&layout);
+        let missing = diagnostics
+            .iter()
+            .find(|item| item.code == "integration.missing")
+            .expect("claude was never set up");
+        assert!(missing.message.contains("sesh setup claude"));
+        assert_eq!(missing.repair_command.as_deref(), Some("sesh setup claude"));
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|item| item.message.starts_with("codex integration")),
+            "a provider that was set up is healthy"
+        );
+    }
+
+    #[test]
+    fn permissions_accept_private_symlink_targets_and_reject_exposed_ones() {
+        let (temp, layout, _store) = fixture();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+
+        let private_target = outside.join("auth.json");
+        std::fs::write(&private_target, b"{}").unwrap();
+        std::fs::set_permissions(&private_target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = layout.root().join("auth.json");
+        std::os::unix::fs::symlink(&private_target, &link).unwrap();
+        assert!(
+            check_permissions(&layout).is_empty(),
+            "a symlink to a user-owned 0600 file is how the Codex adapter wires CODEX_HOME"
+        );
+
+        std::fs::set_permissions(&private_target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            check_permissions(&layout)
+                .iter()
+                .any(|item| item.code == "permissions.insecure"),
+            "a symlink to a world-readable file must still fail closed"
+        );
+        std::fs::remove_file(&link).unwrap();
+
+        let directory_target = outside.join("nested");
+        std::fs::create_dir(&directory_target).unwrap();
+        std::os::unix::fs::symlink(&directory_target, layout.root().join("nested")).unwrap();
+        assert!(
+            check_permissions(&layout)
+                .iter()
+                .any(|item| item.code == "permissions.insecure"),
+            "only regular files may be linked, so traversal cannot escape the state root"
+        );
+    }
+
+    #[test]
+    fn permissions_accept_a_materialized_codex_home_under_the_state_root() {
+        let (temp, layout, store) = fixture();
+        crate::provider::adapter(Provider::Codex)
+            .setup(&layout.integrations())
+            .unwrap();
+        let provider_home = temp.path().join("dot-codex");
+        std::fs::create_dir(&provider_home).unwrap();
+        for name in ["config.toml", "auth.json"] {
+            let file = provider_home.join(name);
+            std::fs::write(&file, b"x").unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        crate::provider::codex::materialize_codex_home(
+            &store.session_dir().join("runs/run-1/codex_home"),
+            &layout.integrations().join("codex/1/hooks.json"),
+            Some(&provider_home),
+        )
+        .unwrap();
+
+        assert_eq!(
+            check_permissions(&layout),
+            Vec::new(),
+            "a Codex run must not leave `sesh doctor` reporting its own state as insecure"
+        );
+    }
+
+    #[test]
+    fn permissions_reject_a_dangling_symlink() {
+        let (temp, layout, _store) = fixture();
+        std::os::unix::fs::symlink(
+            temp.path().join("missing"),
+            layout.root().join("dangling.json"),
+        )
+        .unwrap();
+        assert!(
+            check_permissions(&layout)
+                .iter()
+                .any(|item| item.code == "permissions.unavailable")
         );
     }
 

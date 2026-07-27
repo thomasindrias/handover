@@ -6,6 +6,8 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-27
+
 ### Added
 
 - Local, provider-neutral coding sessions for Claude Code and Codex.
@@ -43,6 +45,17 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 
 ### Fixed
 
+- `sesh doctor` no longer reports a correctly installed Codex integration as
+  insecure. The permission walk rejected every symlink under the state root,
+  but the Codex adapter deliberately links `hooks.json`, `config.toml`, and
+  `auth.json` into each run's private `CODEX_HOME`, so `sesh setup codex`
+  left `doctor` failing and every Codex run added three more errors. A
+  symlink is now judged by its target, which must be a regular file owned by
+  the current user with mode `0600`, and is never followed into a directory.
+  The message names the target rather than the link.
+- `sesh doctor` now reports a provider that was never set up as
+  `integration.missing` with the exact `sesh setup <provider>` command,
+  instead of a raw "No such file or directory" I/O error.
 - Codex hook delivery: hooks registered via `-c` config overlays never
   actually fired against real Codex CLI builds. Each Codex launch now gets
   a private, per-run `CODEX_HOME` with a materialized `hooks.json` and

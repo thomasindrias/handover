@@ -133,8 +133,8 @@ release.
 
 Planned, in rough order:
 
-- **v0.1.0** — switch-moment polish, prebuilt binaries, a Homebrew formula,
-  and a short tutorial.
+- **Easier installs** — prebuilt binaries, a Homebrew formula, and a short
+  tutorial, so trying Sesh no longer requires a Rust toolchain.
 - **More providers** — Gemini CLI, opencode, Cursor CLI. Not every CLI exposes
   lifecycle hooks, so provider support will be tiered and documented honestly.
 - **Multi-machine** — sync through a private Git remote you control, and
