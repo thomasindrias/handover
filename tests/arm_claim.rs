@@ -521,3 +521,203 @@ fn attach_succeeds_when_the_session_has_only_a_stale_lease() {
         "attach must resolve to the existing session, not create a new one"
     );
 }
+
+/// `provider_command_allowed` in `src/app.rs` allows only `Hook`,
+/// `Checkpoint { from_provider: true }`, and `McpServer` once
+/// `HANDOVER_RUN_ID` marks the process as an attached provider. `Arm`,
+/// `Claim`, and `Attach` mutate state and are deliberately not in that list
+/// in this slice; MCP access is gated by run-scoping in a later slice. Pin
+/// the refusal so nobody widens the allow-list by accident.
+#[test]
+fn attached_provider_processes_cannot_arm_claim_or_attach() {
+    let (_temp, cwd, state, path) = finished_session();
+
+    for args in [vec!["arm", "codex"], vec!["claim"], vec!["attach", "codex"]] {
+        let output = cargo_bin_cmd!("handover")
+            .current_dir(&cwd)
+            .env("HANDOVER_HOME", &state)
+            .env("PATH", &path)
+            .env("HANDOVER_RUN_ID", "22222222-2222-4222-8222-222222222222")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{args:?} must be refused inside a provider run"
+        );
+    }
+}
+
+/// The layering contract from the spec: the experience layer holds no
+/// logic, so a complete arm/claim cycle must work with nothing but the CLI
+/// -- no MCP server configured anywhere in this test.
+#[test]
+fn the_full_cycle_runs_on_the_cli_alone_with_no_mcp_server() {
+    let (_temp, cwd, state, path) = finished_session();
+
+    let run = |args: &[&str]| {
+        cargo_bin_cmd!("handover")
+            .current_dir(&cwd)
+            .env("HANDOVER_HOME", &state)
+            .env("PATH", &path)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let armed: serde_json::Value =
+        serde_json::from_slice(&run(&["arm", "codex", "--json"]).stdout).unwrap();
+    let sequence = armed["armed_sequence"].as_u64().unwrap().to_string();
+
+    let claimed = run(&["claim", "--arm", &sequence]);
+    assert!(
+        claimed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&claimed.stderr)
+    );
+    assert!(String::from_utf8_lossy(&claimed.stdout).contains("Ship arm"));
+
+    let log = String::from_utf8_lossy(&run(&["log", "--json"]).stdout).into_owned();
+    assert!(log.contains("switch.armed"));
+    assert!(log.contains("switch.claimed"));
+
+    // The lease is left free for the next launcher.
+    let status: serde_json::Value =
+        serde_json::from_slice(&run(&["status", "--json"]).stdout).unwrap();
+    assert_eq!(status["switch_readiness"]["lease"], "free");
+}
+
+/// `SessionOperationLock` is what makes claiming atomic. Spawning several
+/// concurrent `handover claim` processes against one armed switch must
+/// leave exactly one winner: zero means the lock deadlocked, more than one
+/// means `crate::arm::pending` was read outside the lock in `claim_command`.
+#[test]
+fn concurrent_claims_produce_exactly_one_winner() {
+    let (_temp, cwd, state, path) = finished_session();
+
+    cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["arm", "codex"])
+        .assert()
+        .success();
+
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let cwd = cwd.clone();
+            let state = state.clone();
+            let path = path.clone();
+            std::thread::spawn(move || {
+                cargo_bin_cmd!("handover")
+                    .current_dir(&cwd)
+                    .env("HANDOVER_HOME", &state)
+                    .env("PATH", &path)
+                    .args(["claim"])
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            })
+        })
+        .collect();
+
+    let winners = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .filter(|succeeded| *succeeded)
+        .count();
+    assert_eq!(
+        winners, 1,
+        "an arm is one-shot even under concurrent claims"
+    );
+}
+
+/// Fake claude: SessionStart, `cycles` recognized tool cycles, then Stop --
+/// no narrative checkpoint is ever written. Mirrors the configurable-cycles
+/// fake provider idiom in `tests/switch_readiness.rs`, whose own
+/// `a_stale_narrative_checkpoint_is_advisory_and_does_not_block_readiness`
+/// test proves 7 cycles pushes `events_since` past
+/// `STALE_NARRATIVE_EVENT_THRESHOLD` (20) with no checkpoint recorded.
+fn fake_claude_without_narrative_checkpoint(bin: &std::path::Path, cycles: u32) {
+    let body = format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${{1:-}} == "--version" ]]; then printf '%s\n' 'fake-claude 1.0'; exit 0; fi
+cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
+hook() {{ printf '%s' "$1" | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null; }}
+hook '{{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}}'
+for i in $(seq 1 {cycles}); do
+  hook '{{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{{"command":"cargo test case-'"$i"'"}},"tool_use_id":"tool-'"$i"'"}}'
+  hook '{{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{{"command":"cargo test case-'"$i"'"}},"tool_response":{{"stdout":"ok","stderr":"","exit_code":0}},"tool_use_id":"tool-'"$i"'"}}'
+done
+hook '{{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"Stop"}}'
+exit 0
+"#
+    );
+    write_executable(&bin.join("claude"), &body);
+}
+
+/// A finished `handover run claude` session with `cycles` tool cycles and no
+/// narrative checkpoint: enough events accumulate that `arm` will observe a
+/// stale narrative when it looks.
+fn session_with_stale_narrative(
+    cycles: u32,
+) -> (
+    TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::ffi::OsString,
+) {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    let cwd = repo.join("apps/web");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    fake_claude_without_narrative_checkpoint(&bin, cycles);
+    let state = temp.path().join("state");
+    let path = path_with(&bin);
+
+    cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["run", "claude"])
+        .assert()
+        .success();
+
+    (temp, cwd, state, path)
+}
+
+/// `arm` must not be stricter than the `switch` readiness gate it precedes:
+/// a stale narrative checkpoint is advisory everywhere else in this
+/// codebase (see `switch_readiness.rs`), so `arm` must warn on stderr and
+/// proceed, never refuse, reporting `checkpoint_fresh: false` in its JSON.
+#[test]
+fn arm_warns_on_stderr_but_succeeds_past_a_stale_narrative_checkpoint() {
+    let (_temp, cwd, state, path) = session_with_stale_narrative(7);
+
+    let output = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["arm", "codex", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "a stale narrative checkpoint must warn, not refuse arm: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("events since the last narrative checkpoint"),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["checkpoint_fresh"], false);
+}
