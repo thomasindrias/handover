@@ -1,6 +1,8 @@
 mod support;
 
 use assert_cmd::cargo::cargo_bin_cmd;
+use handover::model::{Provider, RunId, SessionId};
+use handover::store::lease::{LeaseStore, ProcessIdentity, RunLease};
 use tempfile::TempDir;
 
 use support::{init_repo, path_with, write_executable};
@@ -49,6 +51,18 @@ fn finished_session() -> (
         .success();
 
     (temp, cwd, state, path)
+}
+
+/// The lone session directory under `<state>/sessions`, and its id.
+fn session_dir_and_id(state: &std::path::Path) -> (std::path::PathBuf, SessionId) {
+    let dir = std::fs::read_dir(state.join("sessions"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let id = SessionId::parse(dir.file_name().unwrap().to_str().unwrap()).unwrap();
+    (dir, id)
 }
 
 #[test]
@@ -204,4 +218,162 @@ fn an_expired_arm_is_retired_lazily_and_cannot_be_claimed() {
         .output()
         .unwrap();
     assert!(String::from_utf8_lossy(&log.stdout).contains("switch.expired"));
+}
+
+/// `arm` captures `armed_run` from whatever lease exists at arm time, so a
+/// lease exercising `release_for_claim`'s "belongs to the arming run" branch
+/// has to be planted *before* `arm` runs, with the run id `arm` will record.
+#[test]
+fn claim_clears_a_dead_lease_left_by_the_arming_run_without_prompting() {
+    let (_temp, cwd, state, path) = finished_session();
+    let (session, session_id) = session_dir_and_id(&state);
+    let leases = LeaseStore::new(&session);
+
+    let dead = RunLease::new(
+        session_id,
+        RunId::new(),
+        Provider::Claude,
+        ProcessIdentity {
+            pid: u32::MAX,
+            start_token: "gone".into(),
+        },
+    )
+    .unwrap();
+    leases.create(&dead).unwrap();
+
+    cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["arm", "codex"])
+        .assert()
+        .success();
+
+    let output = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["claim"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Ship arm"));
+
+    assert!(
+        leases.read().unwrap().is_none(),
+        "the dead lease left by the arming run should be cleared, not merely ignored"
+    );
+}
+
+#[test]
+fn claim_refuses_while_the_arming_runs_provider_is_still_live() {
+    let (_temp, cwd, state, path) = finished_session();
+    let (session, session_id) = session_dir_and_id(&state);
+    let leases = LeaseStore::new(&session);
+
+    // The current test process stands in for the still-running provider: it
+    // is unquestionably live for the duration of this test.
+    let live = RunLease::new(
+        session_id,
+        RunId::new(),
+        Provider::Claude,
+        ProcessIdentity::capture(std::process::id()).unwrap(),
+    )
+    .unwrap();
+    leases.create(&live).unwrap();
+
+    cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["arm", "codex"])
+        .assert()
+        .success();
+
+    let output = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["claim"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("is still running"), "stderr was: {stderr}");
+    assert!(stderr.contains("claude"), "stderr was: {stderr}");
+
+    // Refused, not consumed: the live lease is untouched.
+    assert_eq!(leases.read().unwrap().unwrap().run_id, live.run_id);
+
+    leases.clear(&live.run_id).unwrap();
+}
+
+#[test]
+fn claim_refuses_when_a_different_run_holds_the_lease() {
+    let (_temp, cwd, state, path) = finished_session();
+    let (session, session_id) = session_dir_and_id(&state);
+    let leases = LeaseStore::new(&session);
+
+    let arming_run = RunLease::new(
+        session_id.clone(),
+        RunId::new(),
+        Provider::Claude,
+        ProcessIdentity {
+            pid: u32::MAX,
+            start_token: "gone".into(),
+        },
+    )
+    .unwrap();
+    leases.create(&arming_run).unwrap();
+
+    cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["arm", "codex"])
+        .assert()
+        .success();
+
+    // Before the claim lands, a different run takes the session's lease --
+    // e.g. a fresh `handover run` started after the arm. Its run id was
+    // never seen by `arm`, so it cannot be the one that authorised the
+    // switch.
+    leases.clear(&arming_run.run_id).unwrap();
+    let foreign_run = RunLease::new(
+        session_id,
+        RunId::new(),
+        Provider::Claude,
+        ProcessIdentity {
+            pid: u32::MAX,
+            start_token: "also gone".into(),
+        },
+    )
+    .unwrap();
+    leases.create(&foreign_run).unwrap();
+
+    let output = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["claim"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("was not created by the run that armed the switch"),
+        "stderr was: {stderr}"
+    );
+    // The classify_lease diagnostic for a dead, unrelated lease: it reports
+    // it as recoverable rather than blocked.
+    assert!(
+        stderr.contains("stale") && stderr.contains("recover"),
+        "expected the classify_lease diagnostic in stderr, got: {stderr}"
+    );
+
+    leases.clear(&foreign_run.run_id).unwrap();
 }
