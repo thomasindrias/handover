@@ -84,6 +84,7 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
             ttl,
             json,
         } => arm_command(provider, surface, &ttl, json, environment, runtime),
+        Command::Claim { arm, json } => claim_command(arm, json, environment, runtime),
         Command::Preview { provider, json } => handover_command(provider, json, environment),
         Command::Fork {
             provider,
@@ -1126,6 +1127,97 @@ fn arm_command(
         json,
     )?;
     Ok(0)
+}
+
+/// Release the lease the arm authorises us to release, if any.
+///
+/// The privilege is narrow: a *dead* lease belonging to the arming run may be
+/// cleared without the recovery prompt. Nothing else may be touched.
+fn release_for_claim(leases: &LeaseStore, pending: &crate::arm::PendingArm) -> Result<()> {
+    let Some(lease) = leases.read()? else {
+        return Ok(());
+    };
+    if lease.host != host_name()? || pending.armed_run.as_ref() != Some(&lease.run_id) {
+        let (_state, reason) = classify_lease(leases)?;
+        return Err(Error::InvalidState(format!(
+            "this session's lease was not created by the run that armed the switch; {}",
+            reason.unwrap_or_else(|| "inspect it with `handover status`".into())
+        )));
+    }
+    let child_live = lease
+        .child
+        .as_ref()
+        .map(ProcessIdentity::is_live)
+        .transpose()?
+        .unwrap_or(false);
+    if lease.supervisor.is_live()? || child_live {
+        let holder = if child_live {
+            lease
+                .child
+                .as_ref()
+                .expect("child_live implies child is present")
+        } else {
+            &lease.supervisor
+        };
+        return Err(Error::InvalidState(format!(
+            "{} is still running this session ({}); quit it to complete the armed switch",
+            lease.provider.executable(),
+            holder.describe()
+        )));
+    }
+    leases.clear(&lease.run_id)
+}
+
+fn claim_command(
+    arm: Option<u64>,
+    json: bool,
+    environment: &Environment,
+    runtime: &dyn Runtime,
+) -> Result<i32> {
+    let (_layout, snapshot, store) = current_session(environment)?;
+    let _operation = SessionOperationLock::acquire(&store.session_dir())?;
+    let events = store.events()?;
+    let pending = crate::arm::pending(&store, runtime, &events)?
+        .ok_or_else(|| Error::InvalidState("no switch is armed for this session".into()))?;
+    if let Some(expected) = arm
+        && expected != pending.sequence
+    {
+        return Err(Error::InvalidState(format!(
+            "the armed switch is at sequence {}, not {expected}",
+            pending.sequence
+        )));
+    }
+
+    release_for_claim(&LeaseStore::new(&store.session_dir()), &pending)?;
+    let preview = preview_handover(&store, &snapshot, pending.to)?;
+    store.append(
+        runtime,
+        None,
+        Some(pending.to),
+        EventKind::SwitchClaimed {
+            armed_sequence: pending.sequence,
+            to: pending.to,
+        },
+    )?;
+
+    if json {
+        write_handover_projection(
+            &store,
+            preview.from_provider,
+            pending.to,
+            preview.transition_sequence,
+            preview.through_sequence,
+            &preview.events,
+            preview.narrative_checkpoint,
+            preview.capture_gaps,
+            &preview.rendered,
+        )
+    } else {
+        std::io::stdout()
+            .write_all(preview.rendered.markdown.as_bytes())
+            .map_err(|source| io("stdout", source))?;
+        Ok(0)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -101,3 +101,107 @@ fn arm_refuses_a_second_pending_arm() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn claim_consumes_the_arm_and_prints_the_handover() {
+    let (_temp, cwd, state, path) = finished_session();
+
+    cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["arm", "codex"])
+        .assert()
+        .success();
+
+    let output = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["claim"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Ship arm"));
+
+    // The arm is one-shot: a second claim finds nothing.
+    let second = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["claim"])
+        .output()
+        .unwrap();
+    assert!(!second.status.success());
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("no switch is armed"),
+        "stderr was: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+}
+
+#[test]
+fn claim_refuses_when_the_asserted_arm_is_not_the_pending_one() {
+    let (_temp, cwd, state, path) = finished_session();
+
+    cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["arm", "codex"])
+        .assert()
+        .success();
+
+    let output = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["claim", "--arm", "999"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("not 999"),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn an_expired_arm_is_retired_lazily_and_cannot_be_claimed() {
+    let (_temp, cwd, state, path) = finished_session();
+
+    cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["arm", "codex", "--ttl", "1s"])
+        .assert()
+        .success();
+
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+
+    let output = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["claim"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no switch is armed"));
+
+    // Expiry is journaled at the moment it is observed.
+    let log = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["log", "--json"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&log.stdout).contains("switch.expired"));
+}

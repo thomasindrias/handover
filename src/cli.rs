@@ -39,6 +39,12 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    Claim {
+        #[arg(long)]
+        arm: Option<u64>,
+        #[arg(long)]
+        json: bool,
+    },
     Preview {
         provider: Provider,
         #[arg(long)]
