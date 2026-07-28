@@ -38,7 +38,9 @@ use crate::runtime::Runtime;
 use crate::store::atomic::{create_private, read_private, sync_directory};
 use crate::store::blob::BlobStore;
 use crate::store::journal::{AppendOutcome, EventJournal, PendingEvent, PendingEventMeta};
-use crate::store::lease::{LeaseStore, ProcessIdentity, RunLease, SessionOperationLock, host_name};
+use crate::store::lease::{
+    LeaseStore, ProcessIdentity, RunLease, SessionOperationLock, host_name, live_holder,
+};
 use crate::store::refs::read_json;
 use crate::store::{Environment, SessionStore, StateLayout};
 use crate::supervisor::{ExitFacts, Supervisor};
@@ -1202,21 +1204,7 @@ fn release_for_claim(leases: &LeaseStore, pending: &crate::arm::PendingArm) -> R
             reason.unwrap_or_else(|| "inspect it with `handover status`".into())
         )));
     }
-    let child_live = lease
-        .child
-        .as_ref()
-        .map(ProcessIdentity::is_live)
-        .transpose()?
-        .unwrap_or(false);
-    if lease.supervisor.is_live()? || child_live {
-        let holder = if child_live {
-            lease
-                .child
-                .as_ref()
-                .expect("child_live implies child is present")
-        } else {
-            &lease.supervisor
-        };
+    if let Some(holder) = live_holder(&lease)? {
         return Err(Error::InvalidState(format!(
             "{} is still running this session ({}); quit it to complete the armed switch",
             lease.provider.executable(),
@@ -1503,22 +1491,7 @@ fn recover_stale_lease_for_switch(
             lease.supervisor.describe()
         )));
     }
-    let supervisor_live = lease.supervisor.is_live()?;
-    let child_live = lease
-        .child
-        .as_ref()
-        .map(ProcessIdentity::is_live)
-        .transpose()?
-        .unwrap_or(false);
-    if supervisor_live || child_live {
-        let holder = if child_live {
-            lease
-                .child
-                .as_ref()
-                .expect("child_live implies child is present")
-        } else {
-            &lease.supervisor
-        };
+    if let Some(holder) = live_holder(&lease)? {
         return Err(Error::InvalidState(format!(
             "cannot switch: {} is still running this session ({}). Finish or quit {}, then retry the switch.",
             lease.provider.executable(),
@@ -1575,14 +1548,7 @@ fn recover_stale_lease(
             lease.run_id, lease.host
         )));
     }
-    let supervisor_live = lease.supervisor.is_live()?;
-    let child_live = lease
-        .child
-        .as_ref()
-        .map(ProcessIdentity::is_live)
-        .transpose()?
-        .unwrap_or(false);
-    if supervisor_live || child_live {
+    if live_holder(&lease)?.is_some() {
         return Err(Error::InvalidState(format!(
             "session already has active provider {}",
             lease.run_id
@@ -1885,22 +1851,7 @@ fn classify_lease(leases: &LeaseStore) -> Result<(&'static str, Option<String>)>
             )),
         ));
     }
-    let supervisor_live = lease.supervisor.is_live()?;
-    let child_live = lease
-        .child
-        .as_ref()
-        .map(ProcessIdentity::is_live)
-        .transpose()?
-        .unwrap_or(false);
-    if supervisor_live || child_live {
-        let holder = if child_live {
-            lease
-                .child
-                .as_ref()
-                .expect("child_live implies child is present")
-        } else {
-            &lease.supervisor
-        };
+    if let Some(holder) = live_holder(&lease)? {
         return Ok((
             "blocked",
             Some(format!(

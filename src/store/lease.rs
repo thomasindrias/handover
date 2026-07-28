@@ -129,6 +129,29 @@ impl RunLease {
     }
 }
 
+/// The process still holding `lease`, or `None` when the lease is stale.
+///
+/// The child is asked first and wins when it is live, because it is the
+/// provider the user would have to quit; the supervisor stands in for it
+/// otherwise. Every caller that has to tell a live lease from a dead one asks
+/// here, so a `RunLease` that grows another process identity changes liveness
+/// in exactly one place instead of silently leaving some callers behind.
+pub fn live_holder(lease: &RunLease) -> Result<Option<&ProcessIdentity>> {
+    let child_live = lease
+        .child
+        .as_ref()
+        .map(ProcessIdentity::is_live)
+        .transpose()?
+        .unwrap_or(false);
+    if child_live {
+        return Ok(lease.child.as_ref());
+    }
+    if lease.supervisor.is_live()? {
+        return Ok(Some(&lease.supervisor));
+    }
+    Ok(None)
+}
+
 #[derive(Clone, Debug)]
 pub struct LeaseStore {
     path: PathBuf,
@@ -144,11 +167,7 @@ impl LeaseStore {
     pub fn create(&self, lease: &RunLease) -> Result<()> {
         validate_lease(lease)?;
         if let Some(existing) = self.read()? {
-            let child_is_live = match existing.child.as_ref() {
-                Some(child) => child.is_live()?,
-                None => false,
-            };
-            if existing.supervisor.is_live()? || child_is_live {
+            if live_holder(&existing)?.is_some() {
                 return Err(Error::InvalidState(format!(
                     "session already has active provider {}",
                     existing.run_id
