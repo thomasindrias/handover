@@ -11,6 +11,19 @@ use crate::model::{
 };
 
 const HEADING: &str = "# Handover\n\n";
+/// Kept terse deliberately: every byte here is part of the irreducible floor a
+/// bounded render must fit, and a render that cannot fit its floor fails.
+const CHECKPOINT_INSTRUCTION: &str = "\n## Before the next handover\n\n\
+     Observed events record what happened, not why. Record the intent yourself \
+     after a meaningful unit of work:\n\n\
+     ```sh\n\
+     printf '%s' '{\"objective\":\"...\",\"summary\":\"...\",\"decisions\":[],\
+     \"assumptions\":[],\"constraints\":[],\"completed\":[],\"in_progress\":[],\
+     \"blockers\":[],\"next_steps\":[\"...\"],\"related_event_sequences\":[]}' \\\n  \
+     | handover checkpoint --format json --from-provider\n\
+     ```\n\n\
+     `objective`, `summary`, and one `next_steps` entry are required; the other \
+     arrays may stay empty. `--from-provider` is required while attached.\n";
 pub const BOOTSTRAP: &str = "Continue the active Handover session from its injected handover. Verify the current worktree state, then proceed with the recorded next action.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -450,6 +463,7 @@ fn render_sections(
     output.push_str(
         "## Inspect the complete session\n\n- `handover log --json`\n- `handover inspect`\n",
     );
+    output.push_str(CHECKPOINT_INSTRUCTION);
     Ok(output)
 }
 
@@ -1183,6 +1197,42 @@ mod tests {
         );
         assert!(rendered.recent_event_sequences.last() == Some(&20));
         assert!(rendered.markdown.contains("Omitted event sequences"));
+    }
+
+    #[test]
+    fn handover_tells_the_receiving_agent_how_to_write_a_checkpoint() {
+        // Observed events cannot supply intent, so the one thing an agent must
+        // do for the next handover has to be stated where the agent will read
+        // it. Nothing else tells it: the plugin ships no instructions and the
+        // staleness nudge is addressed to the human.
+        let rendered = render_with_selection(HandoverInput::fixture(), 65_536).unwrap();
+
+        assert!(
+            rendered.markdown.contains("--from-provider"),
+            "an attached provider may only checkpoint through that flag"
+        );
+        assert!(
+            rendered.markdown.contains("handover checkpoint"),
+            "the command itself must appear, not just a description of it"
+        );
+    }
+
+    #[test]
+    fn a_bounded_handover_drops_recent_events_before_the_checkpoint_instruction() {
+        // Under pressure the instruction is worth more than one more event
+        // line, because without it the next handover has no narrative at all.
+        let mut input = HandoverInput::fixture();
+        input.recent_events = (1..=40)
+            .map(|sequence| (sequence, "x".repeat(512)))
+            .collect();
+
+        let rendered = render_with_selection(input, 4_096).unwrap();
+
+        assert!(rendered.markdown.len() <= 4_096);
+        assert!(
+            rendered.markdown.contains("--from-provider"),
+            "the checkpoint instruction must survive a bounded render"
+        );
     }
 
     #[test]

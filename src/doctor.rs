@@ -274,6 +274,24 @@ pub fn check_integrations(layout: &StateLayout) -> Vec<Diagnostic> {
                         command_argv: None,
                     };
                 }
+                // An asset a newer Handover added is simply absent from an
+                // older install. Re-running setup materializes it, so that is
+                // a next step rather than corruption.
+                if let Error::Io { source, .. } = &error
+                    && source.kind() == std::io::ErrorKind::NotFound
+                {
+                    let setup = format!("handover setup {executable}");
+                    return Diagnostic {
+                        code: "integration.outdated".into(),
+                        severity: "error".into(),
+                        message: format!(
+                            "{executable} integration predates this Handover version; run `{setup}`"
+                        ),
+                        repair_command: Some(setup),
+                        command: None,
+                        command_argv: None,
+                    };
+                }
                 Diagnostic::error(
                     "integration.invalid",
                     format!("{executable} integration: {error}"),
@@ -1072,6 +1090,42 @@ mod tests {
                 .iter()
                 .any(|item| item.message.starts_with("codex integration")),
             "a provider that was set up is healthy"
+        );
+    }
+
+    #[test]
+    fn an_integration_predating_a_new_asset_is_reported_as_outdated_not_as_io_noise() {
+        // Upgrading Handover can add an asset to an already installed
+        // integration. That user did nothing wrong and re-running setup fixes
+        // it, so the diagnostic must say so rather than surface a bare
+        // "No such file or directory".
+        let (_temp, layout, _store) = fixture();
+        for provider in [Provider::Claude, Provider::Codex] {
+            crate::provider::adapter(provider)
+                .setup(&layout.integrations())
+                .unwrap();
+        }
+        std::fs::remove_file(
+            layout
+                .integrations()
+                .join("claude/1/commands/handover-checkpoint.md"),
+        )
+        .unwrap();
+
+        let diagnostic = check_integrations(&layout)
+            .into_iter()
+            .find(|item| item.message.contains("claude"))
+            .expect("the claude integration is missing a newer asset");
+
+        assert_eq!(diagnostic.code, "integration.outdated");
+        assert_eq!(
+            diagnostic.repair_command.as_deref(),
+            Some("handover setup claude")
+        );
+        assert!(
+            !diagnostic.message.contains("No such file or directory"),
+            "a raw I/O error is not a next step, got: {}",
+            diagnostic.message
         );
     }
 

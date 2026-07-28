@@ -10,6 +10,7 @@ use crate::provider::{
 
 const PLUGIN_JSON: &[u8] = include_bytes!("assets/claude-plugin.json");
 const HOOKS_JSON: &[u8] = include_bytes!("assets/claude-hooks.json");
+const CHECKPOINT_COMMAND: &[u8] = include_bytes!("assets/claude-command-checkpoint.md");
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ClaudeAdapter;
@@ -42,13 +43,21 @@ impl ProviderAdapter for ClaudeAdapter {
     fn setup(&self, integration_root: &Path) -> Result<()> {
         let version = integration_root.join("claude/1");
         materialize_immutable(&version.join(".claude-plugin/plugin.json"), PLUGIN_JSON)?;
-        materialize_immutable(&version.join("hooks/hooks.json"), HOOKS_JSON)
+        materialize_immutable(&version.join("hooks/hooks.json"), HOOKS_JSON)?;
+        materialize_immutable(
+            &version.join("commands/handover-checkpoint.md"),
+            CHECKPOINT_COMMAND,
+        )
     }
 
     fn verify(&self, integration_root: &Path) -> Result<()> {
         let version = integration_root.join("claude/1");
         verify_materialized(&version.join(".claude-plugin/plugin.json"), PLUGIN_JSON)?;
-        verify_materialized(&version.join("hooks/hooks.json"), HOOKS_JSON)
+        verify_materialized(&version.join("hooks/hooks.json"), HOOKS_JSON)?;
+        verify_materialized(
+            &version.join("commands/handover-checkpoint.md"),
+            CHECKPOINT_COMMAND,
+        )
     }
 
     fn probe(&self) -> Result<String> {
@@ -153,6 +162,42 @@ mod tests {
 
         std::fs::write(&plugin, b"different").unwrap();
         assert!(ClaudeAdapter.setup(temp.path()).is_err());
+    }
+
+    #[test]
+    fn setup_installs_a_checkpoint_command_the_agent_can_invoke() {
+        let temp = TempDir::new().unwrap();
+        ClaudeAdapter.setup(temp.path()).unwrap();
+
+        let command = temp.path().join("claude/1/commands/handover-checkpoint.md");
+        let text = std::fs::read_to_string(&command).unwrap();
+        assert_eq!(
+            std::fs::metadata(&command).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            text.contains("--from-provider"),
+            "an attached provider may only checkpoint through that flag"
+        );
+        assert!(
+            text.contains("objective"),
+            "the required fields must appear"
+        );
+        ClaudeAdapter.verify(temp.path()).unwrap();
+    }
+
+    #[test]
+    fn verify_rejects_an_install_predating_the_checkpoint_command() {
+        // What an install from an earlier Handover looks like: every asset it
+        // knew about is present and correct, and the newer one is simply absent.
+        let temp = TempDir::new().unwrap();
+        ClaudeAdapter.setup(temp.path()).unwrap();
+        std::fs::remove_file(temp.path().join("claude/1/commands/handover-checkpoint.md")).unwrap();
+
+        assert!(ClaudeAdapter.verify(temp.path()).is_err());
+        // Re-running setup has to restore it, since that is the advice doctor gives.
+        ClaudeAdapter.setup(temp.path()).unwrap();
+        ClaudeAdapter.verify(temp.path()).unwrap();
     }
 
     fn assert_no_session_content(args: &[OsString]) {

@@ -100,6 +100,13 @@ printf '%s' "$CHECKPOINT_JSON" \
   | "$HANDOVER_HOOK_BIN" checkpoint --format json --from-provider
 ```
 
+An attached provider does not have to be told this command. Every handover ends
+with it, so any provider that read its handover already has it, and the Claude
+integration also installs a `/handover-checkpoint` command that gathers the
+narrative and submits it. Submitting only stages the checkpoint in the run
+inbox; the next hook of that run promotes it into the journal, which is when
+`checkpoint.created` appears in `handover log`.
+
 Handover requires a nonempty objective and summary, at least one next step, bounded
 fields and item counts, and sorted unique event references that already exist.
 Unknown fields and oversized payloads are rejected.
