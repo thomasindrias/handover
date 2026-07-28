@@ -121,17 +121,36 @@ pub fn pending(
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_TTL, expires_at, parse_ttl};
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    use tempfile::TempDir;
+
+    use super::{DEFAULT_TTL, expires_at, parse_ttl, pending};
     use crate::arm::latest_unresolved;
     use crate::error::Result;
-    use crate::model::{Event, EventKind, OperationId, Provider, RunId, SessionId, Surface};
+    use crate::model::{
+        Event, EventKind, GitSnapshot, OperationId, Provider, RunId, SessionId, Surface,
+        WorktreeIdentity,
+    };
     use crate::runtime::Runtime;
+    use crate::store::{SessionStore, StateLayout};
 
-    struct FixedClock(&'static str);
+    struct FixedClock(Mutex<&'static str>);
+
+    impl FixedClock {
+        fn new(now: &'static str) -> Self {
+            Self(Mutex::new(now))
+        }
+
+        fn set(&self, now: &'static str) {
+            *self.0.lock().unwrap() = now;
+        }
+    }
 
     impl Runtime for FixedClock {
         fn now(&self) -> Result<String> {
-            Ok(self.0.to_owned())
+            Ok((*self.0.lock().unwrap()).to_owned())
         }
         fn session_id(&self) -> SessionId {
             SessionId::new()
@@ -161,7 +180,7 @@ mod tests {
 
     #[test]
     fn expiry_is_the_clock_plus_the_ttl_in_rfc3339() {
-        let clock = FixedClock("2026-07-28T10:00:00Z");
+        let clock = FixedClock::new("2026-07-28T10:00:00Z");
         assert_eq!(
             expires_at(&clock, parse_ttl("15m").unwrap()).unwrap(),
             "2026-07-28T10:15:00Z"
@@ -222,5 +241,101 @@ mod tests {
             resolving(5, EventKind::SwitchExpired { armed_sequence: 2 }),
         ];
         assert_eq!(latest_unresolved(&events).unwrap().sequence, 4);
+    }
+
+    fn snapshot() -> GitSnapshot {
+        let common_git_dir = PathBuf::from("/repo/.git");
+        let git_dir = PathBuf::from("/repo/.git/worktrees/oauth");
+        GitSnapshot {
+            identity: WorktreeIdentity {
+                key: WorktreeIdentity::derive_key(&common_git_dir, &git_dir),
+                common_git_dir,
+                git_dir,
+                worktree: PathBuf::from("/work/oauth"),
+                cwd_relative: PathBuf::from("apps/web"),
+            },
+            branch: Some("feat/oauth".into()),
+            head: "deadbeef".into(),
+            staged: Vec::new(),
+            unstaged: Vec::new(),
+            untracked: Vec::new(),
+            dirty_submodules: Vec::new(),
+        }
+    }
+
+    /// A real `SessionStore` backed by a temp directory, with a single
+    /// `switch.armed` event already appended. Returns the store and the
+    /// sequence number of that arm.
+    fn store_with_armed_session(
+        temp: &TempDir,
+        runtime: &FixedClock,
+        expires_at: &str,
+    ) -> (SessionStore, u64) {
+        let layout = StateLayout::new(temp.path().join("state"));
+        let store = SessionStore::create(&layout, runtime, snapshot()).unwrap();
+        let event = store
+            .append(
+                runtime,
+                None,
+                None,
+                EventKind::SwitchArmed {
+                    to: Provider::Codex,
+                    surface: Surface::Auto,
+                    expires_at: expires_at.into(),
+                },
+            )
+            .unwrap();
+        (store, event.sequence)
+    }
+
+    #[test]
+    fn pending_returns_the_arm_before_it_expires() {
+        let temp = TempDir::new().unwrap();
+        let runtime = FixedClock::new("2026-07-28T10:00:00Z");
+        let (store, sequence) = store_with_armed_session(&temp, &runtime, "2026-07-28T10:15:00Z");
+
+        runtime.set("2026-07-28T10:14:59Z");
+        let events_before = store.events().unwrap();
+        let arm = pending(&store, &runtime, &events_before)
+            .unwrap()
+            .expect("arm should still be pending one second before expiry");
+
+        assert_eq!(arm.sequence, sequence);
+        assert_eq!(arm.to, Provider::Codex);
+        assert_eq!(arm.surface, Surface::Auto);
+        assert_eq!(arm.expires_at, "2026-07-28T10:15:00Z");
+
+        // No expiry should have been journaled.
+        let events_after = store.events().unwrap();
+        assert_eq!(events_after.len(), events_before.len());
+    }
+
+    #[test]
+    fn pending_retires_the_arm_when_the_clock_reaches_or_passes_expiry() {
+        for now in ["2026-07-28T10:15:00Z", "2026-07-28T10:20:00Z"] {
+            let temp = TempDir::new().unwrap();
+            let runtime = FixedClock::new("2026-07-28T10:00:00Z");
+            let (store, sequence) =
+                store_with_armed_session(&temp, &runtime, "2026-07-28T10:15:00Z");
+
+            runtime.set(now);
+            let events_before = store.events().unwrap();
+            let result = pending(&store, &runtime, &events_before).unwrap();
+            assert!(result.is_none(), "now={now} should have expired the arm");
+
+            let events_after = store.events().unwrap();
+            assert_eq!(
+                events_after.len(),
+                events_before.len() + 1,
+                "now={now} should have journaled exactly one switch.expired event"
+            );
+            assert_eq!(
+                events_after.last().unwrap().kind,
+                EventKind::SwitchExpired {
+                    armed_sequence: sequence
+                },
+                "now={now}"
+            );
+        }
     }
 }
