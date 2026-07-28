@@ -462,3 +462,62 @@ fn attach_refuses_while_a_live_lease_holds_the_session() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// A merely stale/dead lease must not make `attach` refuse: only `"blocked"`
+/// refuses, and a dead lease classifies as `"recoverable"`. This is the
+/// row of the design table the feature exists for.
+#[test]
+fn attach_succeeds_when_the_session_has_only_a_stale_lease() {
+    use handover::model::{Provider, RunId, SessionId};
+    use handover::store::lease::{LeaseStore, ProcessIdentity, RunLease};
+
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    let state = temp.path().join("state");
+
+    let created = cargo_bin_cmd!("handover")
+        .current_dir(&repo)
+        .env("HANDOVER_HOME", &state)
+        .args(["attach", "claude", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created: serde_json::Value = serde_json::from_slice(&created.stdout).unwrap();
+    let session_id = SessionId::parse(created["session_id"].as_str().unwrap()).unwrap();
+
+    let session_dir = state.join("sessions").join(session_id.to_string());
+    let dead = RunLease::new(
+        session_id.clone(),
+        RunId::new(),
+        Provider::Claude,
+        ProcessIdentity {
+            pid: u32::MAX,
+            start_token: "gone".into(),
+        },
+    )
+    .unwrap();
+    LeaseStore::new(&session_dir).create(&dead).unwrap();
+
+    let output = cargo_bin_cmd!("handover")
+        .current_dir(&repo)
+        .env("HANDOVER_HOME", &state)
+        .args(["attach", "codex", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "a stale/dead lease is recoverable, not blocked; attach must not refuse: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["created"], false);
+    assert_eq!(
+        value["session_id"], created["session_id"],
+        "attach must resolve to the existing session, not create a new one"
+    );
+}

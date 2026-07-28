@@ -1230,24 +1230,32 @@ fn attach_command(
     let cwd = std::env::current_dir().map_err(|source| io(".", source))?;
     let layout = resolve_layout(environment, &cwd)?;
     let snapshot = Git::new().snapshot(&cwd)?;
-    let (store, created) = match SessionStore::find_for_worktree(&layout, &snapshot.identity)? {
-        Some(store) => {
-            let (state, reason) = classify_lease(&LeaseStore::new(&store.session_dir()))?;
-            if state == "blocked" {
-                return Err(Error::InvalidState(format!(
-                    "cannot attach to this worktree's session; {}",
-                    reason.unwrap_or_else(|| "it is already held".into())
-                )));
+    let (store, created, _operation) =
+        match SessionStore::find_for_worktree(&layout, &snapshot.identity)? {
+            Some(store) => {
+                // Acquire the operation lock before checking the lease so no other
+                // command can create a live lease between the check and the append
+                // below (see `claim_command`, which follows the same ordering).
+                let operation = SessionOperationLock::acquire(&store.session_dir())?;
+                let (state, reason) = classify_lease(&LeaseStore::new(&store.session_dir()))?;
+                if state == "blocked" {
+                    return Err(Error::InvalidState(format!(
+                        "cannot attach to this worktree's session; {}",
+                        reason.unwrap_or_else(|| "it is already held".into())
+                    )));
+                }
+                (store, false, operation)
             }
-            (store, false)
-        }
-        None => (
-            SessionStore::create(&layout, runtime, snapshot.clone())?,
-            true,
-        ),
-    };
+            None => {
+                // No session dir exists yet, so there is nothing to lock until
+                // after creation; the lock is acquired immediately afterward and
+                // held through the append below.
+                let store = SessionStore::create(&layout, runtime, snapshot.clone())?;
+                let operation = SessionOperationLock::acquire(&store.session_dir())?;
+                (store, true, operation)
+            }
+        };
 
-    let _operation = SessionOperationLock::acquire(&store.session_dir())?;
     store.append(runtime, None, Some(provider), EventKind::SessionAttached {})?;
 
     write_projection(
