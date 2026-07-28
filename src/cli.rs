@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use crate::model::Provider;
+use crate::model::{Provider, Surface};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -29,6 +29,15 @@ pub enum Command {
         recover_lease: bool,
         #[arg(last = true, allow_hyphen_values = true)]
         provider_args: Vec<OsString>,
+    },
+    Arm {
+        provider: Provider,
+        #[arg(long, value_enum, default_value = "auto")]
+        surface: Surface,
+        #[arg(long, default_value = crate::arm::DEFAULT_TTL)]
+        ttl: String,
+        #[arg(long)]
+        json: bool,
     },
     Preview {
         provider: Provider,

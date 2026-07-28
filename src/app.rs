@@ -27,7 +27,7 @@ use crate::handover::{
 };
 use crate::model::{
     Checkpoint, CheckpointAuthor, CheckpointKind, ContentRef, Event, EventEnvelope, EventKind,
-    ForkOperation, ForkPhase, GitSnapshot, Provider, RunId, SessionId,
+    ForkOperation, ForkPhase, GitSnapshot, Provider, RunId, SessionId, Surface,
 };
 use crate::provider::hook::{
     HookEvent, HookOutput, NormalizedHook, capture_failure_output, normalize, session_start_output,
@@ -78,6 +78,12 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
                 input_is_terminal,
             )
         }
+        Command::Arm {
+            provider,
+            surface,
+            ttl,
+            json,
+        } => arm_command(provider, surface, &ttl, json, environment, runtime),
         Command::Preview { provider, json } => handover_command(provider, json, environment),
         Command::Fork {
             provider,
@@ -1056,6 +1062,70 @@ fn handover_command(provider: Provider, json: bool, environment: &Environment) -
             .map_err(|source| io("stdout", source))?;
         Ok(0)
     }
+}
+
+fn arm_command(
+    provider: Provider,
+    surface: Surface,
+    ttl: &str,
+    json: bool,
+    environment: &Environment,
+    runtime: &dyn Runtime,
+) -> Result<i32> {
+    let ttl = crate::arm::parse_ttl(ttl)?;
+    let (_layout, snapshot, store) = current_session(environment)?;
+    let _operation = SessionOperationLock::acquire(&store.session_dir())?;
+    let events = store.events()?;
+    if let Some(existing) = crate::arm::pending(&store, runtime, &events)? {
+        return Err(Error::InvalidState(format!(
+            "a switch to {} is already armed at sequence {}; claim it or wait until {}",
+            existing.to.executable(),
+            existing.sequence,
+            existing.expires_at
+        )));
+    }
+
+    // Gate on exactly what `switch_readiness.ready` means, minus its lease
+    // term: arming while a provider is still running is the point.
+    preview_handover(&store, &snapshot, provider)?;
+
+    let events = store.events()?;
+    let (_, events_since) = crate::list::narrative_freshness(&events);
+    let checkpoint_fresh = events_since < STALE_NARRATIVE_EVENT_THRESHOLD;
+    if !checkpoint_fresh {
+        eprintln!(
+            "warning: {events_since} events since the last narrative checkpoint; \
+             the handover will be thin. Write one with `handover checkpoint`."
+        );
+    }
+
+    let armed_run = LeaseStore::new(&store.session_dir())
+        .read()?
+        .map(|lease| lease.run_id);
+    let expires_at = crate::arm::expires_at(runtime, ttl)?;
+    let event = store.append(
+        runtime,
+        armed_run,
+        previous_provider(&events)?,
+        EventKind::SwitchArmed {
+            to: provider,
+            surface,
+            expires_at: expires_at.clone(),
+        },
+    )?;
+
+    write_projection(
+        &serde_json::json!({
+            "schema_version": 1,
+            "armed_sequence": event.sequence,
+            "to": provider,
+            "surface": surface,
+            "expires_at": expires_at,
+            "checkpoint_fresh": checkpoint_fresh,
+        }),
+        json,
+    )?;
+    Ok(0)
 }
 
 #[allow(clippy::too_many_arguments)]
