@@ -45,6 +45,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    Attach {
+        provider: Provider,
+        #[arg(long)]
+        json: bool,
+    },
     Preview {
         provider: Provider,
         #[arg(long)]

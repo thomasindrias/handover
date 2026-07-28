@@ -377,3 +377,88 @@ fn claim_refuses_when_a_different_run_holds_the_lease() {
 
     leases.clear(&foreign_run.run_id).unwrap();
 }
+
+#[test]
+fn attach_binds_a_fresh_worktree_and_is_idempotent() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    let state = temp.path().join("state");
+
+    let first = cargo_bin_cmd!("handover")
+        .current_dir(&repo)
+        .env("HANDOVER_HOME", &state)
+        .args(["attach", "claude", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["created"], true);
+    assert_eq!(first["provider"], "claude");
+
+    let second = cargo_bin_cmd!("handover")
+        .current_dir(&repo)
+        .env("HANDOVER_HOME", &state)
+        .args(["attach", "codex", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+
+    assert_eq!(second["created"], false);
+    assert_eq!(
+        second["session_id"], first["session_id"],
+        "attach must resolve to the existing session, never create a second one"
+    );
+}
+
+#[test]
+fn attach_refuses_while_a_live_lease_holds_the_session() {
+    use handover::model::{Provider, RunId, SessionId};
+    use handover::store::lease::{LeaseStore, ProcessIdentity, RunLease};
+
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    let state = temp.path().join("state");
+
+    let created = cargo_bin_cmd!("handover")
+        .current_dir(&repo)
+        .env("HANDOVER_HOME", &state)
+        .args(["attach", "claude", "--json"])
+        .output()
+        .unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&created.stdout).unwrap();
+    let session_id = SessionId::parse(created["session_id"].as_str().unwrap()).unwrap();
+
+    let session_dir = state.join("sessions").join(session_id.to_string());
+    let lease = RunLease::new(
+        session_id,
+        RunId::new(),
+        Provider::Claude,
+        ProcessIdentity::capture(std::process::id()).unwrap(),
+    )
+    .unwrap();
+    LeaseStore::new(&session_dir).create(&lease).unwrap();
+
+    let output = cargo_bin_cmd!("handover")
+        .current_dir(&repo)
+        .env("HANDOVER_HOME", &state)
+        .args(["attach", "codex"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("still running"),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

@@ -48,6 +48,7 @@ fn implemented_commands_are_visible_and_internal_hooks_are_hidden() {
             "switch",
             "arm",
             "claim",
+            "attach",
             "preview",
             "fork",
             "checkpoint",

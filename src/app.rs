@@ -85,6 +85,7 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
             json,
         } => arm_command(provider, surface, &ttl, json, environment, runtime),
         Command::Claim { arm, json } => claim_command(arm, json, environment, runtime),
+        Command::Attach { provider, json } => attach_command(provider, json, environment, runtime),
         Command::Preview { provider, json } => handover_command(provider, json, environment),
         Command::Fork {
             provider,
@@ -1218,6 +1219,48 @@ fn claim_command(
             .map_err(|source| io("stdout", source))?;
         Ok(0)
     }
+}
+
+fn attach_command(
+    provider: Provider,
+    json: bool,
+    environment: &Environment,
+    runtime: &dyn Runtime,
+) -> Result<i32> {
+    let cwd = std::env::current_dir().map_err(|source| io(".", source))?;
+    let layout = resolve_layout(environment, &cwd)?;
+    let snapshot = Git::new().snapshot(&cwd)?;
+    let (store, created) = match SessionStore::find_for_worktree(&layout, &snapshot.identity)? {
+        Some(store) => {
+            let (state, reason) = classify_lease(&LeaseStore::new(&store.session_dir()))?;
+            if state == "blocked" {
+                return Err(Error::InvalidState(format!(
+                    "cannot attach to this worktree's session; {}",
+                    reason.unwrap_or_else(|| "it is already held".into())
+                )));
+            }
+            (store, false)
+        }
+        None => (
+            SessionStore::create(&layout, runtime, snapshot.clone())?,
+            true,
+        ),
+    };
+
+    let _operation = SessionOperationLock::acquire(&store.session_dir())?;
+    store.append(runtime, None, Some(provider), EventKind::SessionAttached {})?;
+
+    write_projection(
+        &serde_json::json!({
+            "schema_version": 1,
+            "session_id": store.id(),
+            "provider": provider,
+            "created": created,
+            "worktree": snapshot.identity.worktree,
+        }),
+        json,
+    )?;
+    Ok(0)
 }
 
 #[allow(clippy::too_many_arguments)]
