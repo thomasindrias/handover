@@ -14,11 +14,17 @@ fn help_identifies_the_product() {
 
 #[test]
 fn version_comes_from_the_package() {
+    // Comparing against the manifest is the whole point: a hardcoded version
+    // asserts nothing about where `--version` reads from, and turns every
+    // release into an edit here.
     cargo_bin_cmd!("handover")
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("handover 0.1.0"));
+        .stdout(predicate::str::contains(format!(
+            "handover {}",
+            env!("CARGO_PKG_VERSION")
+        )));
 }
 
 #[test]
