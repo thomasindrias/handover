@@ -53,6 +53,15 @@ fn finished_session() -> (
     (temp, cwd, state, path)
 }
 
+/// A process identity that cannot be live: `u32::MAX` is above every
+/// reachable pid, and the start token would not match even if it were.
+fn dead_identity() -> ProcessIdentity {
+    ProcessIdentity {
+        pid: u32::MAX,
+        start_token: "gone".into(),
+    }
+}
+
 /// The lone session directory under `<state>/sessions`, and its id.
 fn session_dir_and_id(state: &std::path::Path) -> (std::path::PathBuf, SessionId) {
     let dir = std::fs::read_dir(state.join("sessions"))
@@ -311,16 +320,7 @@ fn claim_clears_a_dead_lease_left_by_the_arming_run_without_prompting() {
     let (session, session_id) = session_dir_and_id(&state);
     let leases = LeaseStore::new(&session);
 
-    let dead = RunLease::new(
-        session_id,
-        RunId::new(),
-        Provider::Claude,
-        ProcessIdentity {
-            pid: u32::MAX,
-            start_token: "gone".into(),
-        },
-    )
-    .unwrap();
+    let dead = RunLease::new(session_id, RunId::new(), Provider::Claude, dead_identity()).unwrap();
     leases.create(&dead).unwrap();
 
     let armed = cargo_bin_cmd!("handover")
@@ -436,10 +436,7 @@ fn claim_refuses_when_a_different_run_holds_the_lease() {
         session_id.clone(),
         RunId::new(),
         Provider::Claude,
-        ProcessIdentity {
-            pid: u32::MAX,
-            start_token: "gone".into(),
-        },
+        dead_identity(),
     )
     .unwrap();
     leases.create(&arming_run).unwrap();
@@ -457,16 +454,8 @@ fn claim_refuses_when_a_different_run_holds_the_lease() {
     // never seen by `arm`, so it cannot be the one that authorised the
     // switch.
     leases.clear(&arming_run.run_id).unwrap();
-    let foreign_run = RunLease::new(
-        session_id,
-        RunId::new(),
-        Provider::Claude,
-        ProcessIdentity {
-            pid: u32::MAX,
-            start_token: "also gone".into(),
-        },
-    )
-    .unwrap();
+    let foreign_run =
+        RunLease::new(session_id, RunId::new(), Provider::Claude, dead_identity()).unwrap();
     leases.create(&foreign_run).unwrap();
 
     let output = cargo_bin_cmd!("handover")
@@ -583,7 +572,7 @@ fn attach_refuses_while_a_live_lease_holds_the_session() {
 #[test]
 fn attach_succeeds_when_the_session_has_only_a_stale_lease() {
     use handover::model::{Provider, RunId, SessionId};
-    use handover::store::lease::{LeaseStore, ProcessIdentity, RunLease};
+    use handover::store::lease::{LeaseStore, RunLease};
 
     let temp = TempDir::new().unwrap();
     let repo = temp.path().join("repo");
@@ -609,10 +598,7 @@ fn attach_succeeds_when_the_session_has_only_a_stale_lease() {
         session_id.clone(),
         RunId::new(),
         Provider::Claude,
-        ProcessIdentity {
-            pid: u32::MAX,
-            start_token: "gone".into(),
-        },
+        dead_identity(),
     )
     .unwrap();
     LeaseStore::new(&session_dir).create(&dead).unwrap();
