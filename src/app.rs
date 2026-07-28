@@ -50,7 +50,9 @@ const STALE_NARRATIVE_EVENT_THRESHOLD: u64 = 20;
 pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result<i32> {
     if environment.get("HANDOVER_RUN_ID").is_some() && !provider_command_allowed(&cli.command) {
         return Err(Error::InvalidState(
-            "an attached provider may only invoke Handover hooks or submit provider checkpoints"
+            "an attached provider may only invoke Handover hooks or submit provider checkpoints; \
+             to record one, pipe the checkpoint JSON into \
+             `handover checkpoint --format json --from-provider`"
                 .into(),
         ));
     }

@@ -6,6 +6,30 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 
 ## [Unreleased]
 
+### Added
+
+- A `/handover-checkpoint` command in the Claude integration that gathers the
+  session narrative and submits it, so writing a checkpoint no longer requires
+  knowing the raw CLI form.
+- Every handover now ends with the exact command that records a checkpoint.
+  A provider reads its handover at SessionStart, so any attached agent — Claude
+  or Codex — is told how to leave a narrative for the next one.
+
+### Fixed
+
+- Nothing told an agent how to checkpoint. The plugin shipped hooks only, the
+  handover never mentioned the command, and the staleness nudge said "ask the
+  agent to checkpoint" while the agent had no way to know how. A session could
+  therefore accumulate hundreds of events and still hand over with no
+  narrative, which is the one thing observed events cannot supply.
+- The refusal an attached provider receives now names
+  `handover checkpoint --format json --from-provider`, instead of stating only
+  that a provider may submit checkpoints and leaving the flag to be guessed.
+- `handover doctor` reports an integration that predates a newer Handover as
+  `integration.outdated` with the `handover setup <provider>` that fixes it,
+  rather than a bare "No such file or directory" from the first asset the older
+  install has never seen.
+
 ## [0.1.0] - 2026-07-27
 
 ### Added

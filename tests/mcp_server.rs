@@ -74,6 +74,17 @@ fn mcp_server_starts_under_an_attached_provider_while_other_commands_stay_refuse
                 "an attached provider may only invoke Handover hooks or submit provider checkpoints",
             ));
     }
+
+    // A refused agent has to be able to correct itself, so the refusal names
+    // the flag that makes a checkpoint the one mutation it may perform.
+    cargo_bin_cmd!("handover")
+        .env("HANDOVER_HOME", &state)
+        .env("HANDOVER_SESSION_ID", SESSION_ID)
+        .env("HANDOVER_RUN_ID", RUN_ID)
+        .args(["checkpoint"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--from-provider"));
 }
 
 fn send(
