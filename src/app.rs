@@ -1193,14 +1193,34 @@ fn arm_command(
 ///
 /// The privilege is narrow: a *dead* lease belonging to the arming run may be
 /// cleared without the recovery prompt. Nothing else may be touched.
-fn release_for_claim(leases: &LeaseStore, pending: &crate::arm::PendingArm) -> Result<()> {
+///
+/// Clearing it is a recovery, so it is journaled as `run.recovered` naming
+/// the claim as the reason, exactly as the `switch` and `fork` recovery paths
+/// record theirs. No lease leaves this session's history unexplained.
+fn release_for_claim(
+    store: &SessionStore,
+    leases: &LeaseStore,
+    runtime: &dyn Runtime,
+    recovery_snapshot: &GitSnapshot,
+    pending: &crate::arm::PendingArm,
+) -> Result<()> {
     let Some(lease) = leases.read()? else {
         return Ok(());
     };
-    if lease.host != host_name()? || pending.armed_run.as_ref() != Some(&lease.run_id) {
+    // Two separate refusals. A foreign-host lease may well have been created
+    // by the arming run -- it just cannot be checked from here -- so it must
+    // not be told that something else created it.
+    if lease.host != host_name()? {
         let (_state, reason) = classify_lease(leases)?;
         return Err(Error::InvalidState(format!(
-            "this session's lease was not created by the run that armed the switch; {}",
+            "cannot release this session's lease; {}",
+            reason.unwrap_or_else(|| "inspect it with `handover status`".into())
+        )));
+    }
+    if pending.armed_run.as_ref() != Some(&lease.run_id) {
+        let (_state, reason) = classify_lease(leases)?;
+        return Err(Error::InvalidState(format!(
+            "cannot release this session's lease; it was not created by the run that armed the switch; {}",
             reason.unwrap_or_else(|| "inspect it with `handover status`".into())
         )));
     }
@@ -1211,7 +1231,37 @@ fn release_for_claim(leases: &LeaseStore, pending: &crate::arm::PendingArm) -> R
             holder.describe()
         )));
     }
-    leases.clear(&lease.run_id)
+    store.append(
+        runtime,
+        Some(lease.run_id.clone()),
+        Some(lease.provider),
+        EventKind::RunRecovered {
+            supervisor_pid: lease.supervisor.pid,
+            supervisor_start_token: lease.supervisor.start_token.clone(),
+            child_pid: lease.child.as_ref().map(|child| child.pid),
+            child_start_token: lease.child.as_ref().map(|child| child.start_token.clone()),
+            host: lease.host.clone(),
+            reason: format!(
+                "released by claim of the switch armed at sequence {}",
+                pending.sequence
+            ),
+        },
+    )?;
+    store.append(
+        runtime,
+        Some(lease.run_id.clone()),
+        Some(lease.provider),
+        EventKind::GitSnapshot {
+            snapshot: recovery_snapshot.clone(),
+        },
+    )?;
+    leases.clear(&lease.run_id)?;
+    eprintln!(
+        "Released the stale {} lease left by the arming run ({}); completing the armed switch.",
+        lease.provider.executable(),
+        lease.supervisor.describe()
+    );
+    Ok(())
 }
 
 fn claim_command(
@@ -1234,7 +1284,14 @@ fn claim_command(
         )));
     }
 
-    release_for_claim(&LeaseStore::new(&store.session_dir()), &pending)?;
+    // Prove the handover renders before anything is released or appended: a
+    // missing blob, a vanished saved cwd, or an oversized document must leave
+    // the arm pending and the lease untouched. "Nothing happened" is a state
+    // the user can retry; "half happened" is not.
+    preview_handover(&store, &snapshot, pending.to)?;
+
+    let leases = LeaseStore::new(&store.session_dir());
+    release_for_claim(&store, &leases, runtime, &snapshot, &pending)?;
 
     // A claim is a provider boundary, so it commits a real transition
     // checkpoint exactly as `switch` does. Nothing else may build the

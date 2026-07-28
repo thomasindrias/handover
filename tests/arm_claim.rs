@@ -323,13 +323,20 @@ fn claim_clears_a_dead_lease_left_by_the_arming_run_without_prompting() {
     .unwrap();
     leases.create(&dead).unwrap();
 
-    cargo_bin_cmd!("handover")
+    let armed = cargo_bin_cmd!("handover")
         .current_dir(&cwd)
         .env("HANDOVER_HOME", &state)
         .env("PATH", &path)
-        .args(["arm", "codex"])
-        .assert()
-        .success();
+        .args(["arm", "codex", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        armed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&armed.stderr)
+    );
+    let armed: serde_json::Value = serde_json::from_slice(&armed.stdout).unwrap();
+    let armed_sequence = armed["armed_sequence"].as_u64().unwrap();
 
     let output = cargo_bin_cmd!("handover")
         .current_dir(&cwd)
@@ -348,6 +355,31 @@ fn claim_clears_a_dead_lease_left_by_the_arming_run_without_prompting() {
     assert!(
         leases.read().unwrap().is_none(),
         "the dead lease left by the arming run should be cleared, not merely ignored"
+    );
+
+    // Clearing a lease is a recovery, and recoveries are recorded: neither
+    // the journal nor the user is left to infer that it happened.
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Released the stale claude lease"),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["log", "--json"])
+        .output()
+        .unwrap();
+    let recovered = String::from_utf8_lossy(&log.stdout)
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|envelope| envelope["event"]["type"] == "run.recovered")
+        .expect("releasing the arming run's lease must be journaled");
+    assert_eq!(recovered["event"]["run_id"], dead.run_id.to_string());
+    assert_eq!(
+        recovered["event"]["payload"]["reason"],
+        format!("released by claim of the switch armed at sequence {armed_sequence}")
     );
 }
 
