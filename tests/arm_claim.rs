@@ -158,6 +158,88 @@ fn claim_consumes_the_arm_and_prints_the_handover() {
     );
 }
 
+/// The handover is the product, and every sequence it names is
+/// independently checkable against the journal. `claim` crosses a provider
+/// boundary, so it must commit a real transition checkpoint and describe
+/// that one -- never a number that no event answers to.
+#[test]
+fn the_handover_claim_emits_names_a_transition_checkpoint_that_exists() {
+    let (_temp, cwd, state, path) = finished_session();
+
+    let run = |args: &[&str]| {
+        cargo_bin_cmd!("handover")
+            .current_dir(&cwd)
+            .env("HANDOVER_HOME", &state)
+            .env("PATH", &path)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let armed: serde_json::Value =
+        serde_json::from_slice(&run(&["arm", "codex", "--json"]).stdout).unwrap();
+    let armed_sequence = armed["armed_sequence"].as_u64().unwrap();
+
+    let claimed = run(&["claim", "--json"]);
+    assert!(
+        claimed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&claimed.stderr)
+    );
+    let claimed: serde_json::Value = serde_json::from_slice(&claimed.stdout).unwrap();
+    let transition = claimed["transition"]["sequence"].as_u64().unwrap();
+
+    // What the emitted document tells the next provider.
+    let markdown = claimed["markdown"].as_str().unwrap();
+    assert!(
+        markdown.contains(&format!("- Transition event sequence: {transition}\n")),
+        "handover was: {markdown}"
+    );
+    assert!(
+        markdown.contains(&format!(
+            "## Transition checkpoint\n\n- Event sequence: {transition}\n- Includes committed facts through sequence: {}\n",
+            transition - 1
+        )),
+        "handover was: {markdown}"
+    );
+
+    // What the journal says about that same sequence.
+    let log = run(&["log", "--json"]);
+    let journal: Vec<serde_json::Value> = String::from_utf8_lossy(&log.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let event = journal
+        .iter()
+        .map(|envelope| &envelope["event"])
+        .find(|event| event["sequence"] == transition)
+        .unwrap_or_else(|| {
+            panic!("the handover names transition {transition}, absent from the journal")
+        });
+    assert_eq!(event["type"], "checkpoint.created");
+    assert_eq!(event["payload"]["checkpoint_kind"], "transition");
+    assert_eq!(event["payload"]["through_sequence"], transition - 1);
+
+    // The checkpoint the event points at is on disk too.
+    let (session, _) = session_dir_and_id(&state);
+    assert!(
+        session
+            .join(event["payload"]["path"].as_str().unwrap())
+            .is_file()
+    );
+
+    // And the claim records which committed prefix it handed over, so the
+    // journal alone answers "what did the switching provider receive?".
+    let claim_event = journal
+        .iter()
+        .map(|envelope| &envelope["event"])
+        .find(|event| event["type"] == "switch.claimed")
+        .expect("the claim must be journaled");
+    assert_eq!(claim_event["payload"]["armed_sequence"], armed_sequence);
+    assert_eq!(claim_event["payload"]["through_sequence"], transition);
+    assert!(claim_event["sequence"].as_u64().unwrap() > transition);
+}
+
 #[test]
 fn claim_refuses_when_the_asserted_arm_is_not_the_pending_one() {
     let (_temp, cwd, state, path) = finished_session();

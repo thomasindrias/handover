@@ -37,8 +37,15 @@ pub enum EventKind {
         surface: Surface,
         expires_at: String,
     },
+    /// A claim of the arm at `armed_sequence`. `through_sequence` is the
+    /// sequence of the transition checkpoint this claim's handover was built
+    /// from — the committed prefix the switching provider is handed.
     #[serde(rename = "switch.claimed")]
-    SwitchClaimed { armed_sequence: u64, to: Provider },
+    SwitchClaimed {
+        armed_sequence: u64,
+        to: Provider,
+        through_sequence: u64,
+    },
     #[serde(rename = "switch.expired")]
     SwitchExpired { armed_sequence: u64 },
     #[serde(rename = "session.attached")]
@@ -260,9 +267,14 @@ mod tests {
                 EventKind::SwitchClaimed {
                     armed_sequence: 12,
                     to: Provider::Codex,
+                    through_sequence: 18,
                 },
                 "switch.claimed",
-                serde_json::json!({ "armed_sequence": 12, "to": "codex" }),
+                serde_json::json!({
+                    "armed_sequence": 12,
+                    "to": "codex",
+                    "through_sequence": 18
+                }),
             ),
             (
                 EventKind::SwitchExpired { armed_sequence: 12 },

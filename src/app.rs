@@ -9,7 +9,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::checkpoint::{
-    edit_narrative, load_verified_checkpoint, promote_inbox, read_narrative_json,
+    StoredCheckpoint, edit_narrative, load_verified_checkpoint, promote_inbox, read_narrative_json,
     submit_provider_narrative,
 };
 use crate::cli::{CheckpointFormat, Cli, Command};
@@ -750,14 +750,7 @@ pub fn switch_command(
         input_is_terminal,
     )?;
 
-    let (saved_cwd_relative, saved_cwd) = resolve_saved_cwd(&store)?;
-    let switch_snapshot = Git::new().snapshot(&saved_cwd)?;
-    verify_switch_snapshot(
-        &invocation_snapshot,
-        &switch_snapshot,
-        &store.meta().worktree,
-        &saved_cwd_relative,
-    )?;
+    let (saved_cwd, switch_snapshot) = resolve_switch_snapshot(&store, &invocation_snapshot)?;
     store.append(
         runtime,
         None,
@@ -777,49 +770,14 @@ pub fn switch_command(
             to: provider,
         },
     )?;
-    let events_before_transition = store.events()?;
-    let narrative_checkpoint = latest_narrative_checkpoint(&store, &events_before_transition)?;
-    let narrative_sequence = narrative_checkpoint.as_ref().map(|item| item.0);
-    let (transition_event, transition_stored) =
-        store.create_transition_checkpoint(runtime, None, None, narrative_sequence)?;
-
-    let envelopes = EventJournal::new(&store.session_dir(), store.id().clone()).read_repair()?;
-    let recent_boundary = narrative_sequence.unwrap_or(0);
-    let recent_events = collect_recent_events(&envelopes, recent_boundary)?;
-    let events: Vec<_> = envelopes.iter().map(|item| item.event.clone()).collect();
-    let (recent_commands, latest_test, latest_failure, capture_gaps) =
-        command_facts(&store, &events)?;
-    let rendered = render_with_selection(
-        HandoverInput {
-            session_id: store.id().clone(),
-            parent_lineage: None,
-            from_provider: previous_provider,
-            to_provider: provider,
-            transition_sequence: transition_event.sequence,
-            transition_checkpoint: transition_stored.checkpoint,
-            narrative_checkpoint,
-            snapshot: switch_snapshot.clone(),
-            recent_events,
-            recent_commands,
-            latest_test,
-            latest_failure,
-            capture_gaps,
-        },
-        MAX_HANDOVER_BYTES,
-    )?;
-    let recent_events_jsonl = selected_event_lines(&envelopes, &rendered.recent_event_sequences)?;
-    if recent_events_jsonl.len() > MAX_HANDOVER_BYTES {
-        return Err(Error::InvalidState(
-            "selected recent events exceed 64 KiB".into(),
-        ));
-    }
+    let built = commit_transition_handover(&store, runtime, switch_snapshot, provider)?;
 
     let run_id = runtime.run_id();
     let run_paths = prepare_run_directory(
         &store,
         &run_id,
-        rendered.markdown.as_bytes(),
-        &recent_events_jsonl,
+        built.rendered.markdown.as_bytes(),
+        &built.recent_events_jsonl,
     )?;
     let provider_adapter = adapter(provider);
     provider_adapter.setup(&layout.integrations())?;
@@ -949,7 +907,46 @@ fn collect_recent_events(
     Ok(recent_events)
 }
 
-struct HandoverPreview {
+/// The transition checkpoint a handover is rendered against.
+///
+/// `switch` and `claim` supply one they have just committed to the journal;
+/// `preview` and `status` supply one that only describes what a switch
+/// *would* commit, because a dry run must append nothing.
+struct Transition {
+    sequence: u64,
+    checkpoint: Checkpoint,
+}
+
+impl Transition {
+    /// The transition `SessionStore::create_transition_checkpoint` just
+    /// committed: `sequence` names a `checkpoint.created` event that exists.
+    fn committed(event: &Event, stored: StoredCheckpoint) -> Self {
+        Self {
+            sequence: event.sequence,
+            checkpoint: stored.checkpoint,
+        }
+    }
+
+    /// The transition a switch would commit next. Never journaled — callers
+    /// use it to prove the document renders without mutating anything.
+    fn hypothetical(events: &[Event], narrative_sequence: Option<u64>) -> Self {
+        let through_sequence = events.last().map(|event| event.sequence).unwrap_or(0);
+        Self {
+            sequence: through_sequence + 1,
+            checkpoint: Checkpoint {
+                schema_version: 1,
+                checkpoint_kind: CheckpointKind::Transition,
+                through_sequence,
+                author: CheckpointAuthor::System,
+                narrative: None,
+                narrative_checkpoint_sequence: narrative_sequence,
+            },
+        }
+    }
+}
+
+/// One rendered handover plus the facts its callers report alongside it.
+struct BuiltHandover {
     events: Vec<Event>,
     from_provider: Option<Provider>,
     transition_sequence: u64,
@@ -957,50 +954,37 @@ struct HandoverPreview {
     narrative_checkpoint: Option<(u64, Checkpoint)>,
     capture_gaps: Vec<CaptureGap>,
     rendered: crate::handover::RenderedHandover,
+    recent_events_jsonl: Vec<u8>,
 }
 
-/// Dry-run of the same handover a `switch` to `to_provider` would build:
-/// resolves the saved cwd, verifies it against `invocation_snapshot`, and
-/// renders — a pure read with no mutation, no lease/journal writes. Used
-/// by `handover_command` (`handover preview`) and by `status_command`'s
-/// `switch_readiness` check so both report the exact same verdict
-/// `switch` itself will produce.
-fn preview_handover(
+/// Render the handover for a switch to `to_provider` against the journal
+/// exactly as it stands when called.
+///
+/// Every command that emits a handover — `switch`, `claim`, `preview`,
+/// `status`'s readiness check, the MCP server — renders through here, so no
+/// two of them can describe the same session differently. The one thing
+/// callers vary is the `transition`, because only they know whether it is
+/// committed or hypothetical.
+fn build_handover(
     store: &SessionStore,
-    invocation_snapshot: &GitSnapshot,
+    switch_snapshot: GitSnapshot,
     to_provider: Provider,
-) -> Result<HandoverPreview> {
-    let (saved_cwd_relative, saved_cwd) = resolve_saved_cwd(store)?;
-    let switch_snapshot = Git::new().snapshot(&saved_cwd)?;
-    verify_switch_snapshot(
-        invocation_snapshot,
-        &switch_snapshot,
-        &store.meta().worktree,
-        &saved_cwd_relative,
-    )?;
-
-    let events = store.events()?;
-    let from_provider = previous_provider(&events)?;
-    let narrative_checkpoint = latest_narrative_checkpoint(store, &events)?;
-    let narrative_sequence = narrative_checkpoint.as_ref().map(|item| item.0);
-
+    transition: Transition,
+    narrative_checkpoint: Option<(u64, Checkpoint)>,
+) -> Result<BuiltHandover> {
     let envelopes = store.envelopes()?;
-    let recent_boundary = narrative_sequence.unwrap_or(0);
+    let events: Vec<Event> = envelopes.iter().map(|item| item.event.clone()).collect();
+    let from_provider = previous_provider(&events)?;
+    let recent_boundary = narrative_checkpoint
+        .as_ref()
+        .map(|item| item.0)
+        .unwrap_or(0);
     let recent_events = collect_recent_events(&envelopes, recent_boundary)?;
     let (recent_commands, latest_test, latest_failure, capture_gaps) =
         command_facts(store, &events)?;
 
-    let through_sequence = events.last().map(|event| event.sequence).unwrap_or(0);
-    let transition_sequence = through_sequence + 1;
-    let transition_checkpoint = Checkpoint {
-        schema_version: 1,
-        checkpoint_kind: CheckpointKind::Transition,
-        through_sequence,
-        author: CheckpointAuthor::System,
-        narrative: None,
-        narrative_checkpoint_sequence: narrative_sequence,
-    };
-
+    let transition_sequence = transition.sequence;
+    let through_sequence = transition.checkpoint.through_sequence;
     let rendered = render_with_selection(
         HandoverInput {
             session_id: store.id().clone(),
@@ -1008,7 +992,7 @@ fn preview_handover(
             from_provider,
             to_provider,
             transition_sequence,
-            transition_checkpoint,
+            transition_checkpoint: transition.checkpoint,
             narrative_checkpoint: narrative_checkpoint.clone(),
             snapshot: switch_snapshot,
             recent_events,
@@ -1026,7 +1010,7 @@ fn preview_handover(
         ));
     }
 
-    Ok(HandoverPreview {
+    Ok(BuiltHandover {
         events,
         from_provider,
         transition_sequence,
@@ -1034,7 +1018,80 @@ fn preview_handover(
         narrative_checkpoint,
         capture_gaps,
         rendered,
+        recent_events_jsonl,
     })
+}
+
+/// Resolve the saved cwd and verify it still describes the same unchanged
+/// worktree the command was invoked from, returning that cwd and the
+/// snapshot the handover must be rendered against.
+fn resolve_switch_snapshot(
+    store: &SessionStore,
+    invocation_snapshot: &GitSnapshot,
+) -> Result<(PathBuf, GitSnapshot)> {
+    let (saved_cwd_relative, saved_cwd) = resolve_saved_cwd(store)?;
+    let switch_snapshot = Git::new().snapshot(&saved_cwd)?;
+    verify_switch_snapshot(
+        invocation_snapshot,
+        &switch_snapshot,
+        &store.meta().worktree,
+        &saved_cwd_relative,
+    )?;
+    Ok((saved_cwd, switch_snapshot))
+}
+
+/// Dry-run of the same handover a `switch` to `to_provider` would build:
+/// resolves the saved cwd, verifies it against `invocation_snapshot`, and
+/// renders — a pure read with no mutation, no lease/journal writes. Its
+/// transition is hypothetical, so the document it produces must never be
+/// handed to a provider as a record of a switch that happened. Used by
+/// `handover_command` (`handover preview`), by `status_command`'s
+/// `switch_readiness` check, and by `arm_command` and `claim_command` as the
+/// gate that proves the real handover will render.
+fn preview_handover(
+    store: &SessionStore,
+    invocation_snapshot: &GitSnapshot,
+    to_provider: Provider,
+) -> Result<BuiltHandover> {
+    let (_, snapshot) = resolve_switch_snapshot(store, invocation_snapshot)?;
+    let events = store.events()?;
+    let narrative_checkpoint = latest_narrative_checkpoint(store, &events)?;
+    let transition =
+        Transition::hypothetical(&events, narrative_checkpoint.as_ref().map(|item| item.0));
+    build_handover(
+        store,
+        snapshot,
+        to_provider,
+        transition,
+        narrative_checkpoint,
+    )
+}
+
+/// Commit a transition checkpoint and render the handover against it.
+///
+/// `switch` and `claim` are both provider boundaries, and a boundary leaves a
+/// real `checkpoint.created` event behind so the document it emits names a
+/// checkpoint that exists in the journal. Callers must already hold
+/// `SessionOperationLock`, and must already have proven the document renders
+/// (see `preview_handover`) if they mutated anything first.
+fn commit_transition_handover(
+    store: &SessionStore,
+    runtime: &dyn Runtime,
+    snapshot: GitSnapshot,
+    to_provider: Provider,
+) -> Result<BuiltHandover> {
+    let events = store.events()?;
+    let narrative_checkpoint = latest_narrative_checkpoint(store, &events)?;
+    let narrative_sequence = narrative_checkpoint.as_ref().map(|item| item.0);
+    let (event, stored) =
+        store.create_transition_checkpoint(runtime, None, None, narrative_sequence)?;
+    build_handover(
+        store,
+        snapshot,
+        to_provider,
+        Transition::committed(&event, stored),
+        narrative_checkpoint,
+    )
 }
 
 fn handover_command(provider: Provider, json: bool, environment: &Environment) -> Result<i32> {
@@ -1190,7 +1247,13 @@ fn claim_command(
     }
 
     release_for_claim(&LeaseStore::new(&store.session_dir()), &pending)?;
-    let preview = preview_handover(&store, &snapshot, pending.to)?;
+
+    // A claim is a provider boundary, so it commits a real transition
+    // checkpoint exactly as `switch` does. Nothing else may build the
+    // document: a claim that rendered its own would hand the next provider a
+    // checkpoint sequence no journal entry answers to.
+    let (_, switch_snapshot) = resolve_switch_snapshot(&store, &snapshot)?;
+    let built = commit_transition_handover(&store, runtime, switch_snapshot, pending.to)?;
     store.append(
         runtime,
         None,
@@ -1198,24 +1261,25 @@ fn claim_command(
         EventKind::SwitchClaimed {
             armed_sequence: pending.sequence,
             to: pending.to,
+            through_sequence: built.transition_sequence,
         },
     )?;
 
     if json {
         write_handover_projection(
             &store,
-            preview.from_provider,
+            built.from_provider,
             pending.to,
-            preview.transition_sequence,
-            preview.through_sequence,
-            &preview.events,
-            preview.narrative_checkpoint,
-            preview.capture_gaps,
-            &preview.rendered,
+            built.transition_sequence,
+            built.through_sequence,
+            &built.events,
+            built.narrative_checkpoint,
+            built.capture_gaps,
+            &built.rendered,
         )
     } else {
         std::io::stdout()
-            .write_all(preview.rendered.markdown.as_bytes())
+            .write_all(built.rendered.markdown.as_bytes())
             .map_err(|source| io("stdout", source))?;
         Ok(0)
     }

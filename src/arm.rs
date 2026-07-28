@@ -226,6 +226,7 @@ mod tests {
             EventKind::SwitchClaimed {
                 armed_sequence: 4,
                 to: Provider::Codex,
+                through_sequence: 4,
             },
             EventKind::SwitchExpired { armed_sequence: 4 },
         ] {
