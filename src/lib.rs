@@ -1,4 +1,5 @@
 pub mod app;
+pub mod arm;
 pub mod checkpoint;
 pub mod cli;
 pub mod doctor;
