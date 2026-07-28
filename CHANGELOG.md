@@ -6,6 +6,8 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-28
+
 ### Added
 
 - A `/handover-checkpoint` command in the Claude integration that gathers the
