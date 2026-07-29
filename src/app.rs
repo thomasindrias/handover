@@ -594,6 +594,166 @@ fn doctor_command(json: bool, repair: bool, environment: &Environment) -> Result
     )
 }
 
+/// What one launch needs. `run` and `switch` differ only in these four values;
+/// everything after the launch is identical, which is why they share a tail.
+struct LaunchRequest {
+    provider: Provider,
+    document: Vec<u8>,
+    recent_events_jsonl: Vec<u8>,
+    bootstrap: Option<&'static str>,
+    cwd: PathBuf,
+}
+
+/// Launch `provider`, supervise it, and record its stop.
+///
+/// When the provider exits and an arm is pending, claim it and launch its
+/// target in the same terminal rather than returning. That loop is the
+/// in-session handover: arm while a provider runs, quit it, and its successor
+/// comes up where it was. Each hop needs its own arm, because a claim consumes
+/// the one it acts on.
+///
+/// Takes ownership of `operation` — the lock is dropped before the child
+/// launches and re-acquired for teardown, exactly as the two call sites did.
+#[allow(clippy::too_many_arguments)]
+fn launch_supervised_run(
+    store: &SessionStore,
+    layout: &StateLayout,
+    leases: &LeaseStore,
+    runtime: &dyn Runtime,
+    environment: &Environment,
+    provider_args: &[OsString],
+    request: LaunchRequest,
+    mut operation: SessionOperationLock,
+) -> Result<i32> {
+    let mut request = request;
+    loop {
+        let provider = request.provider;
+        let saved_cwd = request.cwd.clone();
+        let run_id = runtime.run_id();
+        let run_paths = prepare_run_directory(
+            store,
+            &run_id,
+            &request.document,
+            &request.recent_events_jsonl,
+        )?;
+        let provider_adapter = adapter(provider);
+        provider_adapter.setup(&layout.integrations())?;
+        let provider_version = provider_adapter.probe()?;
+        let hook_bin = std::env::current_exe()
+            .map_err(|source| io("current executable", source))?
+            .canonicalize()
+            .map_err(|source| io("current executable", source))?;
+        store.append(
+            runtime,
+            Some(run_id.clone()),
+            Some(provider),
+            EventKind::RunStarted {
+                cwd: saved_cwd
+                    .to_str()
+                    .ok_or_else(|| Error::InvalidState("saved cwd must be valid UTF-8".into()))?
+                    .to_owned(),
+                args: provider_args.iter().map(|arg| encode_arg(arg)).collect(),
+                supervisor_pid: std::process::id(),
+            },
+        )?;
+        let lease = RunLease::new(
+            store.id().clone(),
+            run_id.clone(),
+            provider,
+            ProcessIdentity::capture(std::process::id())?,
+        )?;
+        leases.create(&lease)?;
+        let provider_home = resolve_provider_home(provider, environment);
+        let mut spec = provider_adapter.launch_spec(LaunchContext {
+            cwd: &saved_cwd,
+            inbox: &run_paths.inbox,
+            integration_root: &layout.integrations(),
+            hook_bin: &hook_bin,
+            provider_args,
+            bootstrap: request.bootstrap,
+            run_dir: &run_paths.root,
+            provider_home: provider_home.as_deref(),
+        })?;
+        add_run_environment(
+            &mut spec.env,
+            layout,
+            store,
+            &run_id,
+            provider,
+            &provider_version,
+            &hook_bin,
+            &run_paths,
+        );
+        drop(operation);
+
+        let supervised = Supervisor::launch(spec, store, &run_id, Duration::from_secs(60));
+        operation = SessionOperationLock::acquire(&store.session_dir())?;
+        let (facts, supervision_error) = match supervised {
+            Ok(outcome) => (outcome.facts.clone(), outcome.startup_failure.clone()),
+            Err(error) => (
+                ExitFacts {
+                    exit_code: None,
+                    signal: None,
+                },
+                Some(error.to_string()),
+            ),
+        };
+        promote_inbox(store, runtime, &run_id, provider, &run_paths.checkpoints)?;
+        store.append(
+            runtime,
+            Some(run_id.clone()),
+            Some(provider),
+            EventKind::RunStopped {
+                exit_code: facts.exit_code,
+                signal: facts.signal,
+            },
+        )?;
+        let post = Git::new().snapshot(&saved_cwd)?;
+        store.append(
+            runtime,
+            Some(run_id.clone()),
+            Some(provider),
+            EventKind::GitSnapshot {
+                snapshot: post.clone(),
+            },
+        )?;
+        leases.clear(&run_id)?;
+
+        if let Some(message) = supervision_error {
+            drop(operation);
+            return Err(Error::Command(message));
+        }
+
+        // The lease is clear, so a pending arm can be claimed now. Anything
+        // that stops the handover -- an expired arm, a handover that will not
+        // render -- leaves this run's exit as the result rather than failing
+        // a session that already did its work.
+        let pending = crate::arm::pending(store, runtime, &store.events()?)?;
+        let Some(pending) = pending else {
+            drop(operation);
+            return Ok(facts
+                .exit_code
+                .unwrap_or_else(|| 128 + facts.signal.unwrap_or(1)));
+        };
+        eprintln!(
+            "Handing over to {} (armed at sequence {}).",
+            pending.to.executable(),
+            pending.sequence
+        );
+        let built = claim_pending(store, leases, runtime, &post, &pending)?;
+        // The successor is a switch, so it gets the bootstrap and the saved
+        // cwd even when this hop began as a plain `run`.
+        let (_, next_cwd) = resolve_saved_cwd(store)?;
+        request = LaunchRequest {
+            provider: pending.to,
+            document: built.rendered.markdown.into_bytes(),
+            recent_events_jsonl: built.recent_events_jsonl,
+            bootstrap: Some(BOOTSTRAP),
+            cwd: next_cwd,
+        };
+    }
+}
+
 pub fn run_command(
     provider: Provider,
     provider_args: Vec<OsString>,
@@ -610,8 +770,6 @@ pub fn run_command(
         )));
     }
     let store = SessionStore::create(&layout, runtime, snapshot.clone())?;
-    let run_id = runtime.run_id();
-    let provider_adapter = adapter(provider);
 
     let operation = SessionOperationLock::acquire(&store.session_dir())?;
     let leases = LeaseStore::new(&store.session_dir());
@@ -620,108 +778,23 @@ pub fn run_command(
             "session already has an active or stale provider lease".into(),
         ));
     }
-    provider_adapter.setup(&layout.integrations())?;
-    let provider_version = provider_adapter.probe()?;
-    let run_paths = prepare_run_directory(
+
+    launch_supervised_run(
         &store,
-        &run_id,
-        b"# Handover\n\nThis is the first provider run in this session. Continue from the current Git worktree and user prompt.\n",
-        b"",
-    )?;
-    let hook_bin = std::env::current_exe()
-        .map_err(|source| io("current executable", source))?
-        .canonicalize()
-        .map_err(|source| io("current executable", source))?;
-    let args_for_event = provider_args.iter().map(|arg| encode_arg(arg)).collect();
-    store.append(
+        &layout,
+        &leases,
         runtime,
-        Some(run_id.clone()),
-        Some(provider),
-        EventKind::RunStarted {
-            cwd: snapshot
-                .identity
-                .worktree
-                .join(&snapshot.identity.cwd_relative)
-                .to_str()
-                .expect("validated Git identity is UTF-8")
-                .to_owned(),
-            args: args_for_event,
-            supervisor_pid: std::process::id(),
+        environment,
+        &provider_args,
+        LaunchRequest {
+            provider,
+            document: b"# Handover\n\nThis is the first provider run in this session. Continue from the current Git worktree and user prompt.\n".to_vec(),
+            recent_events_jsonl: Vec::new(),
+            bootstrap: None,
+            cwd: cwd.clone(),
         },
-    )?;
-    let lease = RunLease::new(
-        store.id().clone(),
-        run_id.clone(),
-        provider,
-        ProcessIdentity::capture(std::process::id())?,
-    )?;
-    leases.create(&lease)?;
-    let provider_home = resolve_provider_home(provider, environment);
-    let mut spec = provider_adapter.launch_spec(LaunchContext {
-        cwd: &cwd,
-        inbox: &run_paths.inbox,
-        integration_root: &layout.integrations(),
-        hook_bin: &hook_bin,
-        provider_args: &provider_args,
-        bootstrap: None,
-        run_dir: &run_paths.root,
-        provider_home: provider_home.as_deref(),
-    })?;
-    for (key, value) in [
-        ("HANDOVER_HOME", layout.root().as_os_str()),
-        ("HANDOVER_SESSION_ID", OsStr::new(&store.id().to_string())),
-        ("HANDOVER_RUN_ID", OsStr::new(&run_id.to_string())),
-        ("HANDOVER_PROVIDER", OsStr::new(provider.executable())),
-        ("HANDOVER_PROVIDER_VERSION", OsStr::new(&provider_version)),
-        ("HANDOVER_HOOK_BIN", hook_bin.as_os_str()),
-        ("HANDOVER_DOCUMENT_PATH", run_paths.handover.as_os_str()),
-        (
-            "HANDOVER_CHECKPOINT_INBOX",
-            run_paths.checkpoints.as_os_str(),
-        ),
-    ] {
-        spec.env.insert(OsString::from(key), value.to_owned());
-    }
-    drop(operation);
-
-    let supervised = Supervisor::launch(spec, &store, &run_id, Duration::from_secs(60));
-    let operation = SessionOperationLock::acquire(&store.session_dir())?;
-    let (facts, supervision_error) = match supervised {
-        Ok(outcome) => (outcome.facts.clone(), outcome.startup_failure.clone()),
-        Err(error) => (
-            ExitFacts {
-                exit_code: None,
-                signal: None,
-            },
-            Some(error.to_string()),
-        ),
-    };
-    promote_inbox(&store, runtime, &run_id, provider, &run_paths.checkpoints)?;
-    store.append(
-        runtime,
-        Some(run_id.clone()),
-        Some(provider),
-        EventKind::RunStopped {
-            exit_code: facts.exit_code,
-            signal: facts.signal,
-        },
-    )?;
-    let post = Git::new().snapshot(&cwd)?;
-    store.append(
-        runtime,
-        Some(run_id.clone()),
-        Some(provider),
-        EventKind::GitSnapshot { snapshot: post },
-    )?;
-    leases.clear(&run_id)?;
-    drop(operation);
-
-    if let Some(message) = supervision_error {
-        return Err(Error::Command(message));
-    }
-    Ok(facts
-        .exit_code
-        .unwrap_or_else(|| 128 + facts.signal.unwrap_or(1)))
+        operation,
+    )
 }
 
 pub fn switch_command(
@@ -786,101 +859,22 @@ pub fn switch_command(
     };
     let built = claim_pending(&store, &leases, runtime, &invocation_snapshot, &pending)?;
 
-    let run_id = runtime.run_id();
-    let run_paths = prepare_run_directory(
+    launch_supervised_run(
         &store,
-        &run_id,
-        built.rendered.markdown.as_bytes(),
-        &built.recent_events_jsonl,
-    )?;
-    let provider_adapter = adapter(provider);
-    provider_adapter.setup(&layout.integrations())?;
-    let provider_version = provider_adapter.probe()?;
-    let hook_bin = std::env::current_exe()
-        .map_err(|source| io("current executable", source))?
-        .canonicalize()
-        .map_err(|source| io("current executable", source))?;
-    store.append(
-        runtime,
-        Some(run_id.clone()),
-        Some(provider),
-        EventKind::RunStarted {
-            cwd: saved_cwd
-                .to_str()
-                .ok_or_else(|| Error::InvalidState("saved cwd must be valid UTF-8".into()))?
-                .to_owned(),
-            args: provider_args.iter().map(|arg| encode_arg(arg)).collect(),
-            supervisor_pid: std::process::id(),
-        },
-    )?;
-    let lease = RunLease::new(
-        store.id().clone(),
-        run_id.clone(),
-        provider,
-        ProcessIdentity::capture(std::process::id())?,
-    )?;
-    leases.create(&lease)?;
-    let provider_home = resolve_provider_home(provider, environment);
-    let mut spec = provider_adapter.launch_spec(LaunchContext {
-        cwd: &saved_cwd,
-        inbox: &run_paths.inbox,
-        integration_root: &layout.integrations(),
-        hook_bin: &hook_bin,
-        provider_args: &provider_args,
-        bootstrap: Some(BOOTSTRAP),
-        run_dir: &run_paths.root,
-        provider_home: provider_home.as_deref(),
-    })?;
-    add_run_environment(
-        &mut spec.env,
         &layout,
-        &store,
-        &run_id,
-        provider,
-        &provider_version,
-        &hook_bin,
-        &run_paths,
-    );
-    drop(operation);
-
-    let supervised = Supervisor::launch(spec, &store, &run_id, Duration::from_secs(60));
-    let operation = SessionOperationLock::acquire(&store.session_dir())?;
-    let (facts, supervision_error) = match supervised {
-        Ok(outcome) => (outcome.facts.clone(), outcome.startup_failure.clone()),
-        Err(error) => (
-            ExitFacts {
-                exit_code: None,
-                signal: None,
-            },
-            Some(error.to_string()),
-        ),
-    };
-    promote_inbox(&store, runtime, &run_id, provider, &run_paths.checkpoints)?;
-    store.append(
+        &leases,
         runtime,
-        Some(run_id.clone()),
-        Some(provider),
-        EventKind::RunStopped {
-            exit_code: facts.exit_code,
-            signal: facts.signal,
+        environment,
+        &provider_args,
+        LaunchRequest {
+            provider,
+            document: built.rendered.markdown.into_bytes(),
+            recent_events_jsonl: built.recent_events_jsonl,
+            bootstrap: Some(BOOTSTRAP),
+            cwd: saved_cwd,
         },
-    )?;
-    let post = Git::new().snapshot(&saved_cwd)?;
-    store.append(
-        runtime,
-        Some(run_id.clone()),
-        Some(provider),
-        EventKind::GitSnapshot { snapshot: post },
-    )?;
-    leases.clear(&run_id)?;
-    drop(operation);
-
-    if let Some(message) = supervision_error {
-        return Err(Error::Command(message));
-    }
-    Ok(facts
-        .exit_code
-        .unwrap_or_else(|| 128 + facts.signal.unwrap_or(1)))
+        operation,
+    )
 }
 
 fn resolve_saved_cwd(store: &SessionStore) -> Result<(PathBuf, PathBuf)> {
