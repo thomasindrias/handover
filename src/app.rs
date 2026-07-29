@@ -762,23 +762,29 @@ pub fn switch_command(
         },
     )?;
 
-    // A recorded intent is journaled state. Refuse rather than guess: silently
-    // expiring it because a later command named a different provider would
-    // discard it, and claiming it instead would launch something the user did
-    // not type.
-    if let Some(existing) = crate::arm::pending(&store, runtime, &store.events()?)?
-        && existing.to != provider
-    {
-        return Err(Error::InvalidState(format!(
-            "a switch to {} is already armed at sequence {} (expires {}); \
-             claim it with `handover claim`, or wait for it to expire",
-            existing.to.executable(),
-            existing.sequence,
-            existing.expires_at
-        )));
-    }
-
-    let built = commit_transition_handover(&store, runtime, switch_snapshot, provider)?;
+    // Reuse a matching arm rather than recording a second intent for the same
+    // switch. Task 2's refusal has already rejected a conflicting one.
+    let pending = match crate::arm::pending(&store, runtime, &store.events()?)? {
+        Some(existing) if existing.to == provider => existing,
+        Some(existing) => {
+            return Err(Error::InvalidState(format!(
+                "a switch to {} is already armed at sequence {} (expires {}); \
+                 claim it with `handover claim`, or wait for it to expire",
+                existing.to.executable(),
+                existing.sequence,
+                existing.expires_at
+            )));
+        }
+        None => arm_for_switch(
+            &store,
+            runtime,
+            &leases,
+            provider,
+            Surface::Auto,
+            crate::arm::parse_ttl(crate::arm::DEFAULT_TTL)?,
+        )?,
+    };
+    let built = claim_pending(&store, &leases, runtime, &invocation_snapshot, &pending)?;
 
     let run_id = runtime.run_id();
     let run_paths = prepare_run_directory(
@@ -1131,6 +1137,50 @@ fn handover_command(provider: Provider, json: bool, environment: &Environment) -
     }
 }
 
+/// Append the intent and the capability, and return the arm just created.
+///
+/// `armed_run` is read from the lease that exists right now — that is the run
+/// whose dead lease a later claim may release. Callers must hold
+/// `SessionOperationLock`.
+fn arm_for_switch(
+    store: &SessionStore,
+    runtime: &dyn Runtime,
+    leases: &LeaseStore,
+    provider: Provider,
+    surface: Surface,
+    ttl: std::time::Duration,
+) -> Result<crate::arm::PendingArm> {
+    let events = store.events()?;
+    let armed_run = leases.read()?.map(|lease| lease.run_id);
+    let expires_at = crate::arm::expires_at(runtime, ttl)?;
+    store.append(
+        runtime,
+        armed_run.clone(),
+        None,
+        EventKind::SwitchRequested {
+            from: previous_provider(&events)?,
+            to: provider,
+        },
+    )?;
+    let event = store.append(
+        runtime,
+        armed_run.clone(),
+        None,
+        EventKind::SwitchArmed {
+            to: provider,
+            surface,
+            expires_at: expires_at.clone(),
+        },
+    )?;
+    Ok(crate::arm::PendingArm {
+        sequence: event.sequence,
+        to: provider,
+        surface,
+        expires_at,
+        armed_run,
+    })
+}
+
 fn arm_command(
     provider: Provider,
     surface: Surface,
@@ -1166,39 +1216,16 @@ fn arm_command(
         );
     }
 
-    let armed_run = LeaseStore::new(&store.session_dir())
-        .read()?
-        .map(|lease| lease.run_id);
-    let expires_at = crate::arm::expires_at(runtime, ttl)?;
-    // `arm` owns the intent and `claim` owns the completion, so the journal
-    // reads the same whether a switch came from one command or two.
-    store.append(
-        runtime,
-        armed_run.clone(),
-        None,
-        EventKind::SwitchRequested {
-            from: previous_provider(&events)?,
-            to: provider,
-        },
-    )?;
-    let event = store.append(
-        runtime,
-        armed_run,
-        None,
-        EventKind::SwitchArmed {
-            to: provider,
-            surface,
-            expires_at: expires_at.clone(),
-        },
-    )?;
+    let leases = LeaseStore::new(&store.session_dir());
+    let arm = arm_for_switch(&store, runtime, &leases, provider, surface, ttl)?;
 
     write_projection(
         &serde_json::json!({
             "schema_version": 1,
-            "armed_sequence": event.sequence,
+            "armed_sequence": arm.sequence,
             "to": provider,
             "surface": surface,
-            "expires_at": expires_at,
+            "expires_at": arm.expires_at,
             "checkpoint_fresh": checkpoint_fresh,
         }),
         json,
@@ -1281,6 +1308,35 @@ fn release_for_claim(
     Ok(())
 }
 
+/// Consume `pending`: release the arming run's dead lease if there is one,
+/// commit the transition checkpoint, and record the claim.
+///
+/// Every command that completes a switch goes through here, so no two of them
+/// can hand a provider a different document. Callers must hold
+/// `SessionOperationLock`, and must already have proven the handover renders.
+fn claim_pending(
+    store: &SessionStore,
+    leases: &LeaseStore,
+    runtime: &dyn Runtime,
+    invocation_snapshot: &GitSnapshot,
+    pending: &crate::arm::PendingArm,
+) -> Result<BuiltHandover> {
+    release_for_claim(store, leases, runtime, invocation_snapshot, pending)?;
+    let (_, switch_snapshot) = resolve_switch_snapshot(store, invocation_snapshot)?;
+    let built = commit_transition_handover(store, runtime, switch_snapshot, pending.to)?;
+    store.append(
+        runtime,
+        None,
+        None,
+        EventKind::SwitchClaimed {
+            armed_sequence: pending.sequence,
+            to: pending.to,
+            transition_checkpoint_sequence: built.transition_sequence,
+        },
+    )?;
+    Ok(built)
+}
+
 fn claim_command(
     arm: Option<u64>,
     json: bool,
@@ -1308,24 +1364,7 @@ fn claim_command(
     preview_handover(&store, &snapshot, pending.to)?;
 
     let leases = LeaseStore::new(&store.session_dir());
-    release_for_claim(&store, &leases, runtime, &snapshot, &pending)?;
-
-    // A claim is a provider boundary, so it commits a real transition
-    // checkpoint exactly as `switch` does. Nothing else may build the
-    // document: a claim that rendered its own would hand the next provider a
-    // checkpoint sequence no journal entry answers to.
-    let (_, switch_snapshot) = resolve_switch_snapshot(&store, &snapshot)?;
-    let built = commit_transition_handover(&store, runtime, switch_snapshot, pending.to)?;
-    store.append(
-        runtime,
-        None,
-        None,
-        EventKind::SwitchClaimed {
-            armed_sequence: pending.sequence,
-            to: pending.to,
-            transition_checkpoint_sequence: built.transition_sequence,
-        },
-    )?;
+    let built = claim_pending(&store, &leases, runtime, &snapshot, &pending)?;
 
     if json {
         write_handover_projection(

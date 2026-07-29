@@ -23,6 +23,21 @@ exit 0
     write_executable(&bin.join("claude"), body);
 }
 
+/// Fake codex that completes a session, so `switch`/`claim` have a second
+/// provider on PATH to launch into.
+fn fake_codex(bin: &std::path::Path) {
+    let body = r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-codex 1.0'; exit 0; fi
+cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
+hook() { printf '%s' "$1" | "$HANDOVER_HOOK_BIN" __hook codex >/dev/null; }
+hook '{"session_id":"codex-native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}'
+hook '{"session_id":"codex-native","cwd":"'"$cwd_json"'","hook_event_name":"Stop"}'
+exit 0
+"#;
+    write_executable(&bin.join("codex"), body);
+}
+
 /// A finished `handover run claude` session: temp dir, cwd, and state root.
 /// The `TempDir` must stay bound in the caller — dropping it deletes the repo.
 fn finished_session() -> (
@@ -39,6 +54,7 @@ fn finished_session() -> (
     let bin = temp.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     fake_claude(&bin);
+    fake_codex(&bin);
     let state = temp.path().join("state");
     let path = path_with(&bin);
 
@@ -916,4 +932,32 @@ fn switch_refuses_when_a_different_provider_is_already_armed() {
         stderr.contains("claim"),
         "must say what to do about it: {stderr}"
     );
+}
+
+#[test]
+fn switch_journals_the_same_arm_and_claim_a_two_step_switch_does() {
+    let (_temp, cwd, state, path) = finished_session();
+
+    cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["switch", "codex"])
+        .assert()
+        .success();
+
+    let log = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["log", "--json"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&log.stdout);
+
+    // One command, but the journal records the same three facts a manual
+    // `arm` + `claim` would leave behind.
+    for kind in ["switch.requested", "switch.armed", "switch.claimed"] {
+        assert!(text.contains(kind), "switch must journal {kind}");
+    }
 }
