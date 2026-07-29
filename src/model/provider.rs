@@ -24,9 +24,18 @@ impl Provider {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Surface {
+    #[default]
+    Auto,
+    Cli,
+    Desktop,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Provider;
+    use super::{Provider, Surface};
 
     #[test]
     fn provider_names_are_closed_lowercase_values_with_fixed_executables() {
@@ -47,5 +56,17 @@ mod tests {
     fn other_returns_the_opposite_variant() {
         assert_eq!(Provider::Claude.other(), Provider::Codex);
         assert_eq!(Provider::Codex.other(), Provider::Claude);
+    }
+
+    #[test]
+    fn surface_names_are_closed_lowercase_values() {
+        assert_eq!(serde_json::to_string(&Surface::Auto).unwrap(), "\"auto\"");
+        assert_eq!(serde_json::to_string(&Surface::Cli).unwrap(), "\"cli\"");
+        assert_eq!(
+            serde_json::to_string(&Surface::Desktop).unwrap(),
+            "\"desktop\""
+        );
+        assert_eq!(Surface::default(), Surface::Auto);
+        assert!(serde_json::from_str::<Surface>("\"tui\"").is_err());
     }
 }

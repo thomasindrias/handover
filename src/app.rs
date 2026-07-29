@@ -9,7 +9,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::checkpoint::{
-    edit_narrative, load_verified_checkpoint, promote_inbox, read_narrative_json,
+    StoredCheckpoint, edit_narrative, load_verified_checkpoint, promote_inbox, read_narrative_json,
     submit_provider_narrative,
 };
 use crate::cli::{CheckpointFormat, Cli, Command};
@@ -27,7 +27,7 @@ use crate::handover::{
 };
 use crate::model::{
     Checkpoint, CheckpointAuthor, CheckpointKind, ContentRef, Event, EventEnvelope, EventKind,
-    ForkOperation, ForkPhase, GitSnapshot, Provider, RunId, SessionId,
+    ForkOperation, ForkPhase, GitSnapshot, Provider, RunId, SessionId, Surface,
 };
 use crate::provider::hook::{
     HookEvent, HookOutput, NormalizedHook, capture_failure_output, normalize, session_start_output,
@@ -38,7 +38,9 @@ use crate::runtime::Runtime;
 use crate::store::atomic::{create_private, read_private, sync_directory};
 use crate::store::blob::BlobStore;
 use crate::store::journal::{AppendOutcome, EventJournal, PendingEvent, PendingEventMeta};
-use crate::store::lease::{LeaseStore, ProcessIdentity, RunLease, SessionOperationLock, host_name};
+use crate::store::lease::{
+    LeaseStore, ProcessIdentity, RunLease, SessionOperationLock, host_name, live_holder,
+};
 use crate::store::refs::read_json;
 use crate::store::{Environment, SessionStore, StateLayout};
 use crate::supervisor::{ExitFacts, Supervisor};
@@ -78,6 +80,14 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
                 input_is_terminal,
             )
         }
+        Command::Arm {
+            provider,
+            surface,
+            ttl,
+            json,
+        } => arm_command(provider, surface, &ttl, json, environment, runtime),
+        Command::Claim { arm, json } => claim_command(arm, json, environment, runtime),
+        Command::Attach { provider, json } => attach_command(provider, json, environment, runtime),
         Command::Preview { provider, json } => handover_command(provider, json, environment),
         Command::Fork {
             provider,
@@ -742,14 +752,7 @@ pub fn switch_command(
         input_is_terminal,
     )?;
 
-    let (saved_cwd_relative, saved_cwd) = resolve_saved_cwd(&store)?;
-    let switch_snapshot = Git::new().snapshot(&saved_cwd)?;
-    verify_switch_snapshot(
-        &invocation_snapshot,
-        &switch_snapshot,
-        &store.meta().worktree,
-        &saved_cwd_relative,
-    )?;
+    let (saved_cwd, switch_snapshot) = resolve_switch_snapshot(&store, &invocation_snapshot)?;
     store.append(
         runtime,
         None,
@@ -769,49 +772,14 @@ pub fn switch_command(
             to: provider,
         },
     )?;
-    let events_before_transition = store.events()?;
-    let narrative_checkpoint = latest_narrative_checkpoint(&store, &events_before_transition)?;
-    let narrative_sequence = narrative_checkpoint.as_ref().map(|item| item.0);
-    let (transition_event, transition_stored) =
-        store.create_transition_checkpoint(runtime, None, None, narrative_sequence)?;
-
-    let envelopes = EventJournal::new(&store.session_dir(), store.id().clone()).read_repair()?;
-    let recent_boundary = narrative_sequence.unwrap_or(0);
-    let recent_events = collect_recent_events(&envelopes, recent_boundary)?;
-    let events: Vec<_> = envelopes.iter().map(|item| item.event.clone()).collect();
-    let (recent_commands, latest_test, latest_failure, capture_gaps) =
-        command_facts(&store, &events)?;
-    let rendered = render_with_selection(
-        HandoverInput {
-            session_id: store.id().clone(),
-            parent_lineage: None,
-            from_provider: previous_provider,
-            to_provider: provider,
-            transition_sequence: transition_event.sequence,
-            transition_checkpoint: transition_stored.checkpoint,
-            narrative_checkpoint,
-            snapshot: switch_snapshot.clone(),
-            recent_events,
-            recent_commands,
-            latest_test,
-            latest_failure,
-            capture_gaps,
-        },
-        MAX_HANDOVER_BYTES,
-    )?;
-    let recent_events_jsonl = selected_event_lines(&envelopes, &rendered.recent_event_sequences)?;
-    if recent_events_jsonl.len() > MAX_HANDOVER_BYTES {
-        return Err(Error::InvalidState(
-            "selected recent events exceed 64 KiB".into(),
-        ));
-    }
+    let built = commit_transition_handover(&store, runtime, switch_snapshot, provider)?;
 
     let run_id = runtime.run_id();
     let run_paths = prepare_run_directory(
         &store,
         &run_id,
-        rendered.markdown.as_bytes(),
-        &recent_events_jsonl,
+        built.rendered.markdown.as_bytes(),
+        &built.recent_events_jsonl,
     )?;
     let provider_adapter = adapter(provider);
     provider_adapter.setup(&layout.integrations())?;
@@ -941,7 +909,46 @@ fn collect_recent_events(
     Ok(recent_events)
 }
 
-struct HandoverPreview {
+/// The transition checkpoint a handover is rendered against.
+///
+/// `switch` and `claim` supply one they have just committed to the journal;
+/// `preview` and `status` supply one that only describes what a switch
+/// *would* commit, because a dry run must append nothing.
+struct Transition {
+    sequence: u64,
+    checkpoint: Checkpoint,
+}
+
+impl Transition {
+    /// The transition `SessionStore::create_transition_checkpoint` just
+    /// committed: `sequence` names a `checkpoint.created` event that exists.
+    fn committed(event: &Event, stored: StoredCheckpoint) -> Self {
+        Self {
+            sequence: event.sequence,
+            checkpoint: stored.checkpoint,
+        }
+    }
+
+    /// The transition a switch would commit next. Never journaled — callers
+    /// use it to prove the document renders without mutating anything.
+    fn hypothetical(events: &[Event], narrative_sequence: Option<u64>) -> Self {
+        let through_sequence = events.last().map(|event| event.sequence).unwrap_or(0);
+        Self {
+            sequence: through_sequence + 1,
+            checkpoint: Checkpoint {
+                schema_version: 1,
+                checkpoint_kind: CheckpointKind::Transition,
+                through_sequence,
+                author: CheckpointAuthor::System,
+                narrative: None,
+                narrative_checkpoint_sequence: narrative_sequence,
+            },
+        }
+    }
+}
+
+/// One rendered handover plus the facts its callers report alongside it.
+struct BuiltHandover {
     events: Vec<Event>,
     from_provider: Option<Provider>,
     transition_sequence: u64,
@@ -949,50 +956,37 @@ struct HandoverPreview {
     narrative_checkpoint: Option<(u64, Checkpoint)>,
     capture_gaps: Vec<CaptureGap>,
     rendered: crate::handover::RenderedHandover,
+    recent_events_jsonl: Vec<u8>,
 }
 
-/// Dry-run of the same handover a `switch` to `to_provider` would build:
-/// resolves the saved cwd, verifies it against `invocation_snapshot`, and
-/// renders — a pure read with no mutation, no lease/journal writes. Used
-/// by `handover_command` (`handover preview`) and by `status_command`'s
-/// `switch_readiness` check so both report the exact same verdict
-/// `switch` itself will produce.
-fn preview_handover(
+/// Render the handover for a switch to `to_provider` against the journal
+/// exactly as it stands when called.
+///
+/// Every command that emits a handover — `switch`, `claim`, `preview`,
+/// `status`'s readiness check, the MCP server — renders through here, so no
+/// two of them can describe the same session differently. The one thing
+/// callers vary is the `transition`, because only they know whether it is
+/// committed or hypothetical.
+fn build_handover(
     store: &SessionStore,
-    invocation_snapshot: &GitSnapshot,
+    switch_snapshot: GitSnapshot,
     to_provider: Provider,
-) -> Result<HandoverPreview> {
-    let (saved_cwd_relative, saved_cwd) = resolve_saved_cwd(store)?;
-    let switch_snapshot = Git::new().snapshot(&saved_cwd)?;
-    verify_switch_snapshot(
-        invocation_snapshot,
-        &switch_snapshot,
-        &store.meta().worktree,
-        &saved_cwd_relative,
-    )?;
-
-    let events = store.events()?;
-    let from_provider = previous_provider(&events)?;
-    let narrative_checkpoint = latest_narrative_checkpoint(store, &events)?;
-    let narrative_sequence = narrative_checkpoint.as_ref().map(|item| item.0);
-
+    transition: Transition,
+    narrative_checkpoint: Option<(u64, Checkpoint)>,
+) -> Result<BuiltHandover> {
     let envelopes = store.envelopes()?;
-    let recent_boundary = narrative_sequence.unwrap_or(0);
+    let events: Vec<Event> = envelopes.iter().map(|item| item.event.clone()).collect();
+    let from_provider = previous_provider(&events)?;
+    let recent_boundary = narrative_checkpoint
+        .as_ref()
+        .map(|item| item.0)
+        .unwrap_or(0);
     let recent_events = collect_recent_events(&envelopes, recent_boundary)?;
     let (recent_commands, latest_test, latest_failure, capture_gaps) =
         command_facts(store, &events)?;
 
-    let through_sequence = events.last().map(|event| event.sequence).unwrap_or(0);
-    let transition_sequence = through_sequence + 1;
-    let transition_checkpoint = Checkpoint {
-        schema_version: 1,
-        checkpoint_kind: CheckpointKind::Transition,
-        through_sequence,
-        author: CheckpointAuthor::System,
-        narrative: None,
-        narrative_checkpoint_sequence: narrative_sequence,
-    };
-
+    let transition_sequence = transition.sequence;
+    let through_sequence = transition.checkpoint.through_sequence;
     let rendered = render_with_selection(
         HandoverInput {
             session_id: store.id().clone(),
@@ -1000,7 +994,7 @@ fn preview_handover(
             from_provider,
             to_provider,
             transition_sequence,
-            transition_checkpoint,
+            transition_checkpoint: transition.checkpoint,
             narrative_checkpoint: narrative_checkpoint.clone(),
             snapshot: switch_snapshot,
             recent_events,
@@ -1018,7 +1012,7 @@ fn preview_handover(
         ));
     }
 
-    Ok(HandoverPreview {
+    Ok(BuiltHandover {
         events,
         from_provider,
         transition_sequence,
@@ -1026,7 +1020,80 @@ fn preview_handover(
         narrative_checkpoint,
         capture_gaps,
         rendered,
+        recent_events_jsonl,
     })
+}
+
+/// Resolve the saved cwd and verify it still describes the same unchanged
+/// worktree the command was invoked from, returning that cwd and the
+/// snapshot the handover must be rendered against.
+fn resolve_switch_snapshot(
+    store: &SessionStore,
+    invocation_snapshot: &GitSnapshot,
+) -> Result<(PathBuf, GitSnapshot)> {
+    let (saved_cwd_relative, saved_cwd) = resolve_saved_cwd(store)?;
+    let switch_snapshot = Git::new().snapshot(&saved_cwd)?;
+    verify_switch_snapshot(
+        invocation_snapshot,
+        &switch_snapshot,
+        &store.meta().worktree,
+        &saved_cwd_relative,
+    )?;
+    Ok((saved_cwd, switch_snapshot))
+}
+
+/// Dry-run of the same handover a `switch` to `to_provider` would build:
+/// resolves the saved cwd, verifies it against `invocation_snapshot`, and
+/// renders — a pure read with no mutation, no lease/journal writes. Its
+/// transition is hypothetical, so the document it produces must never be
+/// handed to a provider as a record of a switch that happened. Used by
+/// `handover_command` (`handover preview`), by `status_command`'s
+/// `switch_readiness` check, and by `arm_command` and `claim_command` as the
+/// gate that proves the real handover will render.
+fn preview_handover(
+    store: &SessionStore,
+    invocation_snapshot: &GitSnapshot,
+    to_provider: Provider,
+) -> Result<BuiltHandover> {
+    let (_, snapshot) = resolve_switch_snapshot(store, invocation_snapshot)?;
+    let events = store.events()?;
+    let narrative_checkpoint = latest_narrative_checkpoint(store, &events)?;
+    let transition =
+        Transition::hypothetical(&events, narrative_checkpoint.as_ref().map(|item| item.0));
+    build_handover(
+        store,
+        snapshot,
+        to_provider,
+        transition,
+        narrative_checkpoint,
+    )
+}
+
+/// Commit a transition checkpoint and render the handover against it.
+///
+/// `switch` and `claim` are both provider boundaries, and a boundary leaves a
+/// real `checkpoint.created` event behind so the document it emits names a
+/// checkpoint that exists in the journal. Callers must already hold
+/// `SessionOperationLock`, and must already have proven the document renders
+/// (see `preview_handover`) if they mutated anything first.
+fn commit_transition_handover(
+    store: &SessionStore,
+    runtime: &dyn Runtime,
+    snapshot: GitSnapshot,
+    to_provider: Provider,
+) -> Result<BuiltHandover> {
+    let events = store.events()?;
+    let narrative_checkpoint = latest_narrative_checkpoint(store, &events)?;
+    let narrative_sequence = narrative_checkpoint.as_ref().map(|item| item.0);
+    let (event, stored) =
+        store.create_transition_checkpoint(runtime, None, None, narrative_sequence)?;
+    build_handover(
+        store,
+        snapshot,
+        to_provider,
+        Transition::committed(&event, stored),
+        narrative_checkpoint,
+    )
 }
 
 fn handover_command(provider: Provider, json: bool, environment: &Environment) -> Result<i32> {
@@ -1056,6 +1123,261 @@ fn handover_command(provider: Provider, json: bool, environment: &Environment) -
             .map_err(|source| io("stdout", source))?;
         Ok(0)
     }
+}
+
+fn arm_command(
+    provider: Provider,
+    surface: Surface,
+    ttl: &str,
+    json: bool,
+    environment: &Environment,
+    runtime: &dyn Runtime,
+) -> Result<i32> {
+    let ttl = crate::arm::parse_ttl(ttl)?;
+    let (_layout, snapshot, store) = current_session(environment)?;
+    let _operation = SessionOperationLock::acquire(&store.session_dir())?;
+    let events = store.events()?;
+    if let Some(existing) = crate::arm::pending(&store, runtime, &events)? {
+        return Err(Error::InvalidState(format!(
+            "a switch to {} is already armed at sequence {}; claim it or wait until {}",
+            existing.to.executable(),
+            existing.sequence,
+            existing.expires_at
+        )));
+    }
+
+    // Gate on exactly what `switch_readiness.ready` means, minus its lease
+    // term: arming while a provider is still running is the point.
+    preview_handover(&store, &snapshot, provider)?;
+
+    let events = store.events()?;
+    let (_, events_since) = crate::list::narrative_freshness(&events);
+    let checkpoint_fresh = events_since < STALE_NARRATIVE_EVENT_THRESHOLD;
+    if !checkpoint_fresh {
+        eprintln!(
+            "warning: {events_since} events since the last narrative checkpoint; \
+             the handover will be thin. Write one with `handover checkpoint`."
+        );
+    }
+
+    let armed_run = LeaseStore::new(&store.session_dir())
+        .read()?
+        .map(|lease| lease.run_id);
+    let expires_at = crate::arm::expires_at(runtime, ttl)?;
+    let event = store.append(
+        runtime,
+        armed_run,
+        previous_provider(&events)?,
+        EventKind::SwitchArmed {
+            to: provider,
+            surface,
+            expires_at: expires_at.clone(),
+        },
+    )?;
+
+    write_projection(
+        &serde_json::json!({
+            "schema_version": 1,
+            "armed_sequence": event.sequence,
+            "to": provider,
+            "surface": surface,
+            "expires_at": expires_at,
+            "checkpoint_fresh": checkpoint_fresh,
+        }),
+        json,
+    )?;
+    Ok(0)
+}
+
+/// Release the lease the arm authorises us to release, if any.
+///
+/// The privilege is narrow: a *dead* lease belonging to the arming run may be
+/// cleared without the recovery prompt. Nothing else may be touched.
+///
+/// Clearing it is a recovery, so it is journaled as `run.recovered` naming
+/// the claim as the reason, exactly as the `switch` and `fork` recovery paths
+/// record theirs. No lease leaves this session's history unexplained.
+fn release_for_claim(
+    store: &SessionStore,
+    leases: &LeaseStore,
+    runtime: &dyn Runtime,
+    recovery_snapshot: &GitSnapshot,
+    pending: &crate::arm::PendingArm,
+) -> Result<()> {
+    let Some(lease) = leases.read()? else {
+        return Ok(());
+    };
+    // Two separate refusals. A foreign-host lease may well have been created
+    // by the arming run -- it just cannot be checked from here -- so it must
+    // not be told that something else created it.
+    if lease.host != host_name()? {
+        let (_state, reason) = classify_lease(leases)?;
+        return Err(Error::InvalidState(format!(
+            "cannot release this session's lease; {}",
+            reason.unwrap_or_else(|| "inspect it with `handover status`".into())
+        )));
+    }
+    if pending.armed_run.as_ref() != Some(&lease.run_id) {
+        let (_state, reason) = classify_lease(leases)?;
+        return Err(Error::InvalidState(format!(
+            "cannot release this session's lease; it was not created by the run that armed the switch; {}",
+            reason.unwrap_or_else(|| "inspect it with `handover status`".into())
+        )));
+    }
+    if let Some(holder) = live_holder(&lease)? {
+        return Err(Error::InvalidState(format!(
+            "{} is still running this session ({}); quit it to complete the armed switch",
+            lease.provider.executable(),
+            holder.describe()
+        )));
+    }
+    store.append(
+        runtime,
+        Some(lease.run_id.clone()),
+        Some(lease.provider),
+        EventKind::RunRecovered {
+            supervisor_pid: lease.supervisor.pid,
+            supervisor_start_token: lease.supervisor.start_token.clone(),
+            child_pid: lease.child.as_ref().map(|child| child.pid),
+            child_start_token: lease.child.as_ref().map(|child| child.start_token.clone()),
+            host: lease.host.clone(),
+            reason: format!(
+                "released by claim of the switch armed at sequence {}",
+                pending.sequence
+            ),
+        },
+    )?;
+    store.append(
+        runtime,
+        Some(lease.run_id.clone()),
+        Some(lease.provider),
+        EventKind::GitSnapshot {
+            snapshot: recovery_snapshot.clone(),
+        },
+    )?;
+    leases.clear(&lease.run_id)?;
+    eprintln!(
+        "Released the stale {} lease left by the arming run ({}); completing the armed switch.",
+        lease.provider.executable(),
+        lease.supervisor.describe()
+    );
+    Ok(())
+}
+
+fn claim_command(
+    arm: Option<u64>,
+    json: bool,
+    environment: &Environment,
+    runtime: &dyn Runtime,
+) -> Result<i32> {
+    let (_layout, snapshot, store) = current_session(environment)?;
+    let _operation = SessionOperationLock::acquire(&store.session_dir())?;
+    let events = store.events()?;
+    let pending = crate::arm::pending(&store, runtime, &events)?
+        .ok_or_else(|| Error::InvalidState("no switch is armed for this session".into()))?;
+    if let Some(expected) = arm
+        && expected != pending.sequence
+    {
+        return Err(Error::InvalidState(format!(
+            "the armed switch is at sequence {}, not {expected}",
+            pending.sequence
+        )));
+    }
+
+    // Prove the handover renders before anything is released or appended: a
+    // missing blob, a vanished saved cwd, or an oversized document must leave
+    // the arm pending and the lease untouched. "Nothing happened" is a state
+    // the user can retry; "half happened" is not.
+    preview_handover(&store, &snapshot, pending.to)?;
+
+    let leases = LeaseStore::new(&store.session_dir());
+    release_for_claim(&store, &leases, runtime, &snapshot, &pending)?;
+
+    // A claim is a provider boundary, so it commits a real transition
+    // checkpoint exactly as `switch` does. Nothing else may build the
+    // document: a claim that rendered its own would hand the next provider a
+    // checkpoint sequence no journal entry answers to.
+    let (_, switch_snapshot) = resolve_switch_snapshot(&store, &snapshot)?;
+    let built = commit_transition_handover(&store, runtime, switch_snapshot, pending.to)?;
+    store.append(
+        runtime,
+        None,
+        Some(pending.to),
+        EventKind::SwitchClaimed {
+            armed_sequence: pending.sequence,
+            to: pending.to,
+            transition_checkpoint_sequence: built.transition_sequence,
+        },
+    )?;
+
+    if json {
+        write_handover_projection(
+            &store,
+            built.from_provider,
+            pending.to,
+            built.transition_sequence,
+            built.through_sequence,
+            &built.events,
+            built.narrative_checkpoint,
+            built.capture_gaps,
+            &built.rendered,
+        )
+    } else {
+        std::io::stdout()
+            .write_all(built.rendered.markdown.as_bytes())
+            .map_err(|source| io("stdout", source))?;
+        Ok(0)
+    }
+}
+
+fn attach_command(
+    provider: Provider,
+    json: bool,
+    environment: &Environment,
+    runtime: &dyn Runtime,
+) -> Result<i32> {
+    let cwd = std::env::current_dir().map_err(|source| io(".", source))?;
+    let layout = resolve_layout(environment, &cwd)?;
+    let snapshot = Git::new().snapshot(&cwd)?;
+    let (store, created, _operation) =
+        match SessionStore::find_for_worktree(&layout, &snapshot.identity)? {
+            Some(store) => {
+                // Acquire the operation lock before checking the lease so no other
+                // command can create a live lease between the check and the append
+                // below (see `claim_command`, which follows the same ordering).
+                let operation = SessionOperationLock::acquire(&store.session_dir())?;
+                let (state, reason) = classify_lease(&LeaseStore::new(&store.session_dir()))?;
+                if state == "blocked" {
+                    return Err(Error::InvalidState(format!(
+                        "cannot attach to this worktree's session; {}",
+                        reason.unwrap_or_else(|| "it is already held".into())
+                    )));
+                }
+                (store, false, operation)
+            }
+            None => {
+                // No session dir exists yet, so there is nothing to lock until
+                // after creation; the lock is acquired immediately afterward and
+                // held through the append below.
+                let store = SessionStore::create(&layout, runtime, snapshot.clone())?;
+                let operation = SessionOperationLock::acquire(&store.session_dir())?;
+                (store, true, operation)
+            }
+        };
+
+    store.append(runtime, None, Some(provider), EventKind::SessionAttached {})?;
+
+    write_projection(
+        &serde_json::json!({
+            "schema_version": 1,
+            "session_id": store.id(),
+            "provider": provider,
+            "created": created,
+            "worktree": snapshot.identity.worktree,
+        }),
+        json,
+    )?;
+    Ok(0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1226,22 +1548,7 @@ fn recover_stale_lease_for_switch(
             lease.supervisor.describe()
         )));
     }
-    let supervisor_live = lease.supervisor.is_live()?;
-    let child_live = lease
-        .child
-        .as_ref()
-        .map(ProcessIdentity::is_live)
-        .transpose()?
-        .unwrap_or(false);
-    if supervisor_live || child_live {
-        let holder = if child_live {
-            lease
-                .child
-                .as_ref()
-                .expect("child_live implies child is present")
-        } else {
-            &lease.supervisor
-        };
+    if let Some(holder) = live_holder(&lease)? {
         return Err(Error::InvalidState(format!(
             "cannot switch: {} is still running this session ({}). Finish or quit {}, then retry the switch.",
             lease.provider.executable(),
@@ -1298,14 +1605,7 @@ fn recover_stale_lease(
             lease.run_id, lease.host
         )));
     }
-    let supervisor_live = lease.supervisor.is_live()?;
-    let child_live = lease
-        .child
-        .as_ref()
-        .map(ProcessIdentity::is_live)
-        .transpose()?
-        .unwrap_or(false);
-    if supervisor_live || child_live {
+    if live_holder(&lease)?.is_some() {
         return Err(Error::InvalidState(format!(
             "session already has active provider {}",
             lease.run_id
@@ -1608,22 +1908,7 @@ fn classify_lease(leases: &LeaseStore) -> Result<(&'static str, Option<String>)>
             )),
         ));
     }
-    let supervisor_live = lease.supervisor.is_live()?;
-    let child_live = lease
-        .child
-        .as_ref()
-        .map(ProcessIdentity::is_live)
-        .transpose()?
-        .unwrap_or(false);
-    if supervisor_live || child_live {
-        let holder = if child_live {
-            lease
-                .child
-                .as_ref()
-                .expect("child_live implies child is present")
-        } else {
-            &lease.supervisor
-        };
+    if let Some(holder) = live_holder(&lease)? {
         return Ok((
             "blocked",
             Some(format!(

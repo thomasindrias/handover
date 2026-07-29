@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    CheckpointKind, GitSnapshot, OperationId, Provider, RunId, SessionId, WorktreeIdentity,
+    CheckpointKind, GitSnapshot, OperationId, Provider, RunId, SessionId, Surface, WorktreeIdentity,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -31,6 +31,29 @@ pub enum EventKind {
         from: Option<Provider>,
         to: Provider,
     },
+    #[serde(rename = "switch.armed")]
+    SwitchArmed {
+        to: Provider,
+        surface: Surface,
+        expires_at: String,
+    },
+    /// A claim of the arm at `armed_sequence`.
+    ///
+    /// `transition_checkpoint_sequence` points at the `checkpoint.created`
+    /// event this claim's handover was rendered against, the same way
+    /// `SessionForked` points at `parent_checkpoint_sequence`. It is a
+    /// pointer, not a prefix: read that checkpoint to get the committed
+    /// prefix from its own `through_sequence`, which is a smaller number.
+    #[serde(rename = "switch.claimed")]
+    SwitchClaimed {
+        armed_sequence: u64,
+        to: Provider,
+        transition_checkpoint_sequence: u64,
+    },
+    #[serde(rename = "switch.expired")]
+    SwitchExpired { armed_sequence: u64 },
+    #[serde(rename = "session.attached")]
+    SessionAttached {},
     #[serde(rename = "run.started")]
     RunStarted {
         cwd: String,
@@ -226,5 +249,56 @@ mod tests {
         let mut payload = serde_json::to_value(envelope).unwrap();
         payload["event"]["payload"]["unexpected"] = serde_json::json!(true);
         assert!(serde_json::from_value::<EventEnvelope>(payload).is_err());
+    }
+
+    #[test]
+    fn switch_lifecycle_events_round_trip_with_stable_names() {
+        let cases = [
+            (
+                EventKind::SwitchArmed {
+                    to: Provider::Codex,
+                    surface: crate::model::Surface::Auto,
+                    expires_at: "2026-07-28T10:15:00Z".into(),
+                },
+                "switch.armed",
+                serde_json::json!({
+                    "to": "codex",
+                    "surface": "auto",
+                    "expires_at": "2026-07-28T10:15:00Z"
+                }),
+            ),
+            (
+                EventKind::SwitchClaimed {
+                    armed_sequence: 12,
+                    to: Provider::Codex,
+                    transition_checkpoint_sequence: 18,
+                },
+                "switch.claimed",
+                serde_json::json!({
+                    "armed_sequence": 12,
+                    "to": "codex",
+                    "transition_checkpoint_sequence": 18
+                }),
+            ),
+            (
+                EventKind::SwitchExpired { armed_sequence: 12 },
+                "switch.expired",
+                serde_json::json!({ "armed_sequence": 12 }),
+            ),
+            (
+                EventKind::SessionAttached {},
+                "session.attached",
+                serde_json::json!({}),
+            ),
+        ];
+
+        for (kind, name, payload) in cases {
+            let mut event = event();
+            event.kind = kind.clone();
+            let value = serde_json::to_value(&event).unwrap();
+            assert_eq!(value["type"], name);
+            assert_eq!(value["payload"], payload);
+            assert_eq!(serde_json::from_value::<Event>(value).unwrap().kind, kind);
+        }
     }
 }
