@@ -961,3 +961,72 @@ fn switch_journals_the_same_arm_and_claim_a_two_step_switch_does() {
         assert!(text.contains(kind), "switch must journal {kind}");
     }
 }
+
+/// `switch` finding a pending arm that already targets the same provider
+/// must claim that one rather than arming a second time. The exit status
+/// alone cannot tell the two apart -- both a reuse and a regressed
+/// double-arm would leave `switch` exiting 0 -- so this pins the journal:
+/// the `switch.claimed` event must point at the sequence `handover arm`
+/// produced, and there must be exactly one `switch.armed` and one
+/// `switch.requested` event for the whole arm-then-switch sequence.
+#[test]
+fn switch_reuses_a_pending_arm_for_the_same_provider() {
+    let (_temp, cwd, state, path) = finished_session();
+
+    let run = |args: &[&str]| {
+        cargo_bin_cmd!("handover")
+            .current_dir(&cwd)
+            .env("HANDOVER_HOME", &state)
+            .env("PATH", &path)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let armed: serde_json::Value =
+        serde_json::from_slice(&run(&["arm", "codex", "--json"]).stdout).unwrap();
+    let armed_sequence = armed["armed_sequence"].as_u64().unwrap();
+
+    let switched = run(&["switch", "codex"]);
+    assert!(
+        switched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&switched.stderr)
+    );
+
+    let log = run(&["log", "--json"]);
+    let journal: Vec<serde_json::Value> = String::from_utf8_lossy(&log.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+
+    let claimed = journal
+        .iter()
+        .map(|envelope| &envelope["event"])
+        .find(|event| event["type"] == "switch.claimed")
+        .expect("switch must claim the pending arm");
+    assert_eq!(
+        claimed["payload"]["armed_sequence"], armed_sequence,
+        "switch must claim the arm `handover arm` made, not a second one"
+    );
+
+    let armed_events = journal
+        .iter()
+        .map(|envelope| &envelope["event"])
+        .filter(|event| event["type"] == "switch.armed")
+        .count();
+    assert_eq!(
+        armed_events, 1,
+        "switch must reuse the existing arm rather than recording a second one"
+    );
+
+    let requested_events = journal
+        .iter()
+        .map(|envelope| &envelope["event"])
+        .filter(|event| event["type"] == "switch.requested")
+        .count();
+    assert_eq!(
+        requested_events, 1,
+        "switch must reuse the existing intent rather than recording a second one"
+    );
+}
