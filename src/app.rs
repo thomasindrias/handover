@@ -762,6 +762,22 @@ pub fn switch_command(
         },
     )?;
 
+    // A recorded intent is journaled state. Refuse rather than guess: silently
+    // expiring it because a later command named a different provider would
+    // discard it, and claiming it instead would launch something the user did
+    // not type.
+    if let Some(existing) = crate::arm::pending(&store, runtime, &store.events()?)?
+        && existing.to != provider
+    {
+        return Err(Error::InvalidState(format!(
+            "a switch to {} is already armed at sequence {} (expires {}); \
+             claim it with `handover claim`, or wait for it to expire",
+            existing.to.executable(),
+            existing.sequence,
+            existing.expires_at
+        )));
+    }
+
     let built = commit_transition_handover(&store, runtime, switch_snapshot, provider)?;
 
     let run_id = runtime.run_id();

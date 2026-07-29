@@ -882,3 +882,38 @@ fn arm_records_intent_and_switch_events_are_provider_neutral() {
         );
     }
 }
+
+#[test]
+fn switch_refuses_when_a_different_provider_is_already_armed() {
+    let (_temp, cwd, state, path) = finished_session();
+
+    cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["arm", "codex"])
+        .assert()
+        .success();
+
+    let output = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["switch", "claude"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "switch must refuse a conflicting arm"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("codex"),
+        "must name the armed provider: {stderr}"
+    );
+    assert!(
+        stderr.contains("claim"),
+        "must say what to do about it: {stderr}"
+    );
+}
