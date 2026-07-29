@@ -239,8 +239,8 @@ does not prove process ancestry and is not a same-user authorization boundary.
 Human checkpoints use a separate path.
 
 The MCP server guard exception ("MCP server" below) is a concrete instance of
-this boundary: it lets an attached provider read, through a different path,
-what same-user access already permits.
+this boundary: it lets a launched, attached provider read, through a
+different path, what same-user access already permits.
 
 ## V1 non-goals
 

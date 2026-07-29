@@ -63,7 +63,12 @@ intended use: quit it, and the armed target starts in the same terminal.
 
 `handover attach <provider>` binds the current worktree to a session for a
 provider Handover did not launch. Such a session has no lifecycle hooks, so its
-journal holds narrative checkpoints and Git facts but no observed events.
+journal holds narrative checkpoints and Git facts but no observed events. It
+also has no run ID: unlike "an attached provider" in Checkpoints below (a
+provider process Handover did launch and lease), a provider bound only
+through `attach` cannot submit a checkpoint through the run-scoped inbox,
+though a human can still record one for it directly with
+`handover checkpoint`.
 
 ## Checkpoints
 
