@@ -594,10 +594,15 @@ fn doctor_command(json: bool, repair: bool, environment: &Environment) -> Result
     )
 }
 
-/// What one launch needs. `run` and `switch` differ only in these four values;
+/// What one launch needs. `run` and `switch` differ only in what this holds;
 /// everything after the launch is identical, which is why they share a tail.
+///
+/// `provider_args` belongs here rather than to the loop that launches: they are
+/// the flags the user typed for *this* provider, and a successor launched by a
+/// claimed arm must not inherit them.
 struct LaunchRequest {
     provider: Provider,
+    provider_args: Vec<OsString>,
     document: Vec<u8>,
     recent_events_jsonl: Vec<u8>,
     bootstrap: Option<&'static str>,
@@ -614,14 +619,12 @@ struct LaunchRequest {
 ///
 /// Takes ownership of `operation` — the lock is dropped before the child
 /// launches and re-acquired for teardown, exactly as the two call sites did.
-#[allow(clippy::too_many_arguments)]
 fn launch_supervised_run(
     store: &SessionStore,
     layout: &StateLayout,
     leases: &LeaseStore,
     runtime: &dyn Runtime,
     environment: &Environment,
-    provider_args: &[OsString],
     request: LaunchRequest,
     mut operation: SessionOperationLock,
 ) -> Result<i32> {
@@ -652,7 +655,11 @@ fn launch_supervised_run(
                     .to_str()
                     .ok_or_else(|| Error::InvalidState("saved cwd must be valid UTF-8".into()))?
                     .to_owned(),
-                args: provider_args.iter().map(|arg| encode_arg(arg)).collect(),
+                args: request
+                    .provider_args
+                    .iter()
+                    .map(|arg| encode_arg(arg))
+                    .collect(),
                 supervisor_pid: std::process::id(),
             },
         )?;
@@ -669,7 +676,7 @@ fn launch_supervised_run(
             inbox: &run_paths.inbox,
             integration_root: &layout.integrations(),
             hook_bin: &hook_bin,
-            provider_args,
+            provider_args: &request.provider_args,
             bootstrap: request.bootstrap,
             run_dir: &run_paths.root,
             provider_home: provider_home.as_deref(),
@@ -724,34 +731,74 @@ fn launch_supervised_run(
             return Err(Error::Command(message));
         }
 
+        let exit_code = facts
+            .exit_code
+            .unwrap_or_else(|| 128 + facts.signal.unwrap_or(1));
+
         // The lease is clear, so a pending arm can be claimed now. Anything
         // that stops the handover -- an expired arm, a handover that will not
-        // render -- leaves this run's exit as the result rather than failing
-        // a session that already did its work.
-        let pending = crate::arm::pending(store, runtime, &store.events()?)?;
-        let Some(pending) = pending else {
-            drop(operation);
-            return Ok(facts
-                .exit_code
-                .unwrap_or_else(|| 128 + facts.signal.unwrap_or(1)));
-        };
-        eprintln!(
-            "Handing over to {} (armed at sequence {}).",
-            pending.to.executable(),
-            pending.sequence
-        );
-        let built = claim_pending(store, leases, runtime, &post, &pending)?;
-        // The successor is a switch, so it gets the bootstrap and the saved
-        // cwd even when this hop began as a plain `run`.
-        let (_, next_cwd) = resolve_saved_cwd(store)?;
-        request = LaunchRequest {
-            provider: pending.to,
-            document: built.rendered.markdown.into_bytes(),
-            recent_events_jsonl: built.recent_events_jsonl,
-            bootstrap: Some(BOOTSTRAP),
-            cwd: next_cwd,
-        };
+        // render, a saved cwd that vanished -- leaves this run's exit as the
+        // result rather than failing a session that already did its work. The
+        // arm survives, so the user can claim it once the cause is fixed.
+        match next_launch_from_pending_arm(store, leases, runtime, &post) {
+            Ok(Some(next)) => request = next,
+            Ok(None) => {
+                drop(operation);
+                return Ok(exit_code);
+            }
+            Err(error) => {
+                eprintln!(
+                    "Handover did not complete: {error}. {} exited with {exit_code}; \
+                     any armed switch is still pending, so fix the cause and run \
+                     `handover claim`.",
+                    provider.executable()
+                );
+                drop(operation);
+                return Ok(exit_code);
+            }
+        }
     }
+}
+
+/// Claim a pending arm and describe the launch that succeeds it, or `None` when
+/// nothing is armed.
+///
+/// Called only after the finished run's lease is cleared, and only with
+/// `SessionOperationLock` held. Every failure here is recoverable by
+/// construction: the gate proves the handover renders before anything is
+/// released or appended, so the caller can report it and keep the finished
+/// run's exit code.
+fn next_launch_from_pending_arm(
+    store: &SessionStore,
+    leases: &LeaseStore,
+    runtime: &dyn Runtime,
+    post: &GitSnapshot,
+) -> Result<Option<LaunchRequest>> {
+    let Some(pending) = crate::arm::pending(store, runtime, &store.events()?)? else {
+        return Ok(None);
+    };
+    // Prove the handover renders before anything is released or appended, for
+    // the reason `claim_command` states: "nothing happened" is a state the user
+    // can retry; "half happened" is not.
+    preview_handover(store, post, pending.to)?;
+    eprintln!(
+        "Handing over to {} (armed at sequence {}).",
+        pending.to.executable(),
+        pending.sequence
+    );
+    let built = claim_pending(store, leases, runtime, post, &pending)?;
+    // The successor is a switch, so it gets the bootstrap and the saved cwd
+    // even when this hop began as a plain `run` -- and, like a `handover switch
+    // <provider>` typed with no trailing args, none of the finished run's.
+    let (_, next_cwd) = resolve_saved_cwd(store)?;
+    Ok(Some(LaunchRequest {
+        provider: pending.to,
+        provider_args: Vec::new(),
+        document: built.rendered.markdown.into_bytes(),
+        recent_events_jsonl: built.recent_events_jsonl,
+        bootstrap: Some(BOOTSTRAP),
+        cwd: next_cwd,
+    }))
 }
 
 pub fn run_command(
@@ -785,9 +832,9 @@ pub fn run_command(
         &leases,
         runtime,
         environment,
-        &provider_args,
         LaunchRequest {
             provider,
+            provider_args,
             document: b"# Handover\n\nThis is the first provider run in this session. Continue from the current Git worktree and user prompt.\n".to_vec(),
             recent_events_jsonl: Vec::new(),
             bootstrap: None,
@@ -865,9 +912,9 @@ pub fn switch_command(
         &leases,
         runtime,
         environment,
-        &provider_args,
         LaunchRequest {
             provider,
+            provider_args,
             document: built.rendered.markdown.into_bytes(),
             recent_events_jsonl: built.recent_events_jsonl,
             bootstrap: Some(BOOTSTRAP),
