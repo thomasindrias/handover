@@ -1,7 +1,7 @@
 # Updated automatically by .github/workflows/release.yml on each tagged release.
-class Sesh < Formula
+class Handover < Formula
   desc "Local-first session layer for coding agents"
-  homepage "https://github.com/thomasindrias/sesh"
+  homepage "https://github.com/thomasindrias/handover"
   version "0.1.1"
   license "Apache-2.0"
 
@@ -28,10 +28,10 @@ class Sesh < Formula
   end
 
   def install
-    bin.install "sesh"
+    bin.install "handover"
   end
 
   test do
-    assert_match "sesh #{version}", shell_output("#{bin}/sesh --version")
+    assert_match "handover #{version}", shell_output("#{bin}/handover --version")
   end
 end
