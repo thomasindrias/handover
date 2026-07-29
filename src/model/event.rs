@@ -37,14 +37,18 @@ pub enum EventKind {
         surface: Surface,
         expires_at: String,
     },
-    /// A claim of the arm at `armed_sequence`. `through_sequence` is the
-    /// sequence of the transition checkpoint this claim's handover was built
-    /// from — the committed prefix the switching provider is handed.
+    /// A claim of the arm at `armed_sequence`.
+    ///
+    /// `transition_checkpoint_sequence` points at the `checkpoint.created`
+    /// event this claim's handover was rendered against, the same way
+    /// `SessionForked` points at `parent_checkpoint_sequence`. It is a
+    /// pointer, not a prefix: read that checkpoint to get the committed
+    /// prefix from its own `through_sequence`, which is a smaller number.
     #[serde(rename = "switch.claimed")]
     SwitchClaimed {
         armed_sequence: u64,
         to: Provider,
-        through_sequence: u64,
+        transition_checkpoint_sequence: u64,
     },
     #[serde(rename = "switch.expired")]
     SwitchExpired { armed_sequence: u64 },
@@ -267,13 +271,13 @@ mod tests {
                 EventKind::SwitchClaimed {
                     armed_sequence: 12,
                     to: Provider::Codex,
-                    through_sequence: 18,
+                    transition_checkpoint_sequence: 18,
                 },
                 "switch.claimed",
                 serde_json::json!({
                     "armed_sequence": 12,
                     "to": "codex",
-                    "through_sequence": 18
+                    "transition_checkpoint_sequence": 18
                 }),
             ),
             (

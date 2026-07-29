@@ -237,15 +237,25 @@ fn the_handover_claim_emits_names_a_transition_checkpoint_that_exists() {
             .is_file()
     );
 
-    // And the claim records which committed prefix it handed over, so the
-    // journal alone answers "what did the switching provider receive?".
+    // And the claim points at that checkpoint, so the journal alone answers
+    // "what did the switching provider receive?". The pointer is the
+    // checkpoint's own event sequence, not the committed prefix -- the prefix
+    // is one lower, and lives on the checkpoint asserted above.
     let claim_event = journal
         .iter()
         .map(|envelope| &envelope["event"])
         .find(|event| event["type"] == "switch.claimed")
         .expect("the claim must be journaled");
     assert_eq!(claim_event["payload"]["armed_sequence"], armed_sequence);
-    assert_eq!(claim_event["payload"]["through_sequence"], transition);
+    assert_eq!(
+        claim_event["payload"]["transition_checkpoint_sequence"],
+        transition
+    );
+    assert_ne!(
+        claim_event["payload"]["transition_checkpoint_sequence"],
+        event["payload"]["through_sequence"],
+        "a pointer to the checkpoint is not the checkpoint's committed prefix"
+    );
     assert!(claim_event["sequence"].as_u64().unwrap() > transition);
 }
 

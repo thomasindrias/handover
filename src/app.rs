@@ -1306,7 +1306,7 @@ fn claim_command(
         EventKind::SwitchClaimed {
             armed_sequence: pending.sequence,
             to: pending.to,
-            through_sequence: built.transition_sequence,
+            transition_checkpoint_sequence: built.transition_sequence,
         },
     )?;
 
