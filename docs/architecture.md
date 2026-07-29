@@ -146,6 +146,28 @@ a `switch_readiness` block — lease state, narrative checkpoint freshness,
 handover renderability, and the suggested switch command — so this can be
 checked before quitting the current provider.
 
+A switch is two-phase. `handover arm <provider>` records intent as
+`switch.requested` plus `switch.armed` — a one-shot capability identified by
+the sequence of its `switch.armed` event, carrying an expiry. `handover claim`
+consumes it exactly once, commits the transition checkpoint, and records
+`switch.claimed`. `handover switch` composes both in one command and refuses
+when an arm for a different provider is already pending.
+
+Expiry is evaluated lazily. Handover has no daemon, so an arm found past its
+deadline is retired at read time and `switch.expired` is appended before the
+read returns. An arm that is never read again simply stays unobserved.
+
+An arm authorises one narrow thing: releasing a dead lease belonging to the run
+that armed it, without the interactive prompt `switch --recover-lease`
+otherwise requires. It cannot touch a live lease, nor another run's lease. That
+release is journaled as `run.recovered`, so no lease leaves a session's history
+unexplained. Arm-and-complete-on-exit follows from these rules rather than
+needing enforcement: a claim attempted while the provider still runs refuses,
+because its lease is live.
+
+When a supervised provider exits and an arm is pending, the supervisor claims
+it and launches its target in the same terminal.
+
 ## Fork transaction
 
 `handover fork` deliberately creates a separate line of work. It is not an option on

@@ -56,6 +56,15 @@ provider launches. It applies the same fail-closed snapshot verification as
 `switch`, so a missing or stale narrative checkpoint is visible before a
 switch is spent.
 
+`handover arm <provider>` records a pending switch without launching anything,
+and `handover claim` completes it. Both apply the same fail-closed snapshot
+verification as `switch`. Arming while a provider is still running is the
+intended use: quit it, and the armed target starts in the same terminal.
+
+`handover attach <provider>` binds the current worktree to a session for a
+provider Handover did not launch. Such a session has no lifecycle hooks, so its
+journal holds narrative checkpoints and Git facts but no observed events.
+
 ## Checkpoints
 
 A checkpoint is the portable narrative that observed activity cannot supply.
