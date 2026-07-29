@@ -762,16 +762,6 @@ pub fn switch_command(
         },
     )?;
 
-    let previous_provider = previous_provider(&store.events()?)?;
-    store.append(
-        runtime,
-        None,
-        None,
-        EventKind::SwitchRequested {
-            from: previous_provider,
-            to: provider,
-        },
-    )?;
     let built = commit_transition_handover(&store, runtime, switch_snapshot, provider)?;
 
     let run_id = runtime.run_id();
@@ -1164,10 +1154,21 @@ fn arm_command(
         .read()?
         .map(|lease| lease.run_id);
     let expires_at = crate::arm::expires_at(runtime, ttl)?;
+    // `arm` owns the intent and `claim` owns the completion, so the journal
+    // reads the same whether a switch came from one command or two.
+    store.append(
+        runtime,
+        armed_run.clone(),
+        None,
+        EventKind::SwitchRequested {
+            from: previous_provider(&events)?,
+            to: provider,
+        },
+    )?;
     let event = store.append(
         runtime,
         armed_run,
-        previous_provider(&events)?,
+        None,
         EventKind::SwitchArmed {
             to: provider,
             surface,
@@ -1302,7 +1303,7 @@ fn claim_command(
     store.append(
         runtime,
         None,
-        Some(pending.to),
+        None,
         EventKind::SwitchClaimed {
             armed_sequence: pending.sequence,
             to: pending.to,

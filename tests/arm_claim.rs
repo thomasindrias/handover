@@ -831,3 +831,54 @@ fn arm_warns_on_stderr_but_succeeds_past_a_stale_narrative_checkpoint() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["checkpoint_fresh"], false);
 }
+
+#[test]
+fn arm_records_intent_and_switch_events_are_provider_neutral() {
+    let (_temp, cwd, state, path) = finished_session();
+
+    cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["arm", "codex"])
+        .assert()
+        .success();
+
+    let log = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["log", "--json"])
+        .output()
+        .unwrap();
+    let journal: Vec<serde_json::Value> = String::from_utf8_lossy(&log.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+
+    let requested = journal
+        .iter()
+        .map(|envelope| &envelope["event"])
+        .find(|event| event["type"] == "switch.requested")
+        .expect("arm must record the intent");
+    assert_eq!(requested["payload"]["to"], "codex");
+
+    let armed = journal
+        .iter()
+        .map(|envelope| &envelope["event"])
+        .find(|event| event["type"] == "switch.armed")
+        .expect("arm must record the capability");
+
+    // The intent precedes the capability.
+    assert!(requested["sequence"].as_u64().unwrap() < armed["sequence"].as_u64().unwrap());
+
+    // Switch events are session-level facts: `from`/`to` live in the payload,
+    // so the envelope attributes them to no provider.
+    for event in [requested, armed] {
+        assert_eq!(
+            event["provider"],
+            serde_json::Value::Null,
+            "switch events must be provider-neutral, got {event}"
+        );
+    }
+}
