@@ -137,6 +137,88 @@ exit 0
     );
 }
 
+/// A provider is free to report the same native session id in more than one
+/// run: `claude --resume <id>` and `claude --session-id <uuid>` both make it
+/// reachable, and a codex resume does the same. The journal spans every run in
+/// the session, so a hook idempotency key built from a provider-supplied id
+/// must be scoped to the run that reported it — otherwise the second run's
+/// SessionStart collides with the first run's, no handshake is recorded, and
+/// every later hook in that run is refused.
+#[test]
+fn a_second_run_reporting_the_same_native_ids_still_handshakes() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    // Every id this fake reports is identical across runs: the native session
+    // id and the tool use id, which key the handshake, stop, and tool events.
+    write_executable(
+        &bin.join("claude"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-claude 1.0'; exit 0; fi
+cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
+hook() { printf '%s' "$1" | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null; }
+hook '{"session_id":"resumed","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}'
+hook '{"session_id":"resumed","cwd":"'"$cwd_json"'","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"cargo test oauth"},"tool_use_id":"tool-1"}'
+hook '{"session_id":"resumed","cwd":"'"$cwd_json"'","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"cargo test oauth"},"tool_response":{"stdout":"ok","stderr":"","exit_code":0},"tool_use_id":"tool-1"}'
+hook '{"session_id":"resumed","cwd":"'"$cwd_json"'","hook_event_name":"Stop"}'
+exit 0
+"#,
+    );
+    let state = temp.path().join("state");
+    let path = path_with(&bin);
+
+    for command in [["run", "claude"], ["switch", "claude"]] {
+        cargo_bin_cmd!("handover")
+            .current_dir(&repo)
+            .env("HANDOVER_HOME", &state)
+            .env("PATH", &path)
+            .args(command)
+            .assert()
+            .success();
+    }
+
+    let session = std::fs::read_dir(state.join("sessions"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(session.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let count = |kind: &str| {
+        events
+            .iter()
+            .filter(|value| value["event"]["type"] == kind)
+            .count()
+    };
+    for kind in [
+        "run.handshake",
+        "provider.tool.requested",
+        "provider.tool.completed",
+        "provider.stop.observed",
+    ] {
+        assert_eq!(count(kind), 2, "expected {kind} once per run");
+    }
+    assert_eq!(count("capture.failed"), 0);
+
+    // Both handshakes name the same native session, one per run.
+    let runs: Vec<_> = events
+        .iter()
+        .filter(|value| value["event"]["type"] == "run.handshake")
+        .map(|value| {
+            assert_eq!(value["event"]["payload"]["native_session_id"], "resumed");
+            value["event"]["run_id"].clone()
+        })
+        .collect();
+    assert_ne!(runs[0], runs[1]);
+}
+
 fn path_with(bin: &std::path::Path) -> OsString {
     let mut paths = vec![bin.to_path_buf()];
     paths.extend(std::env::split_paths(
