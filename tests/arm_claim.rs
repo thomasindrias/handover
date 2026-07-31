@@ -962,6 +962,68 @@ fn switch_journals_the_same_arm_and_claim_a_two_step_switch_does() {
     }
 }
 
+/// A `switch` that cannot render its handover must arm nothing.
+///
+/// `arm` and `claim` both prove the document renders before they touch the
+/// journal; the porcelain that composes them has to do the same, or a failed
+/// command leaves a capability the user never asked for — and, for the next
+/// fifteen minutes, refuses every switch to any other provider.
+///
+/// The gate is broken by corrupting the narrative checkpoint's rendered
+/// Markdown, which `load_verified_checkpoint` checks against its canonical
+/// JSON. The saved cwd still resolves, so this lands where the arm used to be
+/// already durable rather than before it.
+#[test]
+fn a_switch_that_cannot_render_its_handover_arms_nothing() {
+    let (_temp, cwd, state, path) = finished_session();
+    let (session, _) = session_dir_and_id(&state);
+
+    let handover = |args: &[&str]| {
+        cargo_bin_cmd!("handover")
+            .current_dir(&cwd)
+            .env("HANDOVER_HOME", &state)
+            .env("PATH", &path)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let journal = || String::from_utf8_lossy(&handover(&["log", "--json"]).stdout).into_owned();
+
+    let markdown = std::fs::read_dir(session.join("checkpoints"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "md"))
+        .expect("the finished run wrote a narrative checkpoint");
+    let canonical = std::fs::read(&markdown).unwrap();
+    std::fs::write(&markdown, b"not the canonical rendering\n").unwrap();
+
+    let refused = handover(&["switch", "codex"]);
+    assert!(
+        !refused.status.success(),
+        "switch must fail when its handover will not render"
+    );
+
+    let text = journal();
+    for kind in ["switch.requested", "switch.armed", "switch.claimed"] {
+        assert!(
+            !text.contains(kind),
+            "a switch that failed its render gate must journal no {kind}; \
+             journal was: {text}"
+        );
+    }
+
+    // "Nothing happened" is retryable: with the cause fixed, the same command
+    // works, and it is not fighting a capability the failure left behind.
+    std::fs::write(&markdown, &canonical).unwrap();
+    let retried = handover(&["switch", "codex"]);
+    assert!(
+        retried.status.success(),
+        "the switch must succeed once the cause is fixed; stderr was: {}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    assert!(journal().contains("switch.claimed"));
+}
+
 /// `switch` finding a pending arm that already targets the same provider
 /// must claim that one rather than arming a second time. The exit status
 /// alone cannot tell the two apart -- both a reuse and a regressed

@@ -124,7 +124,7 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
             let layout = resolve_layout(environment, &cwd)?;
             crate::list::list_command(json, &layout)
         }
-        Command::Status { json } => status_command(json, environment),
+        Command::Status { json } => status_command(json, environment, runtime),
         Command::Log { from, json } => log_command(from, json, environment),
         Command::Inspect { json } => inspect_command(json, environment),
         Command::Delete { yes } => {
@@ -137,7 +137,7 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
             setup_command(provider, environment, stdin.is_terminal())
         }
         Command::Doctor { json, repair } => doctor_command(json, repair, environment),
-        Command::McpServer => crate::mcp::mcp_server_command(environment),
+        Command::McpServer => crate::mcp::mcp_server_command(environment, runtime),
         Command::Hook { provider } => {
             if ["HANDOVER_HOME", "HANDOVER_SESSION_ID", "HANDOVER_RUN_ID"]
                 .into_iter()
@@ -614,8 +614,11 @@ struct LaunchRequest {
 /// When the provider exits and an arm is pending, claim it and launch its
 /// target in the same terminal rather than returning. That loop is the
 /// in-session handover: arm while a provider runs, quit it, and its successor
-/// comes up where it was. Each hop needs its own arm, because a claim consumes
-/// the one it acts on.
+/// comes up where it was. Each hop consumes the arm it acts on, so a further
+/// hop needs a further arm — but that is not a bound. A provider that arms a
+/// switch every time it starts keeps this loop going indefinitely; nothing
+/// here counts hops or refuses one. Termination rests on providers not doing
+/// that, not on the construction of this function.
 ///
 /// Takes ownership of `operation` — the lock is dropped before the child
 /// launches and re-acquired for teardown, exactly as the two call sites did.
@@ -740,7 +743,7 @@ fn launch_supervised_run(
         // render, a saved cwd that vanished -- leaves this run's exit as the
         // result rather than failing a session that already did its work. The
         // arm survives, so the user can claim it once the cause is fixed.
-        match next_launch_from_pending_arm(store, leases, runtime, &post) {
+        match next_launch_from_pending_arm(store, layout, leases, runtime, &post) {
             Ok(Some(next)) => request = next,
             Ok(None) => {
                 drop(operation);
@@ -765,11 +768,12 @@ fn launch_supervised_run(
 ///
 /// Called only after the finished run's lease is cleared, and only with
 /// `SessionOperationLock` held. Every failure here is recoverable by
-/// construction: the gate proves the handover renders before anything is
-/// released or appended, so the caller can report it and keep the finished
-/// run's exit code.
+/// construction: everything that can fail runs before the claim, so the caller
+/// can report it and keep the finished run's exit code, and the arm survives
+/// for `handover claim` to take once the cause is fixed.
 fn next_launch_from_pending_arm(
     store: &SessionStore,
+    layout: &StateLayout,
     leases: &LeaseStore,
     runtime: &dyn Runtime,
     post: &GitSnapshot,
@@ -781,16 +785,26 @@ fn next_launch_from_pending_arm(
     // the reason `claim_command` states: "nothing happened" is a state the user
     // can retry; "half happened" is not.
     preview_handover(store, post, pending.to)?;
+    // Prove the successor can actually start, for the same reason. `arm` never
+    // probes, so an arm for a provider that is not installed is accepted --
+    // and the claim that consumes it must not be spent on a launch that is
+    // about to fail. Both calls repeat verbatim at the top of the caller's
+    // next iteration; both are idempotent.
+    let successor = adapter(pending.to);
+    successor.setup(&layout.integrations())?;
+    successor.probe()?;
+    // A pure read, and so it belongs above the claim with the rest of the
+    // gate. The successor is a switch, so it gets the bootstrap and the saved
+    // cwd even when this hop began as a plain `run` -- and, like a `handover
+    // switch <provider>` typed with no trailing args, none of the finished
+    // run's.
+    let (_, next_cwd) = resolve_saved_cwd(store)?;
     eprintln!(
         "Handing over to {} (armed at sequence {}).",
         pending.to.executable(),
         pending.sequence
     );
     let built = claim_pending(store, leases, runtime, post, &pending)?;
-    // The successor is a switch, so it gets the bootstrap and the saved cwd
-    // even when this hop began as a plain `run` -- and, like a `handover switch
-    // <provider>` typed with no trailing args, none of the finished run's.
-    let (_, next_cwd) = resolve_saved_cwd(store)?;
     Ok(Some(LaunchRequest {
         provider: pending.to,
         provider_args: Vec::new(),
@@ -882,8 +896,16 @@ pub fn switch_command(
         },
     )?;
 
+    // Prove the handover renders before recording any intent. `arm`, `claim`,
+    // and the supervisor's claim path all gate on this before they mutate; the
+    // porcelain must not be the one command that leaves a capability the user
+    // never asked for behind when it fails.
+    preview_handover(&store, &invocation_snapshot, provider)?;
+
     // Reuse a matching arm rather than recording a second intent for the same
-    // switch. Task 2's refusal has already rejected a conflicting one.
+    // switch. An arm for a *different* provider is a conflict this refuses
+    // rather than displaces: a one-shot capability is not overwritten by the
+    // command that trips over it.
     let pending = match crate::arm::pending(&store, runtime, &store.events()?)? {
         Some(existing) if existing.to == provider => existing,
         Some(existing) => {
@@ -2026,7 +2048,10 @@ fn classify_lease(leases: &LeaseStore) -> Result<(&'static str, Option<String>)>
     ))
 }
 
-pub(crate) fn build_status_value(environment: &Environment) -> Result<serde_json::Value> {
+pub(crate) fn build_status_value(
+    environment: &Environment,
+    runtime: &dyn Runtime,
+) -> Result<serde_json::Value> {
     let (_layout, snapshot, store) = current_session(environment)?;
     let events = store.events()?;
     let provider = previous_provider(&events)?;
@@ -2049,7 +2074,21 @@ pub(crate) fn build_status_value(environment: &Environment) -> Result<serde_json
             Ok(_) => (true, None),
             Err(error) => (false, Some(error.to_string())),
         };
-    let ready = lease_state == "free" && handover_renderable;
+    // A pending arm is a refusal this block would otherwise not see: `switch`
+    // rejects a target that is not the armed one, so reporting `ready: true`
+    // and suggesting the other provider would send the user at a command that
+    // cannot run. Read it without `crate::arm::pending`, which retires an
+    // expired arm by appending `switch.expired` -- status holds no
+    // `SessionOperationLock` and must never write.
+    let now = runtime.now()?;
+    let armed = match crate::arm::latest_unresolved(&events) {
+        Some(arm) if crate::arm::is_live_at(&arm, &now)? => Some(arm),
+        _ => None,
+    };
+    let ready = lease_state == "free" && handover_renderable && armed.is_none();
+    // With an arm pending, the only switch that will be accepted is the one it
+    // already names.
+    let suggested_target = armed.as_ref().map(|arm| arm.to).unwrap_or(target_provider);
     Ok(serde_json::json!({
         "schema_version": 1,
         "session_id": store.id(),
@@ -2079,7 +2118,12 @@ pub(crate) fn build_status_value(environment: &Environment) -> Result<serde_json
             "checkpoint_fresh": checkpoint_fresh,
             "handover_renderable": handover_renderable,
             "handover_error": handover_error,
-            "suggested_switch_command": format!("handover switch {}", target_provider.executable()),
+            "armed": armed.as_ref().map(|arm| serde_json::json!({
+                "to": arm.to,
+                "sequence": arm.sequence,
+                "expires_at": arm.expires_at,
+            })),
+            "suggested_switch_command": format!("handover switch {}", suggested_target.executable()),
         },
     }))
 }
@@ -2090,8 +2134,8 @@ pub(crate) fn mcp_list_value(environment: &Environment) -> Result<serde_json::Va
     crate::list::build_list_value(&layout)
 }
 
-fn status_command(json: bool, environment: &Environment) -> Result<i32> {
-    let value = build_status_value(environment)?;
+fn status_command(json: bool, environment: &Environment, runtime: &dyn Runtime) -> Result<i32> {
+    let value = build_status_value(environment, runtime)?;
     write_projection(&value, json)?;
     Ok(0)
 }

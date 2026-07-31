@@ -79,6 +79,18 @@ exit 0
     write_executable(&bin.join("codex"), &body);
 }
 
+/// A codex that cannot report a version. `handover arm` never probes its
+/// target, so an arm for a provider that will not start is accepted — and a
+/// provider that is not on PATH at all fails the same `probe()` this one does,
+/// which is the gate under test.
+fn fake_codex_that_cannot_start(bin: &std::path::Path) {
+    let body = r#"#!/usr/bin/env bash
+printf '%s\n' 'codex: command not found' >&2
+exit 127
+"#;
+    write_executable(&bin.join("codex"), body);
+}
+
 fn fake_codex(bin: &std::path::Path) {
     let body = r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -209,6 +221,86 @@ fn a_handover_that_cannot_render_keeps_the_finished_run_s_exit_code() {
         "nothing may be half-committed by a refused handover; journal was: {text}"
     );
 
+    let claim = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["claim"])
+        .output()
+        .unwrap();
+    assert!(
+        claim.status.success(),
+        "the arm must still be claimable by hand; stderr was: {}",
+        String::from_utf8_lossy(&claim.stderr)
+    );
+}
+
+/// The gate that precedes the claim has to cover the successor's ability to
+/// start, not only the document's ability to render.
+///
+/// Otherwise the overwhelmingly likely failure — an arm for a provider that is
+/// not installed, which `arm` accepts because it never probes — is spent: the
+/// claim commits, the launch then fails, a session that did its work exits
+/// non-zero, and the recovery the error would have suggested (`handover
+/// claim`) is no longer available, because the arm is gone.
+#[test]
+fn a_successor_that_cannot_launch_keeps_the_exit_code_and_the_arm() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    let cwd = repo.join("apps/web");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let state = temp.path().join("state");
+    let handover = assert_cmd::cargo::cargo_bin("handover");
+
+    fake_claude_that_arms(&bin, &handover, &state);
+    fake_codex_that_cannot_start(&bin);
+    let path = path_with(&bin);
+
+    let output = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["run", "claude"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the finished run's exit code must survive a successor that cannot \
+         start; stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Handover did not complete"),
+        "the failure must be reported on stderr; stderr was: {stderr}"
+    );
+
+    let log = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["log", "--json"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&log.stdout);
+    assert!(text.contains("switch.armed"), "the arm must be recorded");
+    assert!(
+        !text.contains("switch.claimed"),
+        "a successor that cannot start must not consume the arm; \
+         journal was: {text}"
+    );
+    assert!(
+        !text.contains("\"provider\":\"codex\""),
+        "codex must have no run in the journal; journal was: {text}"
+    );
+
+    // The advice the loop printed has to be true: the arm is still there to
+    // take, and `handover claim` does not need codex to run.
     let claim = cargo_bin_cmd!("handover")
         .current_dir(&cwd)
         .env("HANDOVER_HOME", &state)

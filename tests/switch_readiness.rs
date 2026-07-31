@@ -82,6 +82,7 @@ fn a_fresh_checkpointed_session_reports_ready() {
     assert_eq!(readiness["checkpoint_fresh"], true);
     assert_eq!(readiness["handover_renderable"], true);
     assert!(readiness["handover_error"].is_null());
+    assert!(readiness["armed"].is_null());
 }
 
 #[test]
@@ -105,15 +106,90 @@ fn a_stale_narrative_checkpoint_is_advisory_and_does_not_block_readiness() {
     assert_eq!(readiness["ready"], true);
 }
 
-#[test]
-fn a_recoverable_lease_blocks_readiness_and_says_so() {
-    let (_temp, repo, state) = run_fake_claude(1, true);
-    let session = std::fs::read_dir(state.join("sessions"))
+fn session_dir(state: &std::path::Path) -> std::path::PathBuf {
+    std::fs::read_dir(state.join("sessions"))
         .unwrap()
         .next()
         .unwrap()
         .unwrap()
-        .path();
+        .path()
+}
+
+fn arm(repo: &std::path::Path, state: &std::path::Path, args: &[&str]) {
+    cargo_bin_cmd!("handover")
+        .current_dir(repo)
+        .env("HANDOVER_HOME", state)
+        .args(args)
+        .assert()
+        .success();
+}
+
+/// A pending arm is a refusal this block could not see: `switch` rejects any
+/// target that is not the armed one, so reporting `ready: true` alongside a
+/// suggestion for the other provider sends the user at a command that cannot
+/// run. Arming the provider that just ran makes the two differ, so the
+/// suggestion has to follow the arm rather than the previous provider.
+#[test]
+fn a_pending_arm_blocks_readiness_and_the_suggestion_follows_it() {
+    let (_temp, repo, state) = run_fake_claude(1, true);
+    arm(&repo, &state, &["arm", "claude"]);
+
+    let status = status_json(&repo, &state);
+    let readiness = &status["switch_readiness"];
+    assert_eq!(readiness["lease"], "free");
+    assert_eq!(readiness["handover_renderable"], true);
+    assert_eq!(
+        readiness["ready"], false,
+        "an armed switch is the only one that will be accepted"
+    );
+    assert_eq!(readiness["armed"]["to"], "claude");
+    assert!(readiness["armed"]["sequence"].as_u64().unwrap() > 0);
+    assert!(
+        readiness["armed"]["expires_at"]
+            .as_str()
+            .unwrap()
+            .ends_with('Z')
+    );
+    assert_eq!(
+        readiness["suggested_switch_command"],
+        "handover switch claude"
+    );
+}
+
+/// `status` holds no `SessionOperationLock`, so it must read a pending arm
+/// without retiring an expired one — `crate::arm::pending` would append
+/// `switch.expired`, which is a write from a command that promises none.
+#[test]
+fn status_sees_through_an_expired_arm_without_journaling_its_expiry() {
+    let (_temp, repo, state) = run_fake_claude(1, true);
+    arm(&repo, &state, &["arm", "codex", "--ttl", "1s"]);
+
+    let journal = session_dir(&state).join("events.jsonl");
+    let before = std::fs::read(&journal).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1_500));
+
+    let status = status_json(&repo, &state);
+    let readiness = &status["switch_readiness"];
+    assert!(
+        readiness["armed"].is_null(),
+        "an expired arm is not pending"
+    );
+    assert_eq!(readiness["ready"], true);
+    assert_eq!(
+        readiness["suggested_switch_command"],
+        "handover switch codex"
+    );
+    assert_eq!(
+        std::fs::read(&journal).unwrap(),
+        before,
+        "status must append nothing, least of all switch.expired"
+    );
+}
+
+#[test]
+fn a_recoverable_lease_blocks_readiness_and_says_so() {
+    let (_temp, repo, state) = run_fake_claude(1, true);
+    let session = session_dir(&state);
     let session_id = SessionId::parse(session.file_name().unwrap().to_str().unwrap()).unwrap();
     let leases = LeaseStore::new(&session);
     let stale = RunLease::new(
@@ -143,12 +219,7 @@ fn a_recoverable_lease_blocks_readiness_and_says_so() {
 #[test]
 fn a_live_lease_blocks_readiness_and_says_so() {
     let (_temp, repo, state) = run_fake_claude(1, true);
-    let session = std::fs::read_dir(state.join("sessions"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let session = session_dir(&state);
     let session_id = SessionId::parse(session.file_name().unwrap().to_str().unwrap()).unwrap();
     let leases = LeaseStore::new(&session);
     let live = RunLease::new(
