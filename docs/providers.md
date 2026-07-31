@@ -56,6 +56,23 @@ provider launches. It applies the same fail-closed snapshot verification as
 `switch`, so a missing or stale narrative checkpoint is visible before a
 switch is spent.
 
+`handover arm <provider>` records a pending switch without launching anything,
+and `handover claim` completes it. Both apply the same fail-closed verification
+as `switch`, and in the same order: the saved cwd is resolved and checked
+against the invoking worktree and the handover is rendered *before* anything is
+recorded, so a command that fails leaves no intent, capability, or checkpoint
+behind. Arming while a provider is still running is the intended use: quit it,
+and the armed target starts in the same terminal.
+
+`handover attach <provider>` binds the current worktree to a session for a
+provider Handover did not launch. Such a session has no lifecycle hooks, so its
+journal holds narrative checkpoints and Git facts but no observed events. It
+also has no run ID: unlike "an attached provider" in Checkpoints below (a
+provider process Handover did launch and lease), a provider bound only
+through `attach` cannot submit a checkpoint through the run-scoped inbox,
+though a human can still record one for it directly with
+`handover checkpoint`.
+
 ## Checkpoints
 
 A checkpoint is the portable narrative that observed activity cannot supply.

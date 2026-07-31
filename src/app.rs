@@ -124,7 +124,7 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
             let layout = resolve_layout(environment, &cwd)?;
             crate::list::list_command(json, &layout)
         }
-        Command::Status { json } => status_command(json, environment),
+        Command::Status { json } => status_command(json, environment, runtime),
         Command::Log { from, json } => log_command(from, json, environment),
         Command::Inspect { json } => inspect_command(json, environment),
         Command::Delete { yes } => {
@@ -137,7 +137,7 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
             setup_command(provider, environment, stdin.is_terminal())
         }
         Command::Doctor { json, repair } => doctor_command(json, repair, environment),
-        Command::McpServer => crate::mcp::mcp_server_command(environment),
+        Command::McpServer => crate::mcp::mcp_server_command(environment, runtime),
         Command::Hook { provider } => {
             if ["HANDOVER_HOME", "HANDOVER_SESSION_ID", "HANDOVER_RUN_ID"]
                 .into_iter()
@@ -594,6 +594,227 @@ fn doctor_command(json: bool, repair: bool, environment: &Environment) -> Result
     )
 }
 
+/// What one launch needs. `run` and `switch` differ only in what this holds;
+/// everything after the launch is identical, which is why they share a tail.
+///
+/// `provider_args` belongs here rather than to the loop that launches: they are
+/// the flags the user typed for *this* provider, and a successor launched by a
+/// claimed arm must not inherit them.
+struct LaunchRequest {
+    provider: Provider,
+    provider_args: Vec<OsString>,
+    document: Vec<u8>,
+    recent_events_jsonl: Vec<u8>,
+    bootstrap: Option<&'static str>,
+    cwd: PathBuf,
+}
+
+/// Launch `provider`, supervise it, and record its stop.
+///
+/// When the provider exits and an arm is pending, claim it and launch its
+/// target in the same terminal rather than returning. That loop is the
+/// in-session handover: arm while a provider runs, quit it, and its successor
+/// comes up where it was. Each hop consumes the arm it acts on, so a further
+/// hop needs a further arm — but that is not a bound. A provider that arms a
+/// switch every time it starts keeps this loop going indefinitely; nothing
+/// here counts hops or refuses one. Termination rests on providers not doing
+/// that, not on the construction of this function.
+///
+/// Takes ownership of `operation` — the lock is dropped before the child
+/// launches and re-acquired for teardown, exactly as the two call sites did.
+fn launch_supervised_run(
+    store: &SessionStore,
+    layout: &StateLayout,
+    leases: &LeaseStore,
+    runtime: &dyn Runtime,
+    environment: &Environment,
+    request: LaunchRequest,
+    mut operation: SessionOperationLock,
+) -> Result<i32> {
+    let mut request = request;
+    loop {
+        let provider = request.provider;
+        let saved_cwd = request.cwd.clone();
+        let run_id = runtime.run_id();
+        let run_paths = prepare_run_directory(
+            store,
+            &run_id,
+            &request.document,
+            &request.recent_events_jsonl,
+        )?;
+        let provider_adapter = adapter(provider);
+        provider_adapter.setup(&layout.integrations())?;
+        let provider_version = provider_adapter.probe()?;
+        let hook_bin = std::env::current_exe()
+            .map_err(|source| io("current executable", source))?
+            .canonicalize()
+            .map_err(|source| io("current executable", source))?;
+        store.append(
+            runtime,
+            Some(run_id.clone()),
+            Some(provider),
+            EventKind::RunStarted {
+                cwd: saved_cwd
+                    .to_str()
+                    .ok_or_else(|| Error::InvalidState("saved cwd must be valid UTF-8".into()))?
+                    .to_owned(),
+                args: request
+                    .provider_args
+                    .iter()
+                    .map(|arg| encode_arg(arg))
+                    .collect(),
+                supervisor_pid: std::process::id(),
+            },
+        )?;
+        let lease = RunLease::new(
+            store.id().clone(),
+            run_id.clone(),
+            provider,
+            ProcessIdentity::capture(std::process::id())?,
+        )?;
+        leases.create(&lease)?;
+        let provider_home = resolve_provider_home(provider, environment);
+        let mut spec = provider_adapter.launch_spec(LaunchContext {
+            cwd: &saved_cwd,
+            inbox: &run_paths.inbox,
+            integration_root: &layout.integrations(),
+            hook_bin: &hook_bin,
+            provider_args: &request.provider_args,
+            bootstrap: request.bootstrap,
+            run_dir: &run_paths.root,
+            provider_home: provider_home.as_deref(),
+        })?;
+        add_run_environment(
+            &mut spec.env,
+            layout,
+            store,
+            &run_id,
+            provider,
+            &provider_version,
+            &hook_bin,
+            &run_paths,
+        );
+        drop(operation);
+
+        let supervised = Supervisor::launch(spec, store, &run_id, Duration::from_secs(60));
+        operation = SessionOperationLock::acquire(&store.session_dir())?;
+        let (facts, supervision_error) = match supervised {
+            Ok(outcome) => (outcome.facts.clone(), outcome.startup_failure.clone()),
+            Err(error) => (
+                ExitFacts {
+                    exit_code: None,
+                    signal: None,
+                },
+                Some(error.to_string()),
+            ),
+        };
+        promote_inbox(store, runtime, &run_id, provider, &run_paths.checkpoints)?;
+        store.append(
+            runtime,
+            Some(run_id.clone()),
+            Some(provider),
+            EventKind::RunStopped {
+                exit_code: facts.exit_code,
+                signal: facts.signal,
+            },
+        )?;
+        let post = Git::new().snapshot(&saved_cwd)?;
+        store.append(
+            runtime,
+            Some(run_id.clone()),
+            Some(provider),
+            EventKind::GitSnapshot {
+                snapshot: post.clone(),
+            },
+        )?;
+        leases.clear(&run_id)?;
+
+        if let Some(message) = supervision_error {
+            drop(operation);
+            return Err(Error::Command(message));
+        }
+
+        let exit_code = facts
+            .exit_code
+            .unwrap_or_else(|| 128 + facts.signal.unwrap_or(1));
+
+        // The lease is clear, so a pending arm can be claimed now. Anything
+        // that stops the handover -- an expired arm, a handover that will not
+        // render, a saved cwd that vanished -- leaves this run's exit as the
+        // result rather than failing a session that already did its work. The
+        // arm survives, so the user can claim it once the cause is fixed.
+        match next_launch_from_pending_arm(store, layout, leases, runtime, &post) {
+            Ok(Some(next)) => request = next,
+            Ok(None) => {
+                drop(operation);
+                return Ok(exit_code);
+            }
+            Err(error) => {
+                eprintln!(
+                    "Handover did not complete: {error}. {} exited with {exit_code}; \
+                     any armed switch is still pending, so fix the cause and run \
+                     `handover claim`.",
+                    provider.executable()
+                );
+                drop(operation);
+                return Ok(exit_code);
+            }
+        }
+    }
+}
+
+/// Claim a pending arm and describe the launch that succeeds it, or `None` when
+/// nothing is armed.
+///
+/// Called only after the finished run's lease is cleared, and only with
+/// `SessionOperationLock` held. Every failure here is recoverable by
+/// construction: everything that can fail runs before the claim, so the caller
+/// can report it and keep the finished run's exit code, and the arm survives
+/// for `handover claim` to take once the cause is fixed.
+fn next_launch_from_pending_arm(
+    store: &SessionStore,
+    layout: &StateLayout,
+    leases: &LeaseStore,
+    runtime: &dyn Runtime,
+    post: &GitSnapshot,
+) -> Result<Option<LaunchRequest>> {
+    let Some(pending) = crate::arm::pending(store, runtime, &store.events()?)? else {
+        return Ok(None);
+    };
+    // Prove the handover renders before anything is released or appended, for
+    // the reason `claim_command` states: "nothing happened" is a state the user
+    // can retry; "half happened" is not.
+    preview_handover(store, post, pending.to)?;
+    // Prove the successor can actually start, for the same reason. `arm` never
+    // probes, so an arm for a provider that is not installed is accepted --
+    // and the claim that consumes it must not be spent on a launch that is
+    // about to fail. Both calls repeat verbatim at the top of the caller's
+    // next iteration; both are idempotent.
+    let successor = adapter(pending.to);
+    successor.setup(&layout.integrations())?;
+    successor.probe()?;
+    // A pure read, and so it belongs above the claim with the rest of the
+    // gate. The successor is a switch, so it gets the bootstrap and the saved
+    // cwd even when this hop began as a plain `run` -- and, like a `handover
+    // switch <provider>` typed with no trailing args, none of the finished
+    // run's.
+    let (_, next_cwd) = resolve_saved_cwd(store)?;
+    eprintln!(
+        "Handing over to {} (armed at sequence {}).",
+        pending.to.executable(),
+        pending.sequence
+    );
+    let built = claim_pending(store, leases, runtime, post, &pending)?;
+    Ok(Some(LaunchRequest {
+        provider: pending.to,
+        provider_args: Vec::new(),
+        document: built.rendered.markdown.into_bytes(),
+        recent_events_jsonl: built.recent_events_jsonl,
+        bootstrap: Some(BOOTSTRAP),
+        cwd: next_cwd,
+    }))
+}
+
 pub fn run_command(
     provider: Provider,
     provider_args: Vec<OsString>,
@@ -610,8 +831,6 @@ pub fn run_command(
         )));
     }
     let store = SessionStore::create(&layout, runtime, snapshot.clone())?;
-    let run_id = runtime.run_id();
-    let provider_adapter = adapter(provider);
 
     let operation = SessionOperationLock::acquire(&store.session_dir())?;
     let leases = LeaseStore::new(&store.session_dir());
@@ -620,108 +839,23 @@ pub fn run_command(
             "session already has an active or stale provider lease".into(),
         ));
     }
-    provider_adapter.setup(&layout.integrations())?;
-    let provider_version = provider_adapter.probe()?;
-    let run_paths = prepare_run_directory(
+
+    launch_supervised_run(
         &store,
-        &run_id,
-        b"# Handover\n\nThis is the first provider run in this session. Continue from the current Git worktree and user prompt.\n",
-        b"",
-    )?;
-    let hook_bin = std::env::current_exe()
-        .map_err(|source| io("current executable", source))?
-        .canonicalize()
-        .map_err(|source| io("current executable", source))?;
-    let args_for_event = provider_args.iter().map(|arg| encode_arg(arg)).collect();
-    store.append(
+        &layout,
+        &leases,
         runtime,
-        Some(run_id.clone()),
-        Some(provider),
-        EventKind::RunStarted {
-            cwd: snapshot
-                .identity
-                .worktree
-                .join(&snapshot.identity.cwd_relative)
-                .to_str()
-                .expect("validated Git identity is UTF-8")
-                .to_owned(),
-            args: args_for_event,
-            supervisor_pid: std::process::id(),
+        environment,
+        LaunchRequest {
+            provider,
+            provider_args,
+            document: b"# Handover\n\nThis is the first provider run in this session. Continue from the current Git worktree and user prompt.\n".to_vec(),
+            recent_events_jsonl: Vec::new(),
+            bootstrap: None,
+            cwd: cwd.clone(),
         },
-    )?;
-    let lease = RunLease::new(
-        store.id().clone(),
-        run_id.clone(),
-        provider,
-        ProcessIdentity::capture(std::process::id())?,
-    )?;
-    leases.create(&lease)?;
-    let provider_home = resolve_provider_home(provider, environment);
-    let mut spec = provider_adapter.launch_spec(LaunchContext {
-        cwd: &cwd,
-        inbox: &run_paths.inbox,
-        integration_root: &layout.integrations(),
-        hook_bin: &hook_bin,
-        provider_args: &provider_args,
-        bootstrap: None,
-        run_dir: &run_paths.root,
-        provider_home: provider_home.as_deref(),
-    })?;
-    for (key, value) in [
-        ("HANDOVER_HOME", layout.root().as_os_str()),
-        ("HANDOVER_SESSION_ID", OsStr::new(&store.id().to_string())),
-        ("HANDOVER_RUN_ID", OsStr::new(&run_id.to_string())),
-        ("HANDOVER_PROVIDER", OsStr::new(provider.executable())),
-        ("HANDOVER_PROVIDER_VERSION", OsStr::new(&provider_version)),
-        ("HANDOVER_HOOK_BIN", hook_bin.as_os_str()),
-        ("HANDOVER_DOCUMENT_PATH", run_paths.handover.as_os_str()),
-        (
-            "HANDOVER_CHECKPOINT_INBOX",
-            run_paths.checkpoints.as_os_str(),
-        ),
-    ] {
-        spec.env.insert(OsString::from(key), value.to_owned());
-    }
-    drop(operation);
-
-    let supervised = Supervisor::launch(spec, &store, &run_id, Duration::from_secs(60));
-    let operation = SessionOperationLock::acquire(&store.session_dir())?;
-    let (facts, supervision_error) = match supervised {
-        Ok(outcome) => (outcome.facts.clone(), outcome.startup_failure.clone()),
-        Err(error) => (
-            ExitFacts {
-                exit_code: None,
-                signal: None,
-            },
-            Some(error.to_string()),
-        ),
-    };
-    promote_inbox(&store, runtime, &run_id, provider, &run_paths.checkpoints)?;
-    store.append(
-        runtime,
-        Some(run_id.clone()),
-        Some(provider),
-        EventKind::RunStopped {
-            exit_code: facts.exit_code,
-            signal: facts.signal,
-        },
-    )?;
-    let post = Git::new().snapshot(&cwd)?;
-    store.append(
-        runtime,
-        Some(run_id.clone()),
-        Some(provider),
-        EventKind::GitSnapshot { snapshot: post },
-    )?;
-    leases.clear(&run_id)?;
-    drop(operation);
-
-    if let Some(message) = supervision_error {
-        return Err(Error::Command(message));
-    }
-    Ok(facts
-        .exit_code
-        .unwrap_or_else(|| 128 + facts.signal.unwrap_or(1)))
+        operation,
+    )
 }
 
 pub fn switch_command(
@@ -762,113 +896,54 @@ pub fn switch_command(
         },
     )?;
 
-    let previous_provider = previous_provider(&store.events()?)?;
-    store.append(
-        runtime,
-        None,
-        None,
-        EventKind::SwitchRequested {
-            from: previous_provider,
-            to: provider,
-        },
-    )?;
-    let built = commit_transition_handover(&store, runtime, switch_snapshot, provider)?;
+    // Prove the handover renders before recording any intent. `arm`, `claim`,
+    // and the supervisor's claim path all gate on this before they mutate; the
+    // porcelain must not be the one command that leaves a capability the user
+    // never asked for behind when it fails.
+    preview_handover(&store, &invocation_snapshot, provider)?;
 
-    let run_id = runtime.run_id();
-    let run_paths = prepare_run_directory(
-        &store,
-        &run_id,
-        built.rendered.markdown.as_bytes(),
-        &built.recent_events_jsonl,
-    )?;
-    let provider_adapter = adapter(provider);
-    provider_adapter.setup(&layout.integrations())?;
-    let provider_version = provider_adapter.probe()?;
-    let hook_bin = std::env::current_exe()
-        .map_err(|source| io("current executable", source))?
-        .canonicalize()
-        .map_err(|source| io("current executable", source))?;
-    store.append(
-        runtime,
-        Some(run_id.clone()),
-        Some(provider),
-        EventKind::RunStarted {
-            cwd: saved_cwd
-                .to_str()
-                .ok_or_else(|| Error::InvalidState("saved cwd must be valid UTF-8".into()))?
-                .to_owned(),
-            args: provider_args.iter().map(|arg| encode_arg(arg)).collect(),
-            supervisor_pid: std::process::id(),
-        },
-    )?;
-    let lease = RunLease::new(
-        store.id().clone(),
-        run_id.clone(),
-        provider,
-        ProcessIdentity::capture(std::process::id())?,
-    )?;
-    leases.create(&lease)?;
-    let provider_home = resolve_provider_home(provider, environment);
-    let mut spec = provider_adapter.launch_spec(LaunchContext {
-        cwd: &saved_cwd,
-        inbox: &run_paths.inbox,
-        integration_root: &layout.integrations(),
-        hook_bin: &hook_bin,
-        provider_args: &provider_args,
-        bootstrap: Some(BOOTSTRAP),
-        run_dir: &run_paths.root,
-        provider_home: provider_home.as_deref(),
-    })?;
-    add_run_environment(
-        &mut spec.env,
-        &layout,
-        &store,
-        &run_id,
-        provider,
-        &provider_version,
-        &hook_bin,
-        &run_paths,
-    );
-    drop(operation);
-
-    let supervised = Supervisor::launch(spec, &store, &run_id, Duration::from_secs(60));
-    let operation = SessionOperationLock::acquire(&store.session_dir())?;
-    let (facts, supervision_error) = match supervised {
-        Ok(outcome) => (outcome.facts.clone(), outcome.startup_failure.clone()),
-        Err(error) => (
-            ExitFacts {
-                exit_code: None,
-                signal: None,
-            },
-            Some(error.to_string()),
-        ),
+    // Reuse a matching arm rather than recording a second intent for the same
+    // switch. An arm for a *different* provider is a conflict this refuses
+    // rather than displaces: a one-shot capability is not overwritten by the
+    // command that trips over it.
+    let pending = match crate::arm::pending(&store, runtime, &store.events()?)? {
+        Some(existing) if existing.to == provider => existing,
+        Some(existing) => {
+            return Err(Error::InvalidState(format!(
+                "a switch to {} is already armed at sequence {} (expires {}); \
+                 claim it with `handover claim`, or wait for it to expire",
+                existing.to.executable(),
+                existing.sequence,
+                existing.expires_at
+            )));
+        }
+        None => arm_for_switch(
+            &store,
+            runtime,
+            &leases,
+            provider,
+            Surface::Auto,
+            crate::arm::parse_ttl(crate::arm::DEFAULT_TTL)?,
+        )?,
     };
-    promote_inbox(&store, runtime, &run_id, provider, &run_paths.checkpoints)?;
-    store.append(
-        runtime,
-        Some(run_id.clone()),
-        Some(provider),
-        EventKind::RunStopped {
-            exit_code: facts.exit_code,
-            signal: facts.signal,
-        },
-    )?;
-    let post = Git::new().snapshot(&saved_cwd)?;
-    store.append(
-        runtime,
-        Some(run_id.clone()),
-        Some(provider),
-        EventKind::GitSnapshot { snapshot: post },
-    )?;
-    leases.clear(&run_id)?;
-    drop(operation);
+    let built = claim_pending(&store, &leases, runtime, &invocation_snapshot, &pending)?;
 
-    if let Some(message) = supervision_error {
-        return Err(Error::Command(message));
-    }
-    Ok(facts
-        .exit_code
-        .unwrap_or_else(|| 128 + facts.signal.unwrap_or(1)))
+    launch_supervised_run(
+        &store,
+        &layout,
+        &leases,
+        runtime,
+        environment,
+        LaunchRequest {
+            provider,
+            provider_args,
+            document: built.rendered.markdown.into_bytes(),
+            recent_events_jsonl: built.recent_events_jsonl,
+            bootstrap: Some(BOOTSTRAP),
+            cwd: saved_cwd,
+        },
+        operation,
+    )
 }
 
 fn resolve_saved_cwd(store: &SessionStore) -> Result<(PathBuf, PathBuf)> {
@@ -1125,6 +1200,50 @@ fn handover_command(provider: Provider, json: bool, environment: &Environment) -
     }
 }
 
+/// Append the intent and the capability, and return the arm just created.
+///
+/// `armed_run` is read from the lease that exists right now — that is the run
+/// whose dead lease a later claim may release. Callers must hold
+/// `SessionOperationLock`.
+fn arm_for_switch(
+    store: &SessionStore,
+    runtime: &dyn Runtime,
+    leases: &LeaseStore,
+    provider: Provider,
+    surface: Surface,
+    ttl: std::time::Duration,
+) -> Result<crate::arm::PendingArm> {
+    let events = store.events()?;
+    let armed_run = leases.read()?.map(|lease| lease.run_id);
+    let expires_at = crate::arm::expires_at(runtime, ttl)?;
+    store.append(
+        runtime,
+        armed_run.clone(),
+        None,
+        EventKind::SwitchRequested {
+            from: previous_provider(&events)?,
+            to: provider,
+        },
+    )?;
+    let event = store.append(
+        runtime,
+        armed_run.clone(),
+        None,
+        EventKind::SwitchArmed {
+            to: provider,
+            surface,
+            expires_at: expires_at.clone(),
+        },
+    )?;
+    Ok(crate::arm::PendingArm {
+        sequence: event.sequence,
+        to: provider,
+        surface,
+        expires_at,
+        armed_run,
+    })
+}
+
 fn arm_command(
     provider: Provider,
     surface: Surface,
@@ -1160,28 +1279,16 @@ fn arm_command(
         );
     }
 
-    let armed_run = LeaseStore::new(&store.session_dir())
-        .read()?
-        .map(|lease| lease.run_id);
-    let expires_at = crate::arm::expires_at(runtime, ttl)?;
-    let event = store.append(
-        runtime,
-        armed_run,
-        previous_provider(&events)?,
-        EventKind::SwitchArmed {
-            to: provider,
-            surface,
-            expires_at: expires_at.clone(),
-        },
-    )?;
+    let leases = LeaseStore::new(&store.session_dir());
+    let arm = arm_for_switch(&store, runtime, &leases, provider, surface, ttl)?;
 
     write_projection(
         &serde_json::json!({
             "schema_version": 1,
-            "armed_sequence": event.sequence,
+            "armed_sequence": arm.sequence,
             "to": provider,
             "surface": surface,
-            "expires_at": expires_at,
+            "expires_at": arm.expires_at,
             "checkpoint_fresh": checkpoint_fresh,
         }),
         json,
@@ -1264,6 +1371,35 @@ fn release_for_claim(
     Ok(())
 }
 
+/// Consume `pending`: release the arming run's dead lease if there is one,
+/// commit the transition checkpoint, and record the claim.
+///
+/// Every command that completes a switch goes through here, so no two of them
+/// can hand a provider a different document. Callers must hold
+/// `SessionOperationLock`, and must already have proven the handover renders.
+fn claim_pending(
+    store: &SessionStore,
+    leases: &LeaseStore,
+    runtime: &dyn Runtime,
+    invocation_snapshot: &GitSnapshot,
+    pending: &crate::arm::PendingArm,
+) -> Result<BuiltHandover> {
+    release_for_claim(store, leases, runtime, invocation_snapshot, pending)?;
+    let (_, switch_snapshot) = resolve_switch_snapshot(store, invocation_snapshot)?;
+    let built = commit_transition_handover(store, runtime, switch_snapshot, pending.to)?;
+    store.append(
+        runtime,
+        None,
+        None,
+        EventKind::SwitchClaimed {
+            armed_sequence: pending.sequence,
+            to: pending.to,
+            transition_checkpoint_sequence: built.transition_sequence,
+        },
+    )?;
+    Ok(built)
+}
+
 fn claim_command(
     arm: Option<u64>,
     json: bool,
@@ -1291,24 +1427,7 @@ fn claim_command(
     preview_handover(&store, &snapshot, pending.to)?;
 
     let leases = LeaseStore::new(&store.session_dir());
-    release_for_claim(&store, &leases, runtime, &snapshot, &pending)?;
-
-    // A claim is a provider boundary, so it commits a real transition
-    // checkpoint exactly as `switch` does. Nothing else may build the
-    // document: a claim that rendered its own would hand the next provider a
-    // checkpoint sequence no journal entry answers to.
-    let (_, switch_snapshot) = resolve_switch_snapshot(&store, &snapshot)?;
-    let built = commit_transition_handover(&store, runtime, switch_snapshot, pending.to)?;
-    store.append(
-        runtime,
-        None,
-        Some(pending.to),
-        EventKind::SwitchClaimed {
-            armed_sequence: pending.sequence,
-            to: pending.to,
-            transition_checkpoint_sequence: built.transition_sequence,
-        },
-    )?;
+    let built = claim_pending(&store, &leases, runtime, &snapshot, &pending)?;
 
     if json {
         write_handover_projection(
@@ -1929,7 +2048,10 @@ fn classify_lease(leases: &LeaseStore) -> Result<(&'static str, Option<String>)>
     ))
 }
 
-pub(crate) fn build_status_value(environment: &Environment) -> Result<serde_json::Value> {
+pub(crate) fn build_status_value(
+    environment: &Environment,
+    runtime: &dyn Runtime,
+) -> Result<serde_json::Value> {
     let (_layout, snapshot, store) = current_session(environment)?;
     let events = store.events()?;
     let provider = previous_provider(&events)?;
@@ -1952,7 +2074,21 @@ pub(crate) fn build_status_value(environment: &Environment) -> Result<serde_json
             Ok(_) => (true, None),
             Err(error) => (false, Some(error.to_string())),
         };
-    let ready = lease_state == "free" && handover_renderable;
+    // A pending arm is a refusal this block would otherwise not see: `switch`
+    // rejects a target that is not the armed one, so reporting `ready: true`
+    // and suggesting the other provider would send the user at a command that
+    // cannot run. Read it without `crate::arm::pending`, which retires an
+    // expired arm by appending `switch.expired` -- status holds no
+    // `SessionOperationLock` and must never write.
+    let now = runtime.now()?;
+    let armed = match crate::arm::latest_unresolved(&events) {
+        Some(arm) if crate::arm::is_live_at(&arm, &now)? => Some(arm),
+        _ => None,
+    };
+    let ready = lease_state == "free" && handover_renderable && armed.is_none();
+    // With an arm pending, the only switch that will be accepted is the one it
+    // already names.
+    let suggested_target = armed.as_ref().map(|arm| arm.to).unwrap_or(target_provider);
     Ok(serde_json::json!({
         "schema_version": 1,
         "session_id": store.id(),
@@ -1982,7 +2118,12 @@ pub(crate) fn build_status_value(environment: &Environment) -> Result<serde_json
             "checkpoint_fresh": checkpoint_fresh,
             "handover_renderable": handover_renderable,
             "handover_error": handover_error,
-            "suggested_switch_command": format!("handover switch {}", target_provider.executable()),
+            "armed": armed.as_ref().map(|arm| serde_json::json!({
+                "to": arm.to,
+                "sequence": arm.sequence,
+                "expires_at": arm.expires_at,
+            })),
+            "suggested_switch_command": format!("handover switch {}", suggested_target.executable()),
         },
     }))
 }
@@ -1993,8 +2134,8 @@ pub(crate) fn mcp_list_value(environment: &Environment) -> Result<serde_json::Va
     crate::list::build_list_value(&layout)
 }
 
-fn status_command(json: bool, environment: &Environment) -> Result<i32> {
-    let value = build_status_value(environment)?;
+fn status_command(json: bool, environment: &Environment, runtime: &dyn Runtime) -> Result<i32> {
+    let value = build_status_value(environment, runtime)?;
     write_projection(&value, json)?;
     Ok(0)
 }

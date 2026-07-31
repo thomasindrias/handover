@@ -91,6 +91,15 @@ pub(crate) fn latest_unresolved(events: &[Event]) -> Option<PendingArm> {
     candidate
 }
 
+/// Whether `arm` is still live at `now`.
+///
+/// Pure, and deliberately separate from `pending`: a caller that holds no
+/// `SessionOperationLock` (`handover status`, the MCP `status` tool) must be
+/// able to ask this question without journaling the answer.
+pub(crate) fn is_live_at(arm: &PendingArm, now: &str) -> Result<bool> {
+    Ok(parse_clock(now)? < parse_clock(&arm.expires_at)?)
+}
+
 /// The pending arm for this session, or `None`.
 ///
 /// Expiry is evaluated lazily: nothing runs in the background to notice a
@@ -105,7 +114,7 @@ pub fn pending(
     let Some(arm) = latest_unresolved(events) else {
         return Ok(None);
     };
-    if parse_clock(&runtime.now()?)? < parse_clock(&arm.expires_at)? {
+    if is_live_at(&arm, &runtime.now()?)? {
         return Ok(Some(arm));
     }
     store.append(

@@ -117,6 +117,82 @@ fn switch_refuses_a_live_or_foreign_host_lease_with_actionable_detail() {
     leases.clear(&foreign.run_id).unwrap();
 }
 
+/// The same consent gate, reached by the arm-*reuse* path.
+///
+/// `switch` with a pending arm for the target does not arm again — it goes
+/// straight to claiming the one that exists. Today the prompt still fires
+/// because recovery runs before the pending-arm lookup, but nothing in the
+/// other tests would notice if that order were lost: a refactor that
+/// short-circuited "arm matches, so claim it" would delete the prompt and
+/// leave every existing assertion green. This pins it. The arm is recorded
+/// while the lease is clear, so it authorises releasing nothing, and the
+/// stale lease planted afterwards must still be refused without consent.
+#[test]
+fn switch_refuses_a_stale_lease_without_consent_when_the_arm_already_exists() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    write_executable(&bin.join("claude"), FAKE_CLAUDE);
+    write_executable(&bin.join("codex"), FAKE_CODEX);
+    let state = temp.path().join("state");
+    let path = path_with(&bin);
+    run_claude(&repo, &state, &path);
+
+    cargo_bin_cmd!("handover")
+        .current_dir(&repo)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["arm", "codex"])
+        .assert()
+        .success();
+
+    let (session, session_id) = session_dir_and_id(&state);
+    let leases = LeaseStore::new(&session);
+    let stale = RunLease::new(
+        session_id,
+        RunId::new(),
+        Provider::Claude,
+        ProcessIdentity {
+            pid: u32::MAX,
+            start_token: "gone".into(),
+        },
+    )
+    .unwrap();
+    leases.create(&stale).unwrap();
+
+    cargo_bin_cmd!("handover")
+        .current_dir(&repo)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["switch", "codex"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "handover switch codex --recover-lease",
+        ));
+
+    assert_eq!(
+        leases.read().unwrap().unwrap().run_id,
+        stale.run_id,
+        "a refused switch must leave the lease exactly as it found it"
+    );
+    let journal = journal(&session);
+    assert!(
+        !journal
+            .iter()
+            .any(|envelope| matches!(envelope.event.kind, EventKind::RunRecovered { .. })),
+        "no lease may be released without consent"
+    );
+    assert!(
+        !journal
+            .iter()
+            .any(|envelope| matches!(envelope.event.kind, EventKind::SwitchClaimed { .. })),
+        "the arm must survive a switch that refused"
+    );
+}
+
 #[test]
 fn switch_recovers_a_stale_lease_only_with_explicit_consent() {
     let temp = TempDir::new().unwrap();

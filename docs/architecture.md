@@ -143,8 +143,34 @@ refuses with the holding provider, pid, and start time; a same-host dead
 lease is recovered only after an explicit `[y/N]` prompt (or
 `--recover-lease` non-interactively), never silently. `handover status` reports
 a `switch_readiness` block — lease state, narrative checkpoint freshness,
-handover renderability, and the suggested switch command — so this can be
-checked before quitting the current provider.
+handover renderability, any pending arm, and the suggested switch command — so
+this can be checked before quitting the current provider. A pending arm makes
+it not ready: the only switch that would be accepted is the one that arm
+already names, and the suggested command says so.
+
+A switch is two-phase. `handover arm <provider>` records intent as
+`switch.requested` plus `switch.armed` — a one-shot capability identified by
+the sequence of its `switch.armed` event, carrying an expiry. `handover claim`
+consumes it exactly once, commits the transition checkpoint, and records
+`switch.claimed`. `handover switch` composes both in one command and refuses
+when an arm for a different provider is already pending.
+
+Expiry is evaluated lazily. Handover has no daemon, so an arm found past its
+deadline is retired at read time and `switch.expired` is appended before the
+read returns. An arm that is never read again simply stays unobserved.
+
+An arm authorises one narrow thing: releasing a dead lease belonging to the run
+that armed it, without the interactive prompt `switch --recover-lease`
+otherwise requires. It cannot touch a live lease, nor another run's lease. That
+release is journaled as `run.recovered`, so no lease leaves a session's history
+unexplained. Arm-and-complete-on-exit follows from these rules rather than
+needing enforcement: a claim attempted while the provider still runs refuses,
+because its lease is live.
+
+When the provider `handover run` or `handover switch` supervises exits and an
+arm is pending, that supervisor claims it and launches its target in the same
+terminal. `handover fork` supervises a child too, but deliberately does not:
+a fork is a separate line of work, not a continuation of this one.
 
 ## Fork transaction
 
@@ -217,8 +243,8 @@ does not prove process ancestry and is not a same-user authorization boundary.
 Human checkpoints use a separate path.
 
 The MCP server guard exception ("MCP server" below) is a concrete instance of
-this boundary: it lets an attached provider read, through a different path,
-what same-user access already permits.
+this boundary: it lets a launched, attached provider read, through a
+different path, what same-user access already permits.
 
 ## V1 non-goals
 
@@ -229,7 +255,7 @@ These boundaries keep the core continuation path small and auditable.
 
 ## MCP server
 
-`handover mcp-server` (`docs/mcp.md`) exposes `list`, `handover`, and `status` as
+`handover mcp-server` (`docs/mcp.md`) exposes `list`, `preview`, and `status` as
 MCP tools over stdio. `provider_command_allowed` (src/app.rs) has one
 explicit exception for `Command::McpServer` so the subcommand can start even
 when `HANDOVER_RUN_ID` is set — the situation it's built for, since an MCP client
@@ -239,7 +265,7 @@ value-producing code the CLI uses, entirely in-process — never a subprocess,
 never a second pass through the CLI dispatcher.
 
 This exception widens what an attached provider can read. Through the MCP
-tools it now receives the exact `list`, `handover`, and `status` output that
+tools it now receives the exact `list`, `preview`, and `status` output that
 `provider_command_allowed` refuses it via the CLI. `list` in particular is
 not scoped to the attached session: it reports the repository path, worktree
 path, and branch for every session on the machine. This is acceptable

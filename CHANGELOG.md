@@ -6,6 +6,18 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 
 ## [Unreleased]
 
+### Added
+
+- `handover arm`, `handover claim`, and `handover attach`: a switch is now a
+  one-shot, expiring capability that can be recorded while a provider is still
+  running and completed when it exits.
+- Quitting a supervised provider with a switch armed launches the armed target
+  in the same terminal.
+- `handover status --json`'s `switch_readiness` block now reports any pending
+  arm as an `armed` object (target, sequence, expiry), counts one against
+  `ready`, and points `suggested_switch_command` at the armed target — while an
+  arm is pending, that is the only switch that will be accepted.
+
 ## [0.1.1] - 2026-07-28
 
 ### Added

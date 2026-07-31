@@ -23,6 +23,21 @@ exit 0
     write_executable(&bin.join("claude"), body);
 }
 
+/// Fake codex that completes a session, so `switch`/`claim` have a second
+/// provider on PATH to launch into.
+fn fake_codex(bin: &std::path::Path) {
+    let body = r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-codex 1.0'; exit 0; fi
+cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
+hook() { printf '%s' "$1" | "$HANDOVER_HOOK_BIN" __hook codex >/dev/null; }
+hook '{"session_id":"codex-native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}'
+hook '{"session_id":"codex-native","cwd":"'"$cwd_json"'","hook_event_name":"Stop"}'
+exit 0
+"#;
+    write_executable(&bin.join("codex"), body);
+}
+
 /// A finished `handover run claude` session: temp dir, cwd, and state root.
 /// The `TempDir` must stay bound in the caller — dropping it deletes the repo.
 fn finished_session() -> (
@@ -39,6 +54,7 @@ fn finished_session() -> (
     let bin = temp.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     fake_claude(&bin);
+    fake_codex(&bin);
     let state = temp.path().join("state");
     let path = path_with(&bin);
 
@@ -830,4 +846,249 @@ fn arm_warns_on_stderr_but_succeeds_past_a_stale_narrative_checkpoint() {
 
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["checkpoint_fresh"], false);
+}
+
+#[test]
+fn arm_records_intent_and_switch_events_are_provider_neutral() {
+    let (_temp, cwd, state, path) = finished_session();
+
+    cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["arm", "codex"])
+        .assert()
+        .success();
+
+    let log = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["log", "--json"])
+        .output()
+        .unwrap();
+    let journal: Vec<serde_json::Value> = String::from_utf8_lossy(&log.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+
+    let requested = journal
+        .iter()
+        .map(|envelope| &envelope["event"])
+        .find(|event| event["type"] == "switch.requested")
+        .expect("arm must record the intent");
+    assert_eq!(requested["payload"]["to"], "codex");
+
+    let armed = journal
+        .iter()
+        .map(|envelope| &envelope["event"])
+        .find(|event| event["type"] == "switch.armed")
+        .expect("arm must record the capability");
+
+    // The intent precedes the capability.
+    assert!(requested["sequence"].as_u64().unwrap() < armed["sequence"].as_u64().unwrap());
+
+    // Switch events are session-level facts: `from`/`to` live in the payload,
+    // so the envelope attributes them to no provider.
+    for event in [requested, armed] {
+        assert_eq!(
+            event["provider"],
+            serde_json::Value::Null,
+            "switch events must be provider-neutral, got {event}"
+        );
+    }
+}
+
+#[test]
+fn switch_refuses_when_a_different_provider_is_already_armed() {
+    let (_temp, cwd, state, path) = finished_session();
+
+    cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["arm", "codex"])
+        .assert()
+        .success();
+
+    let output = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["switch", "claude"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "switch must refuse a conflicting arm"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("codex"),
+        "must name the armed provider: {stderr}"
+    );
+    assert!(
+        stderr.contains("claim"),
+        "must say what to do about it: {stderr}"
+    );
+}
+
+#[test]
+fn switch_journals_the_same_arm_and_claim_a_two_step_switch_does() {
+    let (_temp, cwd, state, path) = finished_session();
+
+    cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["switch", "codex"])
+        .assert()
+        .success();
+
+    let log = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["log", "--json"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&log.stdout);
+
+    // One command, but the journal records the same three facts a manual
+    // `arm` + `claim` would leave behind.
+    for kind in ["switch.requested", "switch.armed", "switch.claimed"] {
+        assert!(text.contains(kind), "switch must journal {kind}");
+    }
+}
+
+/// A `switch` that cannot render its handover must arm nothing.
+///
+/// `arm` and `claim` both prove the document renders before they touch the
+/// journal; the porcelain that composes them has to do the same, or a failed
+/// command leaves a capability the user never asked for — and, for the next
+/// fifteen minutes, refuses every switch to any other provider.
+///
+/// The gate is broken by corrupting the narrative checkpoint's rendered
+/// Markdown, which `load_verified_checkpoint` checks against its canonical
+/// JSON. The saved cwd still resolves, so this lands where the arm used to be
+/// already durable rather than before it.
+#[test]
+fn a_switch_that_cannot_render_its_handover_arms_nothing() {
+    let (_temp, cwd, state, path) = finished_session();
+    let (session, _) = session_dir_and_id(&state);
+
+    let handover = |args: &[&str]| {
+        cargo_bin_cmd!("handover")
+            .current_dir(&cwd)
+            .env("HANDOVER_HOME", &state)
+            .env("PATH", &path)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let journal = || String::from_utf8_lossy(&handover(&["log", "--json"]).stdout).into_owned();
+
+    let markdown = std::fs::read_dir(session.join("checkpoints"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "md"))
+        .expect("the finished run wrote a narrative checkpoint");
+    let canonical = std::fs::read(&markdown).unwrap();
+    std::fs::write(&markdown, b"not the canonical rendering\n").unwrap();
+
+    let refused = handover(&["switch", "codex"]);
+    assert!(
+        !refused.status.success(),
+        "switch must fail when its handover will not render"
+    );
+
+    let text = journal();
+    for kind in ["switch.requested", "switch.armed", "switch.claimed"] {
+        assert!(
+            !text.contains(kind),
+            "a switch that failed its render gate must journal no {kind}; \
+             journal was: {text}"
+        );
+    }
+
+    // "Nothing happened" is retryable: with the cause fixed, the same command
+    // works, and it is not fighting a capability the failure left behind.
+    std::fs::write(&markdown, &canonical).unwrap();
+    let retried = handover(&["switch", "codex"]);
+    assert!(
+        retried.status.success(),
+        "the switch must succeed once the cause is fixed; stderr was: {}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    assert!(journal().contains("switch.claimed"));
+}
+
+/// `switch` finding a pending arm that already targets the same provider
+/// must claim that one rather than arming a second time. The exit status
+/// alone cannot tell the two apart -- both a reuse and a regressed
+/// double-arm would leave `switch` exiting 0 -- so this pins the journal:
+/// the `switch.claimed` event must point at the sequence `handover arm`
+/// produced, and there must be exactly one `switch.armed` and one
+/// `switch.requested` event for the whole arm-then-switch sequence.
+#[test]
+fn switch_reuses_a_pending_arm_for_the_same_provider() {
+    let (_temp, cwd, state, path) = finished_session();
+
+    let run = |args: &[&str]| {
+        cargo_bin_cmd!("handover")
+            .current_dir(&cwd)
+            .env("HANDOVER_HOME", &state)
+            .env("PATH", &path)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let armed: serde_json::Value =
+        serde_json::from_slice(&run(&["arm", "codex", "--json"]).stdout).unwrap();
+    let armed_sequence = armed["armed_sequence"].as_u64().unwrap();
+
+    let switched = run(&["switch", "codex"]);
+    assert!(
+        switched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&switched.stderr)
+    );
+
+    let log = run(&["log", "--json"]);
+    let journal: Vec<serde_json::Value> = String::from_utf8_lossy(&log.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+
+    let claimed = journal
+        .iter()
+        .map(|envelope| &envelope["event"])
+        .find(|event| event["type"] == "switch.claimed")
+        .expect("switch must claim the pending arm");
+    assert_eq!(
+        claimed["payload"]["armed_sequence"], armed_sequence,
+        "switch must claim the arm `handover arm` made, not a second one"
+    );
+
+    let armed_events = journal
+        .iter()
+        .map(|envelope| &envelope["event"])
+        .filter(|event| event["type"] == "switch.armed")
+        .count();
+    assert_eq!(
+        armed_events, 1,
+        "switch must reuse the existing arm rather than recording a second one"
+    );
+
+    let requested_events = journal
+        .iter()
+        .map(|envelope| &envelope["event"])
+        .filter(|event| event["type"] == "switch.requested")
+        .count();
+    assert_eq!(
+        requested_events, 1,
+        "switch must reuse the existing intent rather than recording a second one"
+    );
 }

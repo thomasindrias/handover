@@ -2,9 +2,10 @@ use std::io::{BufRead, Write};
 
 use crate::error::{Error, Result, io};
 use crate::model::Provider;
+use crate::runtime::Runtime;
 use crate::store::Environment;
 
-pub fn mcp_server_command(environment: &Environment) -> Result<i32> {
+pub fn mcp_server_command(environment: &Environment, runtime: &dyn Runtime) -> Result<i32> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -26,7 +27,7 @@ pub fn mcp_server_command(environment: &Environment) -> Result<i32> {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(response) = handle_message(&line, environment) {
+        if let Some(response) = handle_message(&line, environment, runtime) {
             writeln!(stdout, "{response}").map_err(|source| io("stdout", source))?;
             stdout.flush().map_err(|source| io("stdout", source))?;
         }
@@ -34,7 +35,7 @@ pub fn mcp_server_command(environment: &Environment) -> Result<i32> {
     Ok(0)
 }
 
-fn handle_message(line: &str, environment: &Environment) -> Option<String> {
+fn handle_message(line: &str, environment: &Environment, runtime: &dyn Runtime) -> Option<String> {
     let request: serde_json::Value = match serde_json::from_str(line) {
         Ok(value) => value,
         Err(_) => {
@@ -55,7 +56,7 @@ fn handle_message(line: &str, environment: &Environment) -> Option<String> {
     let outcome: std::result::Result<serde_json::Value, String> = match method {
         "initialize" => Ok(initialize_result(&request)),
         "tools/list" => Ok(tools_list_result()),
-        "tools/call" => tools_call_result(&request, environment),
+        "tools/call" => tools_call_result(&request, environment, runtime),
         "ping" => Ok(serde_json::json!({})),
         _ => Err(format!("unknown method: {method}")),
     };
@@ -128,6 +129,7 @@ fn tools_list_result() -> serde_json::Value {
 fn tools_call_result(
     request: &serde_json::Value,
     environment: &Environment,
+    runtime: &dyn Runtime,
 ) -> std::result::Result<serde_json::Value, String> {
     let params = request.get("params").cloned().unwrap_or_default();
     let name = params
@@ -140,7 +142,7 @@ fn tools_call_result(
         .unwrap_or_else(|| serde_json::json!({}));
     let outcome = match name {
         "list" => crate::app::mcp_list_value(environment),
-        "status" => crate::app::build_status_value(environment),
+        "status" => crate::app::build_status_value(environment, runtime),
         "preview" => handover_tool_value(environment, &arguments),
         _ => return Err(format!("unknown tool: {name}")),
     };
