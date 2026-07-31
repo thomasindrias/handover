@@ -2911,6 +2911,7 @@ fn map_and_append_hook(
             false,
         ),
     };
+    let key = key.map(|key| hook_idempotency_key(run_id, provider, &key));
     let now = runtime.now()?;
     let pending = PendingEvent {
         occurred_at: now.clone(),
@@ -2928,6 +2929,21 @@ fn map_and_append_hook(
         )
     };
     Ok((outcome, snapshot, handover))
+}
+
+/// Scope a hook idempotency key to the run and provider that reported it.
+///
+/// Hook keys are built from provider-supplied ids — `native_session_id` and
+/// `tool_use_id` — which are only unique inside one provider attachment. A
+/// resumed conversation reports the same native session id again (`claude
+/// --resume`, `claude --session-id`), and nothing makes a tool use id unique
+/// across separate provider sessions. The journal spans every run and provider
+/// in the session, so an unscoped key would make the second run's SessionStart
+/// collide with the first run's and hard-fail the whole run. Deduplication
+/// still holds where it is needed — repeated hooks inside one run — because
+/// the run id and provider are fixed for the life of a run.
+fn hook_idempotency_key(run_id: &RunId, provider: Provider, key: &str) -> String {
+    format!("{run_id}:{}:{key}", provider.executable())
 }
 
 fn ensure_outcome_request(
@@ -2957,7 +2973,11 @@ fn ensure_outcome_request(
             recorded_at: now,
             run_id: Some(run_id.clone()),
             provider: Some(provider),
-            idempotency_key: Some(format!("pre:{tool_use_id}")),
+            idempotency_key: Some(hook_idempotency_key(
+                run_id,
+                provider,
+                &format!("pre:{tool_use_id}"),
+            )),
             kind: EventKind::ProviderToolRequested {
                 tool_name: tool_name.clone(),
                 tool_use_id: tool_use_id.clone(),
