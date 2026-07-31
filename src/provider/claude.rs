@@ -11,6 +11,7 @@ use crate::provider::{
 const PLUGIN_JSON: &[u8] = include_bytes!("assets/claude-plugin.json");
 const HOOKS_JSON: &[u8] = include_bytes!("assets/claude-hooks.json");
 const CHECKPOINT_COMMAND: &[u8] = include_bytes!("assets/claude-command-checkpoint.md");
+const SWITCH_COMMAND: &[u8] = include_bytes!("assets/claude-command-switch.md");
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ClaudeAdapter;
@@ -47,7 +48,8 @@ impl ProviderAdapter for ClaudeAdapter {
         materialize_immutable(
             &version.join("commands/handover-checkpoint.md"),
             CHECKPOINT_COMMAND,
-        )
+        )?;
+        materialize_immutable(&version.join("commands/handover-switch.md"), SWITCH_COMMAND)
     }
 
     fn verify(&self, integration_root: &Path) -> Result<()> {
@@ -57,7 +59,8 @@ impl ProviderAdapter for ClaudeAdapter {
         verify_materialized(
             &version.join("commands/handover-checkpoint.md"),
             CHECKPOINT_COMMAND,
-        )
+        )?;
+        verify_materialized(&version.join("commands/handover-switch.md"), SWITCH_COMMAND)
     }
 
     fn probe(&self) -> Result<String> {
@@ -196,6 +199,42 @@ mod tests {
 
         assert!(ClaudeAdapter.verify(temp.path()).is_err());
         // Re-running setup has to restore it, since that is the advice doctor gives.
+        ClaudeAdapter.setup(temp.path()).unwrap();
+        ClaudeAdapter.verify(temp.path()).unwrap();
+    }
+
+    #[test]
+    fn setup_installs_a_switch_command_that_arms_through_the_cli() {
+        let temp = TempDir::new().unwrap();
+        ClaudeAdapter.setup(temp.path()).unwrap();
+
+        let command = temp.path().join("claude/1/commands/handover-switch.md");
+        let text = std::fs::read_to_string(&command).unwrap();
+        assert_eq!(
+            std::fs::metadata(&command).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // The CLI, not MCP: Handover does not register its MCP server, so a
+        // command that assumed one would fail on most installs.
+        assert!(
+            text.contains("arm") && text.contains("--from-provider"),
+            "the command must reach arm through the CLI"
+        );
+        assert!(
+            !text.contains("mcp"),
+            "the command must not assume an MCP server is configured"
+        );
+        // A checkpoint first, or the handover the target receives is thin.
+        assert!(
+            text.contains("checkpoint --format json --from-provider"),
+            "the command must write a narrative checkpoint before arming"
+        );
+        ClaudeAdapter.verify(temp.path()).unwrap();
+
+        // An install predating this asset is outdated, not corrupt: re-running
+        // setup restores it, which is the advice doctor gives.
+        std::fs::remove_file(&command).unwrap();
+        assert!(ClaudeAdapter.verify(temp.path()).is_err());
         ClaudeAdapter.setup(temp.path()).unwrap();
         ClaudeAdapter.verify(temp.path()).unwrap();
     }
