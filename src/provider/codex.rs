@@ -55,7 +55,7 @@ impl ProviderAdapter for CodexAdapter {
         let version = integration_root.join("codex/1");
         materialize_immutable(&version.join("hooks.json"), HOOKS_JSON)?;
         materialize_immutable(
-            &version.join("skills/handover-switch/SKILL.md"),
+            &version.join("skills").join(HANDOVER_SKILL).join("SKILL.md"),
             SWITCH_SKILL,
         )
     }
@@ -64,7 +64,7 @@ impl ProviderAdapter for CodexAdapter {
         let version = integration_root.join("codex/1");
         verify_materialized(&version.join("hooks.json"), HOOKS_JSON)?;
         verify_materialized(
-            &version.join("skills/handover-switch/SKILL.md"),
+            &version.join("skills").join(HANDOVER_SKILL).join("SKILL.md"),
             SWITCH_SKILL,
         )
     }

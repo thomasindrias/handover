@@ -1145,7 +1145,7 @@ mod tests {
 
         crate::provider::codex::materialize_codex_home(
             &store.session_dir().join("runs/run-1/codex_home"),
-            &layout.integrations().join("codex/1/hooks.json"),
+            &layout.integrations().join("codex/1"),
             Some(&provider_home),
         )
         .unwrap();

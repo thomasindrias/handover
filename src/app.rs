@@ -527,7 +527,7 @@ fn setup_command(
             let provider_home = resolve_provider_home(provider, environment);
             crate::provider::codex::materialize_codex_home(
                 &review_dir,
-                &layout.integrations().join("codex/1/hooks.json"),
+                &layout.integrations().join("codex/1"),
                 provider_home.as_deref(),
             )?;
             extra_env.push(("CODEX_HOME", review_dir.into_os_string()));

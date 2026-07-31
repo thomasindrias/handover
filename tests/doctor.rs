@@ -47,6 +47,22 @@ fn setup_is_inspectable_noninteractive_and_refuses_asset_drift() {
         .stdout(predicates::str::contains("CODEX_HOME="))
         .stdout(predicates::str::contains("dangerously-bypass-hook-trust").not());
 
+    // The printed CODEX_HOME is a real review home a user can open `/hooks`
+    // in, not a directory of dangling links. Read *through* the symlinks:
+    // this is what fails when `materialize_codex_home` is handed the wrong
+    // directory.
+    let review_dir = state.join("integrations/codex/1/review");
+    assert_eq!(
+        std::fs::read(review_dir.join("hooks.json")).unwrap(),
+        std::fs::read(state.join("integrations/codex/1/hooks.json")).unwrap(),
+        "the review CODEX_HOME's hooks.json must read back the same bytes as the linked asset"
+    );
+    assert_eq!(
+        std::fs::read(review_dir.join("skills/handover-switch/SKILL.md")).unwrap(),
+        std::fs::read(state.join("integrations/codex/1/skills/handover-switch/SKILL.md")).unwrap(),
+        "the review CODEX_HOME's skill must read back the same bytes as the linked asset"
+    );
+
     cargo_bin_cmd!("handover")
         .env_remove("HANDOVER_HOME")
         .env_remove("HANDOVER_SESSION_ID")
