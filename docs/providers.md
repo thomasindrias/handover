@@ -57,9 +57,12 @@ provider launches. It applies the same fail-closed snapshot verification as
 switch is spent.
 
 `handover arm <provider>` records a pending switch without launching anything,
-and `handover claim` completes it. Both apply the same fail-closed snapshot
-verification as `switch`. Arming while a provider is still running is the
-intended use: quit it, and the armed target starts in the same terminal.
+and `handover claim` completes it. Both apply the same fail-closed verification
+as `switch`, and in the same order: the saved cwd is resolved and checked
+against the invoking worktree and the handover is rendered *before* anything is
+recorded, so a command that fails leaves no intent, capability, or checkpoint
+behind. Arming while a provider is still running is the intended use: quit it,
+and the armed target starts in the same terminal.
 
 `handover attach <provider>` binds the current worktree to a session for a
 provider Handover did not launch. Such a session has no lifecycle hooks, so its
