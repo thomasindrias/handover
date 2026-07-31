@@ -1250,6 +1250,25 @@ fn authorize_run_scoped_write(store: &SessionStore, environment: &Environment) -
             store.id()
         )));
     }
+
+    // `active_run` proves a run by this name existed, not that it still does:
+    // run directories outlive their run. Requiring the lease closes that gap —
+    // a finished run's lease was cleared at teardown, so its leftover
+    // environment can no longer arm a switch the user did not ask for.
+    //
+    // Liveness is deliberately not required. A supervisor killed while its
+    // child still runs leaves a dead-but-owned lease, and that provider is
+    // exactly who should still be able to hand its session over.
+    let holds_lease = LeaseStore::new(&store.session_dir())
+        .read()?
+        .is_some_and(|lease| lease.run_id == run.run_id);
+    if !holds_lease {
+        return Err(Error::InvalidState(
+            "this provider's run no longer holds this session's lease; the run it belongs to \
+             has ended, so it can no longer arm or claim a switch for this session"
+                .into(),
+        ));
+    }
     Ok(())
 }
 

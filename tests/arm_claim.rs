@@ -656,12 +656,30 @@ fn attach_succeeds_when_the_session_has_only_a_stale_lease() {
 fn attached_provider_processes_cannot_arm_claim_or_attach_without_a_real_run() {
     let (_temp, cwd, state, path) = finished_session();
 
-    for args in [
-        vec!["arm", "codex"],
-        vec!["claim"],
-        vec!["attach", "codex"],
-        vec!["arm", "codex", "--from-provider"],
-        vec!["claim", "--from-provider"],
+    for (args, expected) in [
+        (
+            vec!["arm", "codex"],
+            "an attached provider may only invoke Handover hooks",
+        ),
+        (
+            vec!["claim"],
+            "an attached provider may only invoke Handover hooks",
+        ),
+        (
+            vec!["attach", "codex"],
+            "an attached provider may only invoke Handover hooks",
+        ),
+        // With the flag, the outer guard lets these through, so the refusal has
+        // to come from the run proof itself. Without this assertion, deleting
+        // that gate leaves the test green.
+        (
+            vec!["arm", "codex", "--from-provider"],
+            "HANDOVER_SESSION_ID is required",
+        ),
+        (
+            vec!["claim", "--from-provider"],
+            "HANDOVER_SESSION_ID is required",
+        ),
     ] {
         let output = cargo_bin_cmd!("handover")
             .current_dir(&cwd)
@@ -675,6 +693,8 @@ fn attached_provider_processes_cannot_arm_claim_or_attach_without_a_real_run() {
             !output.status.success(),
             "{args:?} must be refused inside a provider run with no active-run proof"
         );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{args:?} stderr was: {stderr}");
     }
 }
 
