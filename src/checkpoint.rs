@@ -264,11 +264,28 @@ pub fn read_narrative_json(mut input: impl Read) -> Result<NarrativeInput> {
     Ok(narrative)
 }
 
-pub fn submit_provider_narrative(
-    environment: &Environment,
-    narrative: &NarrativeInput,
-) -> Result<PathBuf> {
-    narrative.validate(u64::MAX)?;
+/// The run this process was launched for, proven from the private environment
+/// Handover gives a launched provider.
+#[derive(Clone, Debug)]
+pub struct ActiveRun {
+    pub root: PathBuf,
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub inbox: PathBuf,
+}
+
+/// Resolve and verify the active run from the environment.
+///
+/// This is the one check standing between a provider process and a write:
+/// `HANDOVER_CHECKPOINT_INBOX` must canonicalize to exactly the private inbox
+/// of `HANDOVER_SESSION_ID`/`HANDOVER_RUN_ID` under `HANDOVER_HOME`, and every
+/// directory on that path must be a real `0700` directory this user owns.
+///
+/// It is one definition on purpose. Checkpoint submission and the `--from-provider`
+/// arm/claim gate must not be able to disagree about which run a process belongs
+/// to. It does not prove process ancestry and is not a same-user authorization
+/// boundary; see `docs/architecture.md`.
+pub fn active_run(environment: &Environment) -> Result<ActiveRun> {
     let root = required_path(environment, "HANDOVER_HOME")?;
     let root = resolve_from_current_dir(root)?;
     validate_private_directory(&root)?;
@@ -298,6 +315,20 @@ pub fn submit_provider_narrative(
             "HANDOVER_CHECKPOINT_INBOX does not match the active run inbox".into(),
         ));
     }
+    Ok(ActiveRun {
+        root,
+        session_id,
+        run_id,
+        inbox: expected,
+    })
+}
+
+pub fn submit_provider_narrative(
+    environment: &Environment,
+    narrative: &NarrativeInput,
+) -> Result<PathBuf> {
+    narrative.validate(u64::MAX)?;
+    let expected = active_run(environment)?.inbox;
 
     let stem = uuid::Uuid::new_v4().to_string();
     let temporary = expected.join(format!("{stem}.json.tmp"));

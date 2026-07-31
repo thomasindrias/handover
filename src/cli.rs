@@ -37,11 +37,15 @@ pub enum Command {
         #[arg(long, default_value = crate::arm::DEFAULT_TTL)]
         ttl: String,
         #[arg(long)]
+        from_provider: bool,
+        #[arg(long)]
         json: bool,
     },
     Claim {
         #[arg(long)]
         arm: Option<u64>,
+        #[arg(long)]
+        from_provider: bool,
         #[arg(long)]
         json: bool,
     },

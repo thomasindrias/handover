@@ -71,7 +71,7 @@ fn mcp_server_starts_under_an_attached_provider_while_other_commands_stay_refuse
             .assert()
             .failure()
             .stderr(predicates::str::contains(
-                "an attached provider may only invoke Handover hooks or submit provider checkpoints",
+                "an attached provider may only invoke Handover hooks",
             ));
     }
 

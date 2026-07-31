@@ -9,8 +9,8 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::checkpoint::{
-    StoredCheckpoint, edit_narrative, load_verified_checkpoint, promote_inbox, read_narrative_json,
-    submit_provider_narrative,
+    StoredCheckpoint, active_run, edit_narrative, load_verified_checkpoint, promote_inbox,
+    read_narrative_json, submit_provider_narrative,
 };
 use crate::cli::{CheckpointFormat, Cli, Command};
 use crate::doctor;
@@ -52,9 +52,10 @@ const STALE_NARRATIVE_EVENT_THRESHOLD: u64 = 20;
 pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result<i32> {
     if environment.get("HANDOVER_RUN_ID").is_some() && !provider_command_allowed(&cli.command) {
         return Err(Error::InvalidState(
-            "an attached provider may only invoke Handover hooks or submit provider checkpoints; \
-             to record one, pipe the checkpoint JSON into \
-             `handover checkpoint --format json --from-provider`"
+            "an attached provider may only invoke Handover hooks, submit provider checkpoints, \
+             or arm and claim a switch — each through `--from-provider`; to record a checkpoint, \
+             pipe its JSON into `handover checkpoint --format json --from-provider`, and to hand \
+             this session over, run `handover arm <provider> --from-provider`"
                 .into(),
         ));
     }
@@ -84,9 +85,22 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
             provider,
             surface,
             ttl,
+            from_provider,
             json,
-        } => arm_command(provider, surface, &ttl, json, environment, runtime),
-        Command::Claim { arm, json } => claim_command(arm, json, environment, runtime),
+        } => arm_command(
+            provider,
+            surface,
+            &ttl,
+            from_provider,
+            json,
+            environment,
+            runtime,
+        ),
+        Command::Claim {
+            arm,
+            from_provider,
+            json,
+        } => claim_command(arm, from_provider, json, environment, runtime),
         Command::Attach { provider, json } => attach_command(provider, json, environment, runtime),
         Command::Preview { provider, json } => handover_command(provider, json, environment),
         Command::Fork {
@@ -157,11 +171,26 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
     }
 }
 
+/// Which commands a launched provider process may still invoke.
+///
+/// Hooks and `mcp-server` are the process-level exceptions. Everything else
+/// here is a *write* the provider is trusted to make about its own run, and
+/// each one re-proves that claim through `authorize_run_scoped_write`. The
+/// flag is what makes the intent explicit at the call site; it is not itself
+/// the authorization.
 fn provider_command_allowed(command: &Command) -> bool {
     matches!(
         command,
         Command::Hook { .. }
             | Command::Checkpoint {
+                from_provider: true,
+                ..
+            }
+            | Command::Arm {
+                from_provider: true,
+                ..
+            }
+            | Command::Claim {
                 from_provider: true,
                 ..
             }
@@ -1200,6 +1229,30 @@ fn handover_command(provider: Provider, json: bool, environment: &Environment) -
     }
 }
 
+/// Prove a `--from-provider` write belongs to the session it is aimed at.
+///
+/// `checkpoint::active_run` proves which run this process was launched for. It
+/// does not prove which session the command resolved from the cwd, and a
+/// provider process can `cd` anywhere — so the two are compared here. Without
+/// this, a provider attached to one session could walk into another worktree
+/// and arm the session it found.
+///
+/// Like the checkpoint path it reuses, this is a guardrail against accidental
+/// misuse, not an authorization boundary: a provider running as the same Unix
+/// user can already write `$HANDOVER_HOME` directly.
+fn authorize_run_scoped_write(store: &SessionStore, environment: &Environment) -> Result<()> {
+    let run = active_run(environment)?;
+    if run.session_id != *store.id() {
+        return Err(Error::InvalidState(format!(
+            "this provider is attached to session {}, but this directory belongs to session {}; \
+             run the command from your own session's worktree",
+            run.session_id,
+            store.id()
+        )));
+    }
+    Ok(())
+}
+
 /// Append the intent and the capability, and return the arm just created.
 ///
 /// `armed_run` is read from the lease that exists right now — that is the run
@@ -1248,12 +1301,16 @@ fn arm_command(
     provider: Provider,
     surface: Surface,
     ttl: &str,
+    from_provider: bool,
     json: bool,
     environment: &Environment,
     runtime: &dyn Runtime,
 ) -> Result<i32> {
     let ttl = crate::arm::parse_ttl(ttl)?;
     let (_layout, snapshot, store) = current_session(environment)?;
+    if from_provider {
+        authorize_run_scoped_write(&store, environment)?;
+    }
     let _operation = SessionOperationLock::acquire(&store.session_dir())?;
     let events = store.events()?;
     if let Some(existing) = crate::arm::pending(&store, runtime, &events)? {
@@ -1402,11 +1459,15 @@ fn claim_pending(
 
 fn claim_command(
     arm: Option<u64>,
+    from_provider: bool,
     json: bool,
     environment: &Environment,
     runtime: &dyn Runtime,
 ) -> Result<i32> {
     let (_layout, snapshot, store) = current_session(environment)?;
+    if from_provider {
+        authorize_run_scoped_write(&store, environment)?;
+    }
     let _operation = SessionOperationLock::acquire(&store.session_dir())?;
     let events = store.events()?;
     let pending = crate::arm::pending(&store, runtime, &events)?

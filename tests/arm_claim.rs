@@ -648,17 +648,21 @@ fn attach_succeeds_when_the_session_has_only_a_stale_lease() {
     );
 }
 
-/// `provider_command_allowed` in `src/app.rs` allows only `Hook`,
-/// `Checkpoint { from_provider: true }`, and `McpServer` once
-/// `HANDOVER_RUN_ID` marks the process as an attached provider. `Arm`,
-/// `Claim`, and `Attach` mutate state and are deliberately not in that list
-/// in this slice; MCP access is gated by run-scoping in a later slice. Pin
-/// the refusal so nobody widens the allow-list by accident.
+/// The flag is not the authorization — the run proof is. A provider process
+/// stays refused without the flag, and refused *with* it when the environment
+/// does not describe a real active run. `attach` has no such flag at all in
+/// this slice: it is worktree-scoped and only reachable over MCP.
 #[test]
-fn attached_provider_processes_cannot_arm_claim_or_attach() {
+fn attached_provider_processes_cannot_arm_claim_or_attach_without_a_real_run() {
     let (_temp, cwd, state, path) = finished_session();
 
-    for args in [vec!["arm", "codex"], vec!["claim"], vec!["attach", "codex"]] {
+    for args in [
+        vec!["arm", "codex"],
+        vec!["claim"],
+        vec!["attach", "codex"],
+        vec!["arm", "codex", "--from-provider"],
+        vec!["claim", "--from-provider"],
+    ] {
         let output = cargo_bin_cmd!("handover")
             .current_dir(&cwd)
             .env("HANDOVER_HOME", &state)
@@ -669,7 +673,7 @@ fn attached_provider_processes_cannot_arm_claim_or_attach() {
             .unwrap();
         assert!(
             !output.status.success(),
-            "{args:?} must be refused inside a provider run"
+            "{args:?} must be refused inside a provider run with no active-run proof"
         );
     }
 }
