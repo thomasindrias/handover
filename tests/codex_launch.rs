@@ -70,4 +70,13 @@ fn codex_launch_uses_a_private_codex_home_with_no_config_overlay_flags() {
     );
     let expected = std::fs::read(state.join("integrations/codex/1/hooks.json")).unwrap();
     assert_eq!(std::fs::read(&hooks_json_link).unwrap(), expected);
+
+    // The launched session can actually reach the skill: it is inside the
+    // CODEX_HOME the child was handed, and it carries the frontmatter Codex
+    // scans for.
+    let skill = codex_home.join("skills/handover-switch/SKILL.md");
+    let text = std::fs::read_to_string(&skill)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", skill.display()));
+    assert!(text.contains("name: handover-switch"));
+    assert!(text.contains("--from-provider"));
 }

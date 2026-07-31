@@ -9,6 +9,11 @@ use crate::provider::{
 };
 
 const HOOKS_JSON: &[u8] = include_bytes!("assets/codex-hooks.json");
+const SWITCH_SKILL: &[u8] = include_bytes!("assets/codex-skill-switch.md");
+
+/// The one skill Handover owns. A user skill of the same name is shadowed, not
+/// merged — see `link_user_skills`.
+const HANDOVER_SKILL: &str = "handover-switch";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CodexAdapter;
@@ -22,7 +27,7 @@ impl ProviderAdapter for CodexAdapter {
         let codex_home = context.run_dir.join("codex_home");
         materialize_codex_home(
             &codex_home,
-            &context.integration_root.join("codex/1/hooks.json"),
+            &context.integration_root.join("codex/1"),
             context.provider_home,
         )?;
 
@@ -47,11 +52,21 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn setup(&self, integration_root: &Path) -> Result<()> {
-        materialize_immutable(&integration_root.join("codex/1/hooks.json"), HOOKS_JSON)
+        let version = integration_root.join("codex/1");
+        materialize_immutable(&version.join("hooks.json"), HOOKS_JSON)?;
+        materialize_immutable(
+            &version.join("skills/handover-switch/SKILL.md"),
+            SWITCH_SKILL,
+        )
     }
 
     fn verify(&self, integration_root: &Path) -> Result<()> {
-        verify_materialized(&integration_root.join("codex/1/hooks.json"), HOOKS_JSON)
+        let version = integration_root.join("codex/1");
+        verify_materialized(&version.join("hooks.json"), HOOKS_JSON)?;
+        verify_materialized(
+            &version.join("skills/handover-switch/SKILL.md"),
+            SWITCH_SKILL,
+        )
     }
 
     fn probe(&self) -> Result<String> {
@@ -59,13 +74,31 @@ impl ProviderAdapter for CodexAdapter {
     }
 }
 
+/// Build the private per-run `CODEX_HOME`.
+///
+/// `integration_version` is `integrations/codex/1` — the directory holding
+/// every asset this function links, which is why it is passed whole rather
+/// than one path per asset.
 pub(crate) fn materialize_codex_home(
     codex_home: &Path,
-    hooks_json_asset: &Path,
+    integration_version: &Path,
     provider_home: Option<&Path>,
 ) -> Result<()> {
     crate::store::ensure_private_dir(codex_home)?;
-    refresh_symlink(hooks_json_asset, &codex_home.join("hooks.json"))?;
+    refresh_symlink(
+        &integration_version.join("hooks.json"),
+        &codex_home.join("hooks.json"),
+    )?;
+
+    // A real directory, not a link: Handover's own skill and the user's must
+    // sit side by side, and a symlinked directory cannot hold an added entry.
+    let skills = codex_home.join("skills");
+    crate::store::ensure_private_dir(&skills)?;
+    refresh_symlink(
+        &integration_version.join("skills").join(HANDOVER_SKILL),
+        &skills.join(HANDOVER_SKILL),
+    )?;
+
     if let Some(real_home) = provider_home {
         for name in ["config.toml", "auth.json"] {
             let source = real_home.join(name);
@@ -224,15 +257,19 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let integration_root = temp.path().join("integrations");
         CodexAdapter.setup(&integration_root).unwrap();
-        let hooks_asset = integration_root.join("codex/1/hooks.json");
+        let version = integration_root.join("codex/1");
         let codex_home = temp.path().join("codex_home");
 
-        materialize_codex_home(&codex_home, &hooks_asset, None).unwrap();
-        materialize_codex_home(&codex_home, &hooks_asset, None).unwrap();
+        materialize_codex_home(&codex_home, &version, None).unwrap();
+        materialize_codex_home(&codex_home, &version, None).unwrap();
 
         assert_eq!(
             std::fs::read(codex_home.join("hooks.json")).unwrap(),
-            std::fs::read(&hooks_asset).unwrap()
+            std::fs::read(version.join("hooks.json")).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(codex_home.join("skills/handover-switch/SKILL.md")).unwrap(),
+            std::fs::read(version.join("skills/handover-switch/SKILL.md")).unwrap()
         );
     }
 
@@ -285,5 +322,70 @@ mod tests {
 
         std::fs::write(&hooks, b"different").unwrap();
         assert!(CodexAdapter.setup(temp.path()).is_err());
+    }
+
+    #[test]
+    fn setup_installs_a_switch_skill_that_arms_through_the_cli() {
+        let temp = TempDir::new().unwrap();
+        CodexAdapter.setup(temp.path()).unwrap();
+
+        let skill = temp.path().join("codex/1/skills/handover-switch/SKILL.md");
+        let text = std::fs::read_to_string(&skill).unwrap();
+        assert_eq!(
+            std::fs::metadata(&skill).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Codex discovers a skill by its frontmatter, so both keys must be there.
+        assert!(text.starts_with("---\n"), "SKILL.md needs YAML frontmatter");
+        assert!(text.contains("\nname: handover-switch\n"));
+        assert!(text.contains("\ndescription: "));
+        assert!(
+            text.contains("arm") && text.contains("--from-provider"),
+            "the skill must reach arm through the CLI"
+        );
+        assert!(
+            text.contains("checkpoint --format json --from-provider"),
+            "the skill must write a narrative checkpoint before arming"
+        );
+        CodexAdapter.verify(temp.path()).unwrap();
+
+        std::fs::remove_file(&skill).unwrap();
+        assert!(CodexAdapter.verify(temp.path()).is_err());
+        CodexAdapter.setup(temp.path()).unwrap();
+        CodexAdapter.verify(temp.path()).unwrap();
+    }
+
+    #[test]
+    fn the_private_codex_home_exposes_handovers_skill_through_a_real_skills_directory() {
+        let temp = TempDir::new().unwrap();
+        let integration_root = temp.path().join("integrations");
+        CodexAdapter.setup(&integration_root).unwrap();
+        let codex_home = temp.path().join("codex_home");
+
+        materialize_codex_home(&codex_home, &integration_root.join("codex/1"), None).unwrap();
+
+        // The directory itself is real: Task 4 adds the user's own skills into
+        // it, and a symlinked directory cannot also hold an added entry.
+        let skills = codex_home.join("skills");
+        assert!(
+            !std::fs::symlink_metadata(&skills)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "skills/ must be a real directory"
+        );
+        let entry = skills.join("handover-switch");
+        assert!(
+            std::fs::symlink_metadata(&entry)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "Handover's own skill is linked, not copied"
+        );
+        assert_eq!(
+            std::fs::read(entry.join("SKILL.md")).unwrap(),
+            std::fs::read(integration_root.join("codex/1/skills/handover-switch/SKILL.md"))
+                .unwrap()
+        );
     }
 }
