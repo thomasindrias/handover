@@ -15,6 +15,12 @@ const SWITCH_SKILL: &[u8] = include_bytes!("assets/codex-skill-switch.md");
 /// merged — see `link_user_skills`.
 const HANDOVER_SKILL: &str = "handover-switch";
 
+/// How many of the user's own skills are linked into a private `CODEX_HOME`.
+///
+/// The walk runs on every launch, so it is bounded rather than unbounded: a
+/// pathological skills directory must make a launch slower, never stop it.
+const MAX_LINKED_USER_SKILLS: usize = 256;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CodexAdapter;
 
@@ -106,8 +112,85 @@ pub(crate) fn materialize_codex_home(
                 refresh_symlink(&source, &codex_home.join(name))?;
             }
         }
+        link_user_skills(&real_home.join("skills"), &skills);
     }
     Ok(())
+}
+
+/// Link each entry of the user's real `skills/` into the private one.
+///
+/// Returns nothing on purpose. The user's skills are a convenience; the private
+/// home's own assets are what the launched session depends on. Every failure
+/// mode here — no `skills/` at all, an unreadable one, an entry that cannot be
+/// linked, more entries than the cap — degrades to "fewer skills, one warning".
+/// A `Result` would invite a `?` at the call site and turn a cosmetic problem
+/// into a failed launch.
+///
+/// The walk is one level deep and links each entry whole, so a deep tree costs
+/// nothing. Entry types come from the directory entry and are never followed,
+/// so a dangling symlink is classified rather than erroring — it is simply
+/// re-linked, and Codex skips it exactly as it would have in the real home.
+///
+/// Handover's own `handover-switch` wins a name collision: it is the skill the
+/// launched session is instructed to use, and the handover text advertises it.
+/// Dot-entries are skipped entirely — `.system` is Codex's own, and it rewrites
+/// it into whatever `CODEX_HOME` it is handed.
+fn link_user_skills(source: &Path, target: &Path) {
+    let entries = match std::fs::read_dir(source) {
+        Ok(entries) => entries,
+        // No skills directory at all is the ordinary case, not a problem.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            eprintln!(
+                "warning: cannot read {} ({error}); your own Codex skills are not available in this session",
+                source.display()
+            );
+            return;
+        }
+    };
+
+    let mut attempted = 0usize;
+    let mut truncated = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        // Codex writes its own built-in skills into `skills/.system` every time
+        // it starts, marker file and all. Linking the user's would make Codex
+        // refresh them *through* the link, into the user's real `~/.codex` --
+        // the one thing the private home exists to prevent. No dot-entry is a
+        // user skill, so none of them are linked.
+        if name.as_encoded_bytes().first() == Some(&b'.') {
+            continue;
+        }
+        if name == std::ffi::OsStr::new(HANDOVER_SKILL) {
+            eprintln!(
+                "warning: your own {HANDOVER_SKILL} skill is shadowed by Handover's in this session"
+            );
+            continue;
+        }
+        // A skill is a directory. Anything else in there -- README.md,
+        // .DS_Store -- is not one and is skipped.
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() || kind.is_symlink() => {}
+            _ => continue,
+        }
+        if attempted == MAX_LINKED_USER_SKILLS {
+            truncated = true;
+            break;
+        }
+        attempted += 1;
+        if let Err(error) = refresh_symlink(&entry.path(), &target.join(&name)) {
+            eprintln!(
+                "warning: cannot link the Codex skill {} ({error})",
+                name.to_string_lossy()
+            );
+        }
+    }
+
+    if truncated {
+        eprintln!(
+            "warning: linking only the first {MAX_LINKED_USER_SKILLS} of your Codex skills into this session"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -387,5 +470,150 @@ mod tests {
             std::fs::read(integration_root.join("codex/1/skills/handover-switch/SKILL.md"))
                 .unwrap()
         );
+    }
+
+    /// Build an integration root and a real `skills/` directory holding
+    /// `names`, and return `(integration version dir, real codex home)`.
+    fn codex_home_fixture(
+        temp: &TempDir,
+        names: &[&str],
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let integration_root = temp.path().join("integrations");
+        CodexAdapter.setup(&integration_root).unwrap();
+        let provider_home = temp.path().join("real-codex-home");
+        let skills = provider_home.join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        for name in names {
+            std::fs::create_dir_all(skills.join(name)).unwrap();
+            std::fs::write(
+                skills.join(name).join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: user skill\n---\n"),
+            )
+            .unwrap();
+        }
+        (integration_root.join("codex/1"), provider_home)
+    }
+
+    #[test]
+    fn the_users_own_skills_are_linked_beside_handovers() {
+        let temp = TempDir::new().unwrap();
+        let (version, provider_home) = codex_home_fixture(&temp, &["bokio", "graphify"]);
+        let codex_home = temp.path().join("codex_home");
+
+        materialize_codex_home(&codex_home, &version, Some(&provider_home)).unwrap();
+
+        let skills = codex_home.join("skills");
+        for name in ["bokio", "graphify"] {
+            let text = std::fs::read_to_string(skills.join(name).join("SKILL.md"))
+                .unwrap_or_else(|error| panic!("{name} is not reachable: {error}"));
+            assert!(text.contains(&format!("name: {name}")));
+        }
+        // Handover's own is still there beside them.
+        assert!(skills.join("handover-switch/SKILL.md").exists());
+    }
+
+    #[test]
+    fn a_user_skill_named_handover_switch_does_not_shadow_handovers() {
+        let temp = TempDir::new().unwrap();
+        let (version, provider_home) = codex_home_fixture(&temp, &["handover-switch"]);
+        let codex_home = temp.path().join("codex_home");
+
+        materialize_codex_home(&codex_home, &version, Some(&provider_home)).unwrap();
+
+        // Handover's, not the user's: the launched session is told to use this
+        // exact skill, so it must be the one it finds.
+        let text =
+            std::fs::read_to_string(codex_home.join("skills/handover-switch/SKILL.md")).unwrap();
+        assert!(
+            text.contains("--from-provider"),
+            "Handover's skill must win the collision, got: {text}"
+        );
+        assert!(!text.contains("description: user skill"));
+    }
+
+    #[test]
+    fn a_hostile_skills_directory_degrades_instead_of_failing_the_launch() {
+        let temp = TempDir::new().unwrap();
+        let (version, provider_home) = codex_home_fixture(&temp, &["good"]);
+        let skills = provider_home.join("skills");
+        // A dangling symlink, and a plain file that is not a skill at all.
+        std::os::unix::fs::symlink(temp.path().join("nowhere"), skills.join("dangling")).unwrap();
+        std::fs::write(skills.join("README.md"), b"not a skill").unwrap();
+        let codex_home = temp.path().join("codex_home");
+
+        // The launch must survive all of it.
+        materialize_codex_home(&codex_home, &version, Some(&provider_home)).unwrap();
+
+        let private = codex_home.join("skills");
+        assert!(
+            private.join("good/SKILL.md").exists(),
+            "good skills still link"
+        );
+        assert!(private.join("handover-switch/SKILL.md").exists());
+        assert!(
+            !private.join("README.md").exists(),
+            "a plain file is not a skill and is skipped"
+        );
+    }
+
+    /// Verified against Codex 0.145: on every start it (re)writes its built-in
+    /// skills into `$CODEX_HOME/skills/.system`, marker file and all. If that
+    /// entry were a symlink to the user's real one, Codex would write through
+    /// it into `~/.codex` — the exact thing the private home exists to prevent.
+    #[test]
+    fn codexs_own_system_skills_directory_is_never_linked_into_the_private_home() {
+        let temp = TempDir::new().unwrap();
+        let (version, provider_home) = codex_home_fixture(&temp, &[".system", "mine"]);
+        let codex_home = temp.path().join("codex_home");
+
+        materialize_codex_home(&codex_home, &version, Some(&provider_home)).unwrap();
+
+        let private = codex_home.join("skills");
+        assert!(
+            std::fs::symlink_metadata(private.join(".system")).is_err(),
+            "linking .system would let Codex write into the user's real ~/.codex"
+        );
+        assert!(
+            private.join("mine/SKILL.md").exists(),
+            "ordinary skills still link"
+        );
+    }
+
+    #[test]
+    fn a_missing_skills_directory_is_the_ordinary_case_and_not_an_error() {
+        let temp = TempDir::new().unwrap();
+        let integration_root = temp.path().join("integrations");
+        CodexAdapter.setup(&integration_root).unwrap();
+        let provider_home = temp.path().join("real-codex-home");
+        std::fs::create_dir(&provider_home).unwrap();
+        let codex_home = temp.path().join("codex_home");
+
+        materialize_codex_home(
+            &codex_home,
+            &integration_root.join("codex/1"),
+            Some(&provider_home),
+        )
+        .unwrap();
+
+        assert!(codex_home.join("skills/handover-switch/SKILL.md").exists());
+    }
+
+    #[test]
+    fn more_skills_than_the_cap_are_truncated_rather_than_failing() {
+        let temp = TempDir::new().unwrap();
+        let names: Vec<String> = (0..super::MAX_LINKED_USER_SKILLS + 8)
+            .map(|index| format!("skill-{index:04}"))
+            .collect();
+        let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (version, provider_home) = codex_home_fixture(&temp, &borrowed);
+        let codex_home = temp.path().join("codex_home");
+
+        materialize_codex_home(&codex_home, &version, Some(&provider_home)).unwrap();
+
+        let linked = std::fs::read_dir(codex_home.join("skills"))
+            .unwrap()
+            .count();
+        // Handover's own, plus at most the cap of the user's.
+        assert_eq!(linked, super::MAX_LINKED_USER_SKILLS + 1);
     }
 }
