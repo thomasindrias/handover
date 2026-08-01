@@ -162,8 +162,10 @@ read returns. An arm that is never read again simply stays unobserved.
 An arm authorises one narrow thing: releasing a dead lease belonging to the run
 that armed it, without the interactive prompt `switch --recover-lease`
 otherwise requires. It cannot touch a live lease, nor another run's lease. That
-release is journaled as `run.recovered`, so no lease leaves a session's history
-unexplained. Arm-and-complete-on-exit follows from these rules rather than
+authority is recorded only when the caller *is* that run — an arm typed in a
+plain terminal adopts nothing, so `arm` plus `claim` can never become an
+unprompted recovery of a lease its caller never owned. That release is journaled
+as `run.recovered`, so no lease leaves a session's history unexplained. Arm-and-complete-on-exit follows from these rules rather than
 needing enforcement: a claim attempted while the provider still runs refuses,
 because its lease is live.
 

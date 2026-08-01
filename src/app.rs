@@ -9,8 +9,8 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::checkpoint::{
-    StoredCheckpoint, active_run, edit_narrative, load_verified_checkpoint, promote_inbox,
-    read_narrative_json, submit_provider_narrative,
+    ActiveRun, StoredCheckpoint, active_run, edit_narrative, load_verified_checkpoint,
+    promote_inbox, read_narrative_json, submit_provider_narrative,
 };
 use crate::cli::{CheckpointFormat, Cli, Command};
 use crate::doctor;
@@ -950,6 +950,9 @@ pub fn switch_command(
             &store,
             runtime,
             &leases,
+            // `switch` recovers a stale lease with consent *before* arming, so
+            // there is no lease left to adopt and nothing to narrow.
+            None,
             provider,
             Surface::Auto,
             crate::arm::parse_ttl(crate::arm::DEFAULT_TTL)?,
@@ -1229,18 +1232,28 @@ fn handover_command(provider: Provider, json: bool, environment: &Environment) -
     }
 }
 
-/// Prove a `--from-provider` write belongs to the session it is aimed at.
+/// Prove a `--from-provider` write belongs to the session it is aimed at, and
+/// hand back the run it proved.
 ///
 /// `checkpoint::active_run` proves which run this process was launched for. It
 /// does not prove which session the command resolved from the cwd, and a
 /// provider process can `cd` anywhere — so the two are compared here. Without
 /// this, a provider attached to one session could walk into another worktree
-/// and arm the session it found.
+/// and arm the session it found. It then requires that run to still hold the
+/// session's lease, because a run directory outlives its run; liveness is
+/// deliberately not required.
+///
+/// The `ActiveRun` it returns is how a caller says *which* run it is, which is
+/// what lets `arm_for_switch` record `armed_run` only for the run that owns the
+/// lease.
 ///
 /// Like the checkpoint path it reuses, this is a guardrail against accidental
 /// misuse, not an authorization boundary: a provider running as the same Unix
 /// user can already write `$HANDOVER_HOME` directly.
-fn authorize_run_scoped_write(store: &SessionStore, environment: &Environment) -> Result<()> {
+fn authorize_run_scoped_write(
+    store: &SessionStore,
+    environment: &Environment,
+) -> Result<ActiveRun> {
     let run = active_run(environment)?;
     if run.session_id != *store.id() {
         return Err(Error::InvalidState(format!(
@@ -1269,24 +1282,33 @@ fn authorize_run_scoped_write(store: &SessionStore, environment: &Environment) -
                 .into(),
         ));
     }
-    Ok(())
+    Ok(run)
 }
 
 /// Append the intent and the capability, and return the arm just created.
 ///
-/// `armed_run` is read from the lease that exists right now — that is the run
-/// whose dead lease a later claim may release. Callers must hold
-/// `SessionOperationLock`.
+/// `armed_run` is recorded only when `caller_run` *is* the run holding the
+/// lease. That is the entire authority an arm carries: a later claim may
+/// release that run's dead lease without the `[y/N]` prompt
+/// `switch --recover-lease` otherwise requires. An arm recorded from outside a
+/// run adopts nothing, so it can never become an unprompted recovery of a lease
+/// its caller never owned.
+///
+/// Callers must hold `SessionOperationLock`.
 fn arm_for_switch(
     store: &SessionStore,
     runtime: &dyn Runtime,
     leases: &LeaseStore,
+    caller_run: Option<&RunId>,
     provider: Provider,
     surface: Surface,
     ttl: std::time::Duration,
 ) -> Result<crate::arm::PendingArm> {
     let events = store.events()?;
-    let armed_run = leases.read()?.map(|lease| lease.run_id);
+    let armed_run = match (caller_run, leases.read()?) {
+        (Some(caller), Some(lease)) if lease.run_id == *caller => Some(lease.run_id),
+        _ => None,
+    };
     let expires_at = crate::arm::expires_at(runtime, ttl)?;
     store.append(
         runtime,
@@ -1331,9 +1353,11 @@ fn arm_value(
 ) -> Result<serde_json::Value> {
     let ttl = crate::arm::parse_ttl(ttl)?;
     let (_layout, snapshot, store) = current_session(environment)?;
-    if from_provider {
-        authorize_run_scoped_write(&store, environment)?;
-    }
+    let caller_run = if from_provider {
+        Some(authorize_run_scoped_write(&store, environment)?.run_id)
+    } else {
+        None
+    };
     let _operation = SessionOperationLock::acquire(&store.session_dir())?;
     let events = store.events()?;
     if let Some(existing) = crate::arm::pending(&store, runtime, &events)? {
@@ -1360,7 +1384,15 @@ fn arm_value(
     }
 
     let leases = LeaseStore::new(&store.session_dir());
-    let arm = arm_for_switch(&store, runtime, &leases, provider, surface, ttl)?;
+    let arm = arm_for_switch(
+        &store,
+        runtime,
+        &leases,
+        caller_run.as_ref(),
+        provider,
+        surface,
+        ttl,
+    )?;
 
     Ok(serde_json::json!({
         "schema_version": 1,
@@ -1424,18 +1456,22 @@ fn release_for_claim(
             reason.unwrap_or_else(|| "inspect it with `handover status`".into())
         )));
     }
-    if pending.armed_run.as_ref() != Some(&lease.run_id) {
-        let (_state, reason) = classify_lease(leases)?;
-        return Err(Error::InvalidState(format!(
-            "cannot release this session's lease; it was not created by the run that armed the switch; {}",
-            reason.unwrap_or_else(|| "inspect it with `handover status`".into())
-        )));
-    }
+    // Liveness before ownership: "quit the running provider" is true and
+    // actionable whoever armed the switch, and nobody may release a live lease
+    // anyway. Who owns it only becomes the interesting question once it is
+    // dead and could actually be released.
     if let Some(holder) = live_holder(&lease)? {
         return Err(Error::InvalidState(format!(
             "{} is still running this session ({}); quit it to complete the armed switch",
             lease.provider.executable(),
             holder.describe()
+        )));
+    }
+    if pending.armed_run.as_ref() != Some(&lease.run_id) {
+        let (_state, reason) = classify_lease(leases)?;
+        return Err(Error::InvalidState(format!(
+            "cannot release this session's lease; it was not created by the run that armed the switch; {}",
+            reason.unwrap_or_else(|| "inspect it with `handover status`".into())
         )));
     }
     store.append(

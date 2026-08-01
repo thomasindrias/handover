@@ -90,6 +90,22 @@ fn session_dir_and_id(state: &std::path::Path) -> (std::path::PathBuf, SessionId
     (dir, id)
 }
 
+/// The lone run directory under a session, and its id.
+///
+/// `finished_session()` runs exactly one provider, and run directories outlive
+/// the run that made them — only `handover delete` removes them. That is what
+/// lets a test speak as a real, finished run.
+fn run_dir_and_id(session: &std::path::Path) -> (std::path::PathBuf, RunId) {
+    let dir = std::fs::read_dir(session.join("runs"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let id = RunId::parse(dir.file_name().unwrap().to_str().unwrap()).unwrap();
+    (dir, id)
+}
+
 #[test]
 fn arm_records_the_target_and_an_expiry_without_launching_anything() {
     let (_temp, cwd, state, path) = finished_session();
@@ -337,23 +353,37 @@ fn an_expired_arm_is_retired_lazily_and_cannot_be_claimed() {
     assert!(String::from_utf8_lossy(&log.stdout).contains("switch.expired"));
 }
 
-/// `arm` captures `armed_run` from whatever lease exists at arm time, so a
-/// lease exercising `release_for_claim`'s "belongs to the arming run" branch
-/// has to be planted *before* `arm` runs, with the run id `arm` will record.
+/// The one privilege an arm carries: releasing a *dead* lease belonging to the
+/// run that armed it, with no `[y/N]` prompt. Reaching it requires the caller
+/// to *be* that run, so this arms from inside the run, against a lease that run
+/// left behind — a supervisor killed before the teardown that clears it.
 #[test]
 fn claim_clears_a_dead_lease_left_by_the_arming_run_without_prompting() {
     let (_temp, cwd, state, path) = finished_session();
     let (session, session_id) = session_dir_and_id(&state);
+    let (run_dir, run_id) = run_dir_and_id(&session);
     let leases = LeaseStore::new(&session);
 
-    let dead = RunLease::new(session_id, RunId::new(), Provider::Claude, dead_identity()).unwrap();
+    let dead = RunLease::new(
+        session_id.clone(),
+        run_id.clone(),
+        Provider::Claude,
+        dead_identity(),
+    )
+    .unwrap();
     leases.create(&dead).unwrap();
 
     let armed = cargo_bin_cmd!("handover")
         .current_dir(&cwd)
         .env("HANDOVER_HOME", &state)
         .env("PATH", &path)
-        .args(["arm", "codex", "--json"])
+        .env("HANDOVER_SESSION_ID", session_id.to_string())
+        .env("HANDOVER_RUN_ID", run_id.to_string())
+        .env(
+            "HANDOVER_CHECKPOINT_INBOX",
+            run_dir.join("inbox/checkpoints"),
+        )
+        .args(["arm", "codex", "--from-provider", "--json"])
         .output()
         .unwrap();
     assert!(
@@ -402,15 +432,63 @@ fn claim_clears_a_dead_lease_left_by_the_arming_run_without_prompting() {
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .find(|envelope| envelope["event"]["type"] == "run.recovered")
         .expect("releasing the arming run's lease must be journaled");
-    assert_eq!(recovered["event"]["run_id"], dead.run_id.to_string());
+    assert_eq!(recovered["event"]["run_id"], run_id.to_string());
     assert_eq!(
         recovered["event"]["payload"]["reason"],
         format!("released by claim of the switch armed at sequence {armed_sequence}")
     );
 }
 
+/// The narrowing. An arm recorded from *outside* a run adopts nothing, so it
+/// carries no authority over the lease it happened to find. Before this,
+/// `arm` + `claim` from any terminal was an unprompted
+/// `switch --recover-lease` — the consent gate reachable by two commands that
+/// never advertised that power.
 #[test]
-fn claim_refuses_while_the_arming_runs_provider_is_still_live() {
+fn an_arm_from_outside_a_run_cannot_release_the_lease_it_found() {
+    let (_temp, cwd, state, path) = finished_session();
+    let (session, session_id) = session_dir_and_id(&state);
+    let leases = LeaseStore::new(&session);
+
+    let dead = RunLease::new(session_id, RunId::new(), Provider::Claude, dead_identity()).unwrap();
+    leases.create(&dead).unwrap();
+
+    cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["arm", "codex"])
+        .assert()
+        .success();
+
+    let output = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["claim"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "an arm recorded outside a run must not carry the release privilege"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("was not created by the run that armed the switch"),
+        "stderr was: {stderr}"
+    );
+
+    // Untouched: recovering it stays the consent-gated path.
+    assert_eq!(leases.read().unwrap().unwrap().run_id, dead.run_id);
+    leases.clear(&dead.run_id).unwrap();
+}
+
+/// A live lease always says "quit it", whoever armed the switch. Liveness is
+/// checked before ownership because that advice is true and actionable either
+/// way, and a live lease could not be released by anyone — so ownership only
+/// becomes the interesting question once the lease is dead.
+#[test]
+fn claim_refuses_while_a_provider_is_still_live() {
     let (_temp, cwd, state, path) = finished_session();
     let (session, session_id) = session_dir_and_id(&state);
     let leases = LeaseStore::new(&session);
@@ -445,6 +523,16 @@ fn claim_refuses_while_the_arming_runs_provider_is_still_live() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("is still running"), "stderr was: {stderr}");
     assert!(stderr.contains("claude"), "stderr was: {stderr}");
+    // Liveness must be the refusal that fires, not merely a diagnostic tacked
+    // onto the ownership one. `classify_lease` appends "is still running" to
+    // that refusal too, so asserting only the phrase above cannot tell the two
+    // orderings apart -- but a live lease must never be told the ownership
+    // story, which is true-but-useless advice about a lease nobody may release.
+    assert!(
+        !stderr.contains("was not created by the run that armed the switch"),
+        "a live lease must be told to quit the provider, not who armed the switch; \
+         stderr was: {stderr}"
+    );
 
     // Refused, not consumed: the live lease is untouched.
     assert_eq!(leases.read().unwrap().unwrap().run_id, live.run_id);

@@ -28,6 +28,13 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
   per-run `CODEX_HOME` links each entry of the real `skills/` directory
   individually, beside Handover's own.
 
+### Changed
+
+- An arm now carries authority over a lease only when the caller is the run
+  holding it. `handover arm` typed in a plain terminal no longer adopts a
+  crashed run's lease, so `arm` plus `claim` can no longer release one without
+  the consent prompt `handover switch --recover-lease` requires.
+
 ## [0.1.1] - 2026-07-28
 
 ### Added
