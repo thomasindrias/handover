@@ -1316,15 +1316,19 @@ fn arm_for_switch(
     })
 }
 
-fn arm_command(
+/// The arm projection, shared by `handover arm` and the MCP `arm` tool.
+///
+/// `from_provider` selects the authorization rule, never the behaviour. Both
+/// callers run this same function, which is the layering contract: the
+/// experience layer holds no logic.
+fn arm_value(
     provider: Provider,
     surface: Surface,
     ttl: &str,
     from_provider: bool,
-    json: bool,
     environment: &Environment,
     runtime: &dyn Runtime,
-) -> Result<i32> {
+) -> Result<serde_json::Value> {
     let ttl = crate::arm::parse_ttl(ttl)?;
     let (_layout, snapshot, store) = current_session(environment)?;
     if from_provider {
@@ -1358,18 +1362,38 @@ fn arm_command(
     let leases = LeaseStore::new(&store.session_dir());
     let arm = arm_for_switch(&store, runtime, &leases, provider, surface, ttl)?;
 
-    write_projection(
-        &serde_json::json!({
-            "schema_version": 1,
-            "armed_sequence": arm.sequence,
-            "to": provider,
-            "surface": surface,
-            "expires_at": arm.expires_at,
-            "checkpoint_fresh": checkpoint_fresh,
-        }),
-        json,
-    )?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "armed_sequence": arm.sequence,
+        "to": provider,
+        "surface": surface,
+        "expires_at": arm.expires_at,
+        "checkpoint_fresh": checkpoint_fresh,
+    }))
+}
+
+fn arm_command(
+    provider: Provider,
+    surface: Surface,
+    ttl: &str,
+    from_provider: bool,
+    json: bool,
+    environment: &Environment,
+    runtime: &dyn Runtime,
+) -> Result<i32> {
+    let value = arm_value(provider, surface, ttl, from_provider, environment, runtime)?;
+    write_projection(&value, json)?;
     Ok(0)
+}
+
+pub(crate) fn mcp_arm_value(
+    provider: Provider,
+    surface: Surface,
+    ttl: &str,
+    environment: &Environment,
+    runtime: &dyn Runtime,
+) -> Result<serde_json::Value> {
+    arm_value(provider, surface, ttl, true, environment, runtime)
 }
 
 /// Release the lease the arm authorises us to release, if any.
@@ -1476,13 +1500,17 @@ fn claim_pending(
     Ok(built)
 }
 
-fn claim_command(
+/// Consume this session's pending arm and return everything either output form
+/// needs.
+///
+/// Every command that completes a claim goes through here, so the CLI and the
+/// MCP tool cannot diverge on what a claim does — only on how they print it.
+fn claim_core(
     arm: Option<u64>,
     from_provider: bool,
-    json: bool,
     environment: &Environment,
     runtime: &dyn Runtime,
-) -> Result<i32> {
+) -> Result<(SessionStore, Provider, BuiltHandover)> {
     let (_layout, snapshot, store) = current_session(environment)?;
     if from_provider {
         authorize_run_scoped_write(&store, environment)?;
@@ -1509,11 +1537,22 @@ fn claim_command(
     let leases = LeaseStore::new(&store.session_dir());
     let built = claim_pending(&store, &leases, runtime, &snapshot, &pending)?;
 
+    Ok((store, pending.to, built))
+}
+
+fn claim_command(
+    arm: Option<u64>,
+    from_provider: bool,
+    json: bool,
+    environment: &Environment,
+    runtime: &dyn Runtime,
+) -> Result<i32> {
+    let (store, to_provider, built) = claim_core(arm, from_provider, environment, runtime)?;
     if json {
         write_handover_projection(
             &store,
             built.from_provider,
-            pending.to,
+            to_provider,
             built.transition_sequence,
             built.through_sequence,
             &built.events,
@@ -1529,12 +1568,36 @@ fn claim_command(
     }
 }
 
-fn attach_command(
-    provider: Provider,
-    json: bool,
+pub(crate) fn mcp_claim_value(
+    arm: Option<u64>,
     environment: &Environment,
     runtime: &dyn Runtime,
-) -> Result<i32> {
+) -> Result<serde_json::Value> {
+    let (store, to_provider, built) = claim_core(arm, true, environment, runtime)?;
+    Ok(build_handover_value(
+        &store,
+        built.from_provider,
+        to_provider,
+        built.transition_sequence,
+        built.through_sequence,
+        &built.events,
+        built.narrative_checkpoint,
+        built.capture_gaps,
+        &built.rendered,
+    ))
+}
+
+/// The attach projection, shared by `handover attach` and the MCP `attach`
+/// tool.
+///
+/// Deliberately **not** run-scoped. By definition no run exists yet — a desktop
+/// app has no run environment at all — so this is scoped to the worktree its
+/// cwd resolves to, exactly as `run` is.
+fn attach_value(
+    provider: Provider,
+    environment: &Environment,
+    runtime: &dyn Runtime,
+) -> Result<serde_json::Value> {
     let cwd = std::env::current_dir().map_err(|source| io(".", source))?;
     let layout = resolve_layout(environment, &cwd)?;
     let snapshot = Git::new().snapshot(&cwd)?;
@@ -1543,7 +1606,7 @@ fn attach_command(
             Some(store) => {
                 // Acquire the operation lock before checking the lease so no other
                 // command can create a live lease between the check and the append
-                // below (see `claim_command`, which follows the same ordering).
+                // below (see `claim_core`, which follows the same ordering).
                 let operation = SessionOperationLock::acquire(&store.session_dir())?;
                 let (state, reason) = classify_lease(&LeaseStore::new(&store.session_dir()))?;
                 if state == "blocked" {
@@ -1566,17 +1629,32 @@ fn attach_command(
 
     store.append(runtime, None, Some(provider), EventKind::SessionAttached {})?;
 
-    write_projection(
-        &serde_json::json!({
-            "schema_version": 1,
-            "session_id": store.id(),
-            "provider": provider,
-            "created": created,
-            "worktree": snapshot.identity.worktree,
-        }),
-        json,
-    )?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "session_id": store.id(),
+        "provider": provider,
+        "created": created,
+        "worktree": snapshot.identity.worktree,
+    }))
+}
+
+fn attach_command(
+    provider: Provider,
+    json: bool,
+    environment: &Environment,
+    runtime: &dyn Runtime,
+) -> Result<i32> {
+    let value = attach_value(provider, environment, runtime)?;
+    write_projection(&value, json)?;
     Ok(0)
+}
+
+pub(crate) fn mcp_attach_value(
+    provider: Provider,
+    environment: &Environment,
+    runtime: &dyn Runtime,
+) -> Result<serde_json::Value> {
+    attach_value(provider, environment, runtime)
 }
 
 #[allow(clippy::too_many_arguments)]

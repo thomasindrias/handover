@@ -149,7 +149,7 @@ fn notifications_initialized_receives_no_response() {
 }
 
 #[test]
-fn tools_list_reports_the_three_tools_with_their_schemas() {
+fn tools_list_reports_the_six_tools_with_their_schemas() {
     let temp = TempDir::new().unwrap();
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -167,7 +167,13 @@ fn tools_list_reports_the_three_tools_with_their_schemas() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["list", "preview", "status"]);
+    // The full advertised set is pinned separately by
+    // `the_tool_list_advertises_the_three_reads_and_the_three_writes`; this
+    // test's job is the schema shape, not the roster.
+    assert_eq!(
+        names,
+        vec!["list", "preview", "status", "arm", "claim", "attach"]
+    );
     assert_eq!(
         tools[1]["inputSchema"]["required"],
         serde_json::json!(["provider"])
@@ -440,4 +446,143 @@ fn an_unknown_tool_name_returns_a_json_rpc_error_not_a_tool_result() {
     let (success, responses) = send(&repo, &state, &format!("{request}\n"));
     assert!(success);
     assert_eq!(responses[0]["error"]["code"], -32601);
+}
+
+/// The write tools are run-scoped. Without a real active run in the
+/// environment they refuse — as a tool result, not a protocol error.
+#[test]
+fn the_write_tools_refuse_outside_the_active_run() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    let state = temp.path().join("state");
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    write_executable(
+        &bin.join("claude"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-claude 1.0'; exit 0; fi
+cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
+hook() { printf '%s' "$1" | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null; }
+hook '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}'
+printf '%s' '{"objective":"Be armed","summary":"Ready.","decisions":[],"assumptions":[],"constraints":[],"completed":[],"in_progress":[],"blockers":[],"next_steps":["Continue"],"related_event_sequences":[]}' | "$HANDOVER_HOOK_BIN" checkpoint --format json --from-provider
+hook '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"Stop"}'
+exit 0
+"#,
+    );
+    let path = path_with(&bin);
+    cargo_bin_cmd!("handover")
+        .current_dir(&repo)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["run", "claude"])
+        .assert()
+        .success();
+
+    // The server is started with no run environment at all — the state a
+    // human's `handover mcp-server` is in.
+    for (name, arguments) in [
+        ("arm", serde_json::json!({ "provider": "codex" })),
+        ("claim", serde_json::json!({})),
+    ] {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments },
+        });
+        let (success, responses) = send(&repo, &state, &format!("{request}\n"));
+        assert!(success, "the server itself must not die");
+        assert_eq!(responses.len(), 1);
+        assert!(
+            responses[0].get("error").is_none(),
+            "a domain refusal is a tool result, not a protocol error: {:?}",
+            responses[0]
+        );
+        assert_eq!(
+            responses[0]["result"]["isError"], true,
+            "{name} must refuse outside the active run: {:?}",
+            responses[0]
+        );
+    }
+
+    // Nothing was journaled by either refusal.
+    let log = cargo_bin_cmd!("handover")
+        .current_dir(&repo)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["log", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&log.stdout).contains("switch."),
+        "a refused write tool must leave no switch events behind"
+    );
+}
+
+/// `attach` is the deliberate exception: it is scoped to the worktree its cwd
+/// resolves to, because by definition no run exists yet.
+#[test]
+fn attach_is_worktree_scoped_rather_than_run_scoped() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    let state = temp.path().join("state");
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": "attach", "arguments": { "provider": "claude" } },
+    });
+    let (success, responses) = send(&repo, &state, &format!("{request}\n"));
+    assert!(success);
+    assert_eq!(
+        responses[0]["result"]["isError"], false,
+        "attach needs no run: {:?}",
+        responses[0]
+    );
+
+    let text = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(value["created"], true);
+    assert_eq!(value["provider"], "claude");
+
+    // Attaching again resolves to the same session rather than forking a
+    // second history beside it.
+    let (_, again) = send(&repo, &state, &format!("{request}\n"));
+    let text = again[0]["result"]["content"][0]["text"].as_str().unwrap();
+    let second: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(second["created"], false);
+    assert_eq!(second["session_id"], value["session_id"]);
+}
+
+/// A tool the server never advertised is a protocol error; a tool it did
+/// advertise is not. Pin the advertised set so the two stay distinguishable.
+#[test]
+fn the_tool_list_advertises_the_three_reads_and_the_three_writes() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let state = temp.path().join("state");
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+    });
+    let (_, responses) = send(&repo, &state, &format!("{request}\n"));
+    let names: Vec<&str> = responses[0]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["list", "preview", "status", "arm", "claim", "attach"]
+    );
 }

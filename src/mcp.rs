@@ -1,7 +1,7 @@
 use std::io::{BufRead, Write};
 
 use crate::error::{Error, Result, io};
-use crate::model::Provider;
+use crate::model::{Provider, Surface};
 use crate::runtime::Runtime;
 use crate::store::Environment;
 
@@ -122,6 +122,38 @@ fn tools_list_result() -> serde_json::Value {
                 "description": "Report this session's current state and switch readiness, including the exact command to run to switch.",
                 "inputSchema": { "type": "object", "properties": {} },
             },
+            {
+                "name": "arm",
+                "description": "Record a pending switch to another provider without launching anything. The switch completes when this session's provider exits, and the target comes up in the same terminal holding the handover. Scoped to the run this process is attached to.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "provider": { "type": "string", "enum": ["claude", "codex"] },
+                        "surface": { "type": "string", "enum": ["auto", "cli", "desktop"] },
+                        "ttl": { "type": "string", "description": "How long the arm stays claimable, e.g. `15m`. Defaults to 15m." },
+                    },
+                    "required": ["provider"],
+                },
+            },
+            {
+                "name": "claim",
+                "description": "Consume this session's pending arm, commit the transition checkpoint, and return the handover. Refuses while a provider still holds the run lease. Scoped to the run this process is attached to.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "arm": { "type": "integer", "description": "Assert which arm is being consumed, by the sequence of its switch.armed event." },
+                    },
+                },
+            },
+            {
+                "name": "attach",
+                "description": "Bind this worktree to a Handover session for a provider Handover did not launch. Resolves to the existing session when one exists rather than forking a second history beside it.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "provider": { "type": "string", "enum": ["claude", "codex"] } },
+                    "required": ["provider"],
+                },
+            },
         ],
     })
 }
@@ -144,22 +176,73 @@ fn tools_call_result(
         "list" => crate::app::mcp_list_value(environment),
         "status" => crate::app::build_status_value(environment, runtime),
         "preview" => handover_tool_value(environment, &arguments),
+        "arm" => arm_tool_value(environment, runtime, &arguments),
+        "claim" => claim_tool_value(environment, runtime, &arguments),
+        "attach" => attach_tool_value(environment, runtime, &arguments),
         _ => return Err(format!("unknown tool: {name}")),
     };
     Ok(tool_call_content(outcome))
+}
+
+fn required_provider(arguments: &serde_json::Value) -> Result<Provider> {
+    let provider_value = arguments
+        .get("provider")
+        .cloned()
+        .ok_or_else(|| Error::InvalidState("missing required argument: provider".into()))?;
+    serde_json::from_value(provider_value)
+        .map_err(|error| Error::InvalidState(format!("invalid provider argument: {error}")))
 }
 
 fn handover_tool_value(
     environment: &Environment,
     arguments: &serde_json::Value,
 ) -> Result<serde_json::Value> {
-    let provider_value = arguments
-        .get("provider")
-        .cloned()
-        .ok_or_else(|| Error::InvalidState("missing required argument: provider".into()))?;
-    let provider: Provider = serde_json::from_value(provider_value)
-        .map_err(|error| Error::InvalidState(format!("invalid provider argument: {error}")))?;
-    crate::app::mcp_handover_value(provider, environment)
+    crate::app::mcp_handover_value(required_provider(arguments)?, environment)
+}
+
+fn arm_tool_value(
+    environment: &Environment,
+    runtime: &dyn Runtime,
+    arguments: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let provider = required_provider(arguments)?;
+    let surface = match arguments.get("surface") {
+        None | Some(serde_json::Value::Null) => Surface::Auto,
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|error| Error::InvalidState(format!("invalid surface argument: {error}")))?,
+    };
+    let ttl = match arguments.get("ttl") {
+        None | Some(serde_json::Value::Null) => crate::arm::DEFAULT_TTL.to_owned(),
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| Error::InvalidState("ttl must be a string such as `15m`".into()))?
+            .to_owned(),
+    };
+    crate::app::mcp_arm_value(provider, surface, &ttl, environment, runtime)
+}
+
+fn claim_tool_value(
+    environment: &Environment,
+    runtime: &dyn Runtime,
+    arguments: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let arm = match arguments.get("arm") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(value.as_u64().ok_or_else(|| {
+            Error::InvalidState(
+                "arm must be the sequence number of the armed switch, as an integer".into(),
+            )
+        })?),
+    };
+    crate::app::mcp_claim_value(arm, environment, runtime)
+}
+
+fn attach_tool_value(
+    environment: &Environment,
+    runtime: &dyn Runtime,
+    arguments: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    crate::app::mcp_attach_value(required_provider(arguments)?, environment, runtime)
 }
 
 fn tool_call_content(outcome: Result<serde_json::Value>) -> serde_json::Value {
