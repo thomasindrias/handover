@@ -200,9 +200,10 @@ the skills the user installed. Handover's `handover-switch` wins a name
 collision, because it is the skill the session is instructed to use. Codex's own
 `.system` skills are excluded: Codex rewrites that directory into whatever
 `CODEX_HOME` it is handed, so linking the user's would route that write back into
-their real `~/.codex`. The walk is one level deep, bounded, and best-effort: a
-missing, unreadable, or oversized skills directory costs the session some of its
-own skills and a warning on stderr, never the launch.
+their real `~/.codex`. The walk is one level deep, bounded, and best-effort:
+having no `skills/` directory at all is the ordinary case and passes silently,
+while an unreadable or oversized one costs the session some of its own skills
+and prints a warning on stderr. None of them ever fails the launch.
 
 `handover doctor` checks that materialized assets still match the Handover
 version.
