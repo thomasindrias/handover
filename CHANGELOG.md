@@ -17,6 +17,16 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
   arm as an `armed` object (target, sequence, expiry), counts one against
   `ready`, and points `suggested_switch_command` at the armed target — while an
   arm is pending, that is the only switch that will be accepted.
+- A provider Handover launched can now arm its own switch: `/handover-switch` in
+  Claude, a `handover-switch` skill in Codex, and `handover arm <provider>
+  --from-provider` underneath both. Type it where you are working; the session
+  moves when you quit.
+- MCP `arm`, `claim`, and `attach` tools. `arm` and `claim` are scoped to the
+  active run; `attach` is scoped to the worktree, because a session Handover did
+  not launch has no run.
+- A Handover-launched Codex session now keeps the user's own skills. The private
+  per-run `CODEX_HOME` links each entry of the real `skills/` directory
+  individually, beside Handover's own.
 
 ## [0.1.1] - 2026-07-28
 

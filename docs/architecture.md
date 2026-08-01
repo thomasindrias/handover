@@ -243,8 +243,10 @@ does not prove process ancestry and is not a same-user authorization boundary.
 Human checkpoints use a separate path.
 
 The MCP server guard exception ("MCP server" below) is a concrete instance of
-this boundary: it lets a launched, attached provider read, through a
-different path, what same-user access already permits.
+this boundary: it lets a launched, attached provider read, and now also arm and
+claim a switch, through a different path, what same-user access already
+permits. Provider-side writes reuse the checkpoint path's run scoping and add
+one more check on top of it: the run must still hold the session's lease.
 
 ## V1 non-goals
 
@@ -255,21 +257,40 @@ These boundaries keep the core continuation path small and auditable.
 
 ## MCP server
 
-`handover mcp-server` (`docs/mcp.md`) exposes `list`, `preview`, and `status` as
-MCP tools over stdio. `provider_command_allowed` (src/app.rs) has one
-explicit exception for `Command::McpServer` so the subcommand can start even
-when `HANDOVER_RUN_ID` is set — the situation it's built for, since an MCP client
-spawns the server as a subprocess of the very provider Handover launched. No
-other command's behavior under that guard changes. Tool calls run the same
+`handover mcp-server` (`docs/mcp.md`) exposes `list`, `preview`, `status`,
+`arm`, `claim`, and `attach` as MCP tools over stdio. `provider_command_allowed`
+(src/app.rs) has explicit exceptions for `Command::McpServer` and for `arm` and
+`claim` under `--from-provider`, so those can run even when `HANDOVER_RUN_ID` is
+set — the situation they are built for, since an MCP client spawns the server as
+a subprocess of the very provider Handover launched, and a launched provider is
+exactly who should be able to say where the session goes next. No other
+command's behavior under that guard changes. Tool calls run the same
 value-producing code the CLI uses, entirely in-process — never a subprocess,
 never a second pass through the CLI dispatcher.
 
-This exception widens what an attached provider can read. Through the MCP
-tools it now receives the exact `list`, `preview`, and `status` output that
-`provider_command_allowed` refuses it via the CLI. `list` in particular is
-not scoped to the attached session: it reports the repository path, worktree
-path, and branch for every session on the machine. This is acceptable
-because all three tools are pure reads with no mutation path, the guard is a
-soft guardrail against accidental misuse rather than an authorization
-boundary, and a provider process running as the same Unix user can already
-read `$HANDOVER_HOME` directly (see "Security boundary" above).
+This exception widens what an attached provider can do. Through the MCP tools
+it receives the exact `list`, `preview`, and `status` output that
+`provider_command_allowed` refuses it via the CLI. `list` in particular is not
+scoped to the attached session: it reports the repository path, worktree path,
+and branch for every session on the machine.
+
+Three of the six tools also write. `arm` and `claim` are scoped to the active
+run: they pass the same session-id, run-id, and private-inbox-path check that
+provider checkpoint submission passes (`checkpoint::active_run`), then require
+that the session resolved from the cwd is the one that run is attached to, and
+finally that the run still holds that session's lease. The environment proves
+which run a process belongs to; the cwd decides which session a command acts
+on, and a provider process can change directory, so both are checked. The
+lease check closes what those two leave open: a run's directory and inbox
+outlive the run itself, so without it a finished run's leftover environment
+could still arm or claim a switch nobody asked for.
+
+`attach` is the single deliberate exception. By definition no run exists when a
+session is adopted — a provider Handover did not launch has no run environment
+at all — so `attach` is scoped to the worktree its cwd resolves to, which is the
+same scoping `run` uses.
+
+None of this is an authorization boundary. It is a guardrail against accidental
+misuse: the guard does not prove process ancestry, and a provider process
+running as the same Unix user can already write `$HANDOVER_HOME` directly (see
+"Security boundary" above).

@@ -1,11 +1,11 @@
 # MCP server
 
-`handover mcp-server` exposes three read-only tools over the Model Context
-Protocol's stdio transport, so a provider attached to a Handover session (Claude
-Code, Codex, or any MCP-capable client) can query Handover directly instead of a
-human running commands in a second terminal.
+`handover mcp-server` exposes six tools over the Model Context Protocol's stdio
+transport, so a provider attached to a Handover session (Claude Code, Codex, or
+any MCP-capable client) can query and drive Handover directly instead of a human
+running commands in a second terminal.
 
-## Tools
+## Read tools
 
 - **`list`** — no arguments. Returns exactly what `handover list --json` returns:
   every local session across every repository.
@@ -14,14 +14,35 @@ human running commands in a second terminal.
   narrative checkpoint and capture-gap metadata, without switching.
 - **`status`** — no arguments. Returns exactly what `handover status --json`
   returns, including a `switch_readiness` block with a
-  `suggested_switch_command` string — the exact command to run to actually
-  switch.
+  `suggested_switch_command` string.
 
-There is no `switch` tool. Switching takes over the calling terminal and
-blocks until the new provider exits, and the current session's own run lease
-is always live while that session is asking — a tool call from inside that
-session would always refuse. `status`'s `suggested_switch_command` gives the
-calling agent the exact next command to hand to the human instead.
+## Write tools
+
+- **`arm`** — `{"provider": "claude" | "codex", "surface"?: "auto" | "cli" |
+  "desktop", "ttl"?: "15m"}`. Records a pending switch without launching
+  anything, exactly as `handover arm` does. The switch completes when the
+  session's provider exits.
+- **`claim`** — `{"arm"?: <sequence>}`. Consumes the pending arm, commits the
+  transition checkpoint, and returns the handover. Refuses while a provider
+  still holds the run lease, so it succeeds only once the outgoing session has
+  actually ended.
+- **`attach`** — `{"provider": "claude" | "codex"}`. Binds the current worktree
+  to a session for a provider Handover did not launch, resolving to the existing
+  session when one exists.
+
+`arm` and `claim` are scoped to the active run: the calling process must supply
+the same session id, run id, and private inbox path that provider checkpoint
+submission requires, and the session resolved from the working directory must be
+the one that run is attached to. `attach` cannot be scoped that way — by
+definition no run exists yet — so it is scoped to the worktree its working
+directory resolves to. Neither is an authorization boundary; see
+`docs/architecture.md`.
+
+There is no `switch` tool. Switching takes over the calling terminal and blocks
+until the new provider exits, and the calling session's own run lease is always
+live while it is asking. `arm` is the in-session form of the same intent: it
+records where to go, and the supervisor completes the move when the provider
+exits.
 
 A domain-level failure (for example, no Handover session bound to the directory
 the server was started in) comes back as a normal tool result with

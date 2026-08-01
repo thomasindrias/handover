@@ -124,6 +124,29 @@ narrative and submits it. Submitting only stages the checkpoint in the run
 inbox; the next hook of that run promotes it into the journal, which is when
 `checkpoint.created` appears in `handover log`.
 
+An attached provider can also record where the session should go next:
+
+```bash
+"$HANDOVER_HOOK_BIN" arm <provider> --from-provider
+```
+
+This launches nothing and interrupts nothing. When the provider exits, the
+supervisor claims the arm and starts the target in the same terminal, already
+holding the handover. The Claude integration installs this as a
+`/handover-switch` command and the Codex integration as a `handover-switch`
+skill; both are recipes over the CLI, so neither requires Handover's MCP server
+to be configured.
+
+Arming is accepted only when three things hold: the caller's session ID, run ID,
+and private inbox path match an active run; the session resolved from the working
+directory is that run's session; and that run still holds the session's lease.
+The last is what stops a run whose environment outlived it from arming a switch
+nobody asked for — run directories persist for the life of a session, but a
+finished run's lease is cleared at teardown. Liveness is deliberately not
+required: a supervisor killed while its child still runs leaves a dead but
+still-owned lease, and that provider is exactly who should be able to hand its
+session over.
+
 Handover requires a nonempty objective and summary, at least one next step, bounded
 fields and item counts, and sorted unique event references that already exist.
 Unknown fields and oversized payloads are rejected.
@@ -163,14 +186,26 @@ Verified against a real Claude Code session: the hook contract holds
 headless invocations (`claude -p`, any `--output-format`) never surface it,
 by design.
 
-Claude assets are stored as a versioned plugin manifest and hook
-definitions, loaded per session via `--plugin-dir`. Codex assets are stored
-as a versioned `hooks.json`; each launch gives the child process a private,
-per-run `CODEX_HOME` containing that file plus best-effort symlinks to the
-user's real `config.toml`/`auth.json`, so login and preferences carry over
-without Handover ever writing to the user's actual `~/.codex` or the target
-repository. `handover doctor` checks that materialized assets still match the
-Handover version.
+Claude assets are stored as a versioned plugin manifest, hook definitions, and
+the `/handover-checkpoint` and `/handover-switch` commands, loaded per session
+via `--plugin-dir`. Codex assets are stored as a versioned `hooks.json` plus a
+`handover-switch` skill; each launch gives the child process a private, per-run
+`CODEX_HOME` containing those files plus best-effort symlinks to the user's real
+`config.toml`/`auth.json`, so login and preferences carry over without Handover
+ever writing to the user's actual `~/.codex` or the target repository.
+
+That private home also links each entry of the user's real `skills/` directory
+individually, beside Handover's own, so a Handover-launched Codex session keeps
+the skills the user installed. Handover's `handover-switch` wins a name
+collision, because it is the skill the session is instructed to use. Codex's own
+`.system` skills are excluded: Codex rewrites that directory into whatever
+`CODEX_HOME` it is handed, so linking the user's would route that write back into
+their real `~/.codex`. The walk is one level deep, bounded, and best-effort: a
+missing, unreadable, or oversized skills directory costs the session some of its
+own skills and a warning on stderr, never the launch.
+
+`handover doctor` checks that materialized assets still match the Handover
+version.
 
 ## Optional smoke tests
 
