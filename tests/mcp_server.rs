@@ -2,6 +2,8 @@ mod support;
 
 use assert_cmd::cargo::cargo_bin_cmd;
 use tempfile::TempDir;
+use time::format_description::well_known::Rfc3339;
+use time::{Duration, OffsetDateTime};
 
 use support::{init_repo, path_with, write_executable};
 
@@ -149,7 +151,7 @@ fn notifications_initialized_receives_no_response() {
 }
 
 #[test]
-fn tools_list_reports_the_six_tools_with_their_schemas() {
+fn tools_list_reports_each_tools_input_schema() {
     let temp = TempDir::new().unwrap();
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -163,21 +165,38 @@ fn tools_list_reports_the_six_tools_with_their_schemas() {
 
     assert!(success);
     let tools = responses[0]["result"]["tools"].as_array().unwrap();
-    let names: Vec<_> = tools
-        .iter()
-        .map(|tool| tool["name"].as_str().unwrap())
-        .collect();
-    // The full advertised set is pinned separately by
-    // `the_tool_list_advertises_the_three_reads_and_the_three_writes`; this
-    // test's job is the schema shape, not the roster.
-    assert_eq!(
-        names,
-        vec!["list", "preview", "status", "arm", "claim", "attach"]
-    );
-    assert_eq!(
-        tools[1]["inputSchema"]["required"],
-        serde_json::json!(["provider"])
-    );
+    // The advertised roster is pinned by
+    // `the_tool_list_advertises_the_three_reads_and_the_three_writes`. This
+    // test's job is the schema shape, so it looks each tool up by name and
+    // says nothing about which tools exist or in what order.
+    let schema = |name: &str| -> serde_json::Value {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is not advertised at all"))["inputSchema"]
+            .clone()
+    };
+
+    // Every provider-targeted tool must say so, or a client will call it with
+    // no provider and get a domain error it could have avoided.
+    for name in ["preview", "arm", "attach"] {
+        assert_eq!(schema(name)["type"], "object", "{name}");
+        assert_eq!(
+            schema(name)["required"],
+            serde_json::json!(["provider"]),
+            "{name} must declare provider as required"
+        );
+    }
+
+    // `claim` takes no required argument: its only input is the optional
+    // assertion of which arm is being consumed.
+    assert_eq!(schema("claim")["type"], "object");
+    assert!(schema("claim").get("required").is_none());
+    assert_eq!(schema("claim")["properties"]["arm"]["type"], "integer");
+
+    // `arm`'s two optional arguments are what the tool layer parses by hand.
+    assert_eq!(schema("arm")["properties"]["surface"]["type"], "string");
+    assert_eq!(schema("arm")["properties"]["ttl"]["type"], "string");
 }
 
 #[test]
@@ -480,6 +499,19 @@ exit 0
         .assert()
         .success();
 
+    // Arm through the ordinary CLI, which needs no run environment. Without
+    // this the `claim` half of the loop below proves nothing: `claim` would
+    // fail at "no switch is armed for this session" whether or not
+    // authorization ran at all, and a regression that dropped claim's
+    // run-scoping would ship green.
+    cargo_bin_cmd!("handover")
+        .current_dir(&repo)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["arm", "codex"])
+        .assert()
+        .success();
+
     // The server is started with no run environment at all — the state a
     // human's `handover mcp-server` is in.
     for (name, arguments) in [
@@ -505,9 +537,24 @@ exit 0
             "{name} must refuse outside the active run: {:?}",
             responses[0]
         );
+        // The refusal must come from the run proof and nowhere else.
+        // `authorize_run_scoped_write` runs before either tool touches the
+        // pending arm, so this is the first thing that fails — and it is what
+        // makes each half of this loop discriminating. Drop authorization and
+        // `arm` refuses with "already armed" while `claim` succeeds outright;
+        // neither says this.
+        let text = responses[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            text.contains("HANDOVER_SESSION_ID is required"),
+            "{name} must refuse at the run proof, not somewhere further in: {text}"
+        );
     }
 
-    // Nothing was journaled by either refusal.
+    // Neither refusal claimed the arm that is sitting there waiting.
+    // `switch.requested` and `switch.armed` are legitimately present from the
+    // CLI arm above; `switch.claimed` would mean a write tool ran unproven.
     let log = cargo_bin_cmd!("handover")
         .current_dir(&repo)
         .env("HANDOVER_HOME", &state)
@@ -516,8 +563,8 @@ exit 0
         .output()
         .unwrap();
     assert!(
-        !String::from_utf8_lossy(&log.stdout).contains("switch."),
-        "a refused write tool must leave no switch events behind"
+        !String::from_utf8_lossy(&log.stdout).contains("switch.claimed"),
+        "a refused write tool must leave no claim behind"
     );
 }
 
@@ -558,6 +605,140 @@ fn attach_is_worktree_scoped_rather_than_run_scoped() {
     let second: serde_json::Value = serde_json::from_str(text).unwrap();
     assert_eq!(second["created"], false);
     assert_eq!(second["session_id"], value["session_id"]);
+}
+
+/// The write tools on their success path, in the only fixture that can reach
+/// it: the MCP client is spawned *by* the provider Handover launched, so the
+/// server inherits a genuine active run — the run environment and a live lease
+/// — which is the one state `authorize_run_scoped_write` accepts.
+///
+/// Everything the tool layer parses by hand is exercised here: `arm`'s
+/// `surface` and `ttl`, and `claim`'s `arm`.
+#[test]
+fn the_write_tools_succeed_inside_the_run_that_spawned_the_server() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let trace = temp.path().join("mcp-trace.jsonl");
+
+    // The fake provider is its own MCP client: it pipes three tool calls into
+    // `handover mcp-server` and parks the responses in a trace file. Both the
+    // requests and `$HANDOVER_TEST_MCP_TRACE` reach the script through the
+    // launched provider's environment, exactly as a real client would be
+    // configured.
+    write_executable(
+        &bin.join("claude"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-claude 1.0'; exit 0; fi
+cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
+hook() { printf '%s' "$1" | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null; }
+hook '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}'
+printf '%s' '{"objective":"Ship it","summary":"On track.","decisions":[],"assumptions":[],"constraints":[],"completed":[],"in_progress":[],"blockers":[],"next_steps":["Finish"],"related_event_sequences":[]}' | "$HANDOVER_HOOK_BIN" checkpoint --format json --from-provider
+{
+  printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"arm","arguments":{"provider":"codex","surface":"cli","ttl":"30m"}}}'
+  printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"claim","arguments":{}}}'
+  printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"claim","arguments":{"arm":999999}}}'
+} | "$HANDOVER_HOOK_BIN" mcp-server > "$HANDOVER_TEST_MCP_TRACE"
+hook '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"Stop"}'
+exit 0
+"#,
+    );
+    // The arm made over MCP completes when claude exits, so the successor has
+    // to be probeable.
+    write_executable(
+        &bin.join("codex"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-codex 1.0'; exit 0; fi
+cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
+hook() { printf '%s' "$1" | "$HANDOVER_HOOK_BIN" __hook codex >/dev/null; }
+hook '{"session_id":"codex-native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}'
+hook '{"session_id":"codex-native","cwd":"'"$cwd_json"'","hook_event_name":"Stop"}'
+exit 0
+"#,
+    );
+    let state = temp.path().join("state");
+    let path = path_with(&bin);
+
+    cargo_bin_cmd!("handover")
+        .current_dir(&repo)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .env("HANDOVER_TEST_MCP_TRACE", &trace)
+        .args(["run", "claude"])
+        .assert()
+        .success();
+
+    let responses: Vec<serde_json::Value> = std::fs::read_to_string(&trace)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 3, "trace was: {responses:?}");
+
+    // 1. `arm` succeeds, and both optional arguments reach the projection.
+    let armed = &responses[0]["result"];
+    assert_eq!(
+        armed["isError"], false,
+        "arm must succeed inside its own run: {:?}",
+        responses[0]
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(armed["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(value["to"], "codex");
+    assert_eq!(
+        value["surface"], "cli",
+        "the tool's surface argument must reach the projection, not the Auto default"
+    );
+    let expires = OffsetDateTime::parse(value["expires_at"].as_str().unwrap(), &Rfc3339).unwrap();
+    let remaining = expires - OffsetDateTime::now_utc();
+    assert!(
+        remaining > Duration::minutes(20) && remaining <= Duration::minutes(30),
+        "the tool's 30m ttl must reach the projection, not the 15m default; {remaining} remained"
+    );
+    let armed_sequence = value["armed_sequence"].as_u64().unwrap();
+
+    // 2. `claim` refuses while the calling run's own lease is still live.
+    // That is correct — the provider asking to claim is the provider that has
+    // to quit first — so it is asserted rather than skipped.
+    let live = &responses[1]["result"];
+    assert_eq!(live["isError"], true, "{:?}", responses[1]);
+    let text = live["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("claude is still running this session"),
+        "claim must refuse on the live lease, not on authorization: {text}"
+    );
+
+    // 3. `claim`'s optional arm assertion is threaded through. A claim naming
+    // the wrong sequence is refused by sequence, which is only reachable if
+    // the argument was parsed — dropping it would produce the live-lease
+    // refusal above instead.
+    let mismatched = &responses[2]["result"];
+    assert_eq!(mismatched["isError"], true, "{:?}", responses[2]);
+    let text = mismatched["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains(&format!(
+            "the armed switch is at sequence {armed_sequence}, not 999999"
+        )),
+        "claim's arm argument must reach the core: {text}"
+    );
+
+    // The arm survived all three calls and was claimed when claude exited, so
+    // what the tool wrote was a real arm and not a projection over nothing.
+    let log = cargo_bin_cmd!("handover")
+        .current_dir(&repo)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["log", "--json"])
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&log.stdout);
+    assert!(log.contains("switch.armed"), "{log}");
+    assert!(log.contains("switch.claimed"), "{log}");
 }
 
 /// A tool the server never advertised is a protocol error; a tool it did

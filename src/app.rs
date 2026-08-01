@@ -1505,6 +1505,11 @@ fn claim_pending(
 ///
 /// Every command that completes a claim goes through here, so the CLI and the
 /// MCP tool cannot diverge on what a claim does — only on how they print it.
+///
+/// Callers must not write through the returned `SessionStore`: the
+/// `SessionOperationLock` that guarded the claim is released when this returns,
+/// so any further append would be unserialized. Formatting the result is all
+/// the store is for here.
 fn claim_core(
     arm: Option<u64>,
     from_provider: bool,
@@ -1540,6 +1545,32 @@ fn claim_core(
     Ok((store, pending.to, built))
 }
 
+/// The projection a completed claim produces, for both `handover claim --json`
+/// and the MCP `claim` tool.
+///
+/// One call site, so the two cannot drift into disagreeing about what a claim
+/// returned. `build_handover_value` takes nine positional arguments, two pairs
+/// of which are same-typed and therefore transposable in silence; keeping the
+/// mapping from `BuiltHandover` in one place is what makes that unreachable
+/// here.
+fn claim_projection(
+    store: &SessionStore,
+    to_provider: Provider,
+    built: BuiltHandover,
+) -> serde_json::Value {
+    build_handover_value(
+        store,
+        built.from_provider,
+        to_provider,
+        built.transition_sequence,
+        built.through_sequence,
+        &built.events,
+        built.narrative_checkpoint,
+        built.capture_gaps,
+        &built.rendered,
+    )
+}
+
 fn claim_command(
     arm: Option<u64>,
     from_provider: bool,
@@ -1549,17 +1580,8 @@ fn claim_command(
 ) -> Result<i32> {
     let (store, to_provider, built) = claim_core(arm, from_provider, environment, runtime)?;
     if json {
-        write_handover_projection(
-            &store,
-            built.from_provider,
-            to_provider,
-            built.transition_sequence,
-            built.through_sequence,
-            &built.events,
-            built.narrative_checkpoint,
-            built.capture_gaps,
-            &built.rendered,
-        )
+        write_projection(&claim_projection(&store, to_provider, built), true)?;
+        Ok(0)
     } else {
         std::io::stdout()
             .write_all(built.rendered.markdown.as_bytes())
@@ -1574,17 +1596,7 @@ pub(crate) fn mcp_claim_value(
     runtime: &dyn Runtime,
 ) -> Result<serde_json::Value> {
     let (store, to_provider, built) = claim_core(arm, true, environment, runtime)?;
-    Ok(build_handover_value(
-        &store,
-        built.from_provider,
-        to_provider,
-        built.transition_sequence,
-        built.through_sequence,
-        &built.events,
-        built.narrative_checkpoint,
-        built.capture_gaps,
-        &built.rendered,
-    ))
+    Ok(claim_projection(&store, to_provider, built))
 }
 
 /// The attach projection, shared by `handover attach` and the MCP `attach`
