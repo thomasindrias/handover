@@ -100,10 +100,6 @@ pub(crate) fn materialize_codex_home(
     // sit side by side, and a symlinked directory cannot hold an added entry.
     let skills = codex_home.join("skills");
     crate::store::ensure_private_dir(&skills)?;
-    refresh_symlink(
-        &integration_version.join("skills").join(HANDOVER_SKILL),
-        &skills.join(HANDOVER_SKILL),
-    )?;
 
     if let Some(real_home) = provider_home {
         for name in ["config.toml", "auth.json"] {
@@ -114,6 +110,16 @@ pub(crate) fn materialize_codex_home(
         }
         link_user_skills(&real_home.join("skills"), &skills);
     }
+
+    // Last, so Handover's own skill holds this path unconditionally. The name
+    // check in `link_user_skills` is the visible guard; this is the structural
+    // one — a filesystem that folds case or normalises Unicode differently than
+    // that check assumes still cannot leave a user entry here.
+    refresh_symlink(
+        &integration_version.join("skills").join(HANDOVER_SKILL),
+        &skills.join(HANDOVER_SKILL),
+    )?;
+
     Ok(())
 }
 
@@ -161,7 +167,14 @@ fn link_user_skills(source: &Path, target: &Path) {
         if name.as_encoded_bytes().first() == Some(&b'.') {
             continue;
         }
-        if name == std::ffi::OsStr::new(HANDOVER_SKILL) {
+        // Byte-exact is not enough: this project's own platform (APFS) folds
+        // case by default, so a user skill named `Handover-Switch` would pass
+        // an exact check and then clobber Handover's link through the very
+        // case-folding the check ignored.
+        if name
+            .as_encoded_bytes()
+            .eq_ignore_ascii_case(HANDOVER_SKILL.as_bytes())
+        {
             eprintln!(
                 "warning: your own {HANDOVER_SKILL} skill is shadowed by Handover's in this session"
             );
@@ -512,6 +525,48 @@ mod tests {
         assert!(skills.join("handover-switch/SKILL.md").exists());
     }
 
+    /// `~/.codex/skills/foo -> ~/.claude/skills/foo` is a common real setup, so
+    /// a symlinked user skill must be linked exactly like a plain directory
+    /// one. `entry.file_type()` never follows the link (it is `is_symlink() ==
+    /// true`, `is_dir() == false`), so the `|| kind.is_symlink()` arm is the
+    /// only reason either case below is linked at all.
+    #[test]
+    fn symlinked_user_skills_are_linked_including_dangling_ones() {
+        let temp = TempDir::new().unwrap();
+        let (version, provider_home) = codex_home_fixture(&temp, &[]);
+        let skills = provider_home.join("skills");
+
+        let elsewhere = temp.path().join("elsewhere-skill");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(
+            elsewhere.join("SKILL.md"),
+            "---\nname: elsewhere\ndescription: symlinked user skill\n---\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&elsewhere, skills.join("linked")).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("nowhere"), skills.join("dangling")).unwrap();
+
+        let codex_home = temp.path().join("codex_home");
+        materialize_codex_home(&codex_home, &version, Some(&provider_home)).unwrap();
+
+        let private = codex_home.join("skills");
+        // Readable *through* the private home, not just present as a link.
+        let text = std::fs::read_to_string(private.join("linked/SKILL.md"))
+            .unwrap_or_else(|error| panic!("symlinked skill is not reachable: {error}"));
+        assert!(text.contains("name: elsewhere"));
+
+        // Re-linked, not dropped: the doc comment promises a dangling symlink
+        // is classified rather than erroring, and simply re-linked. Use
+        // symlink_metadata so following the dangling target isn't required.
+        assert!(
+            std::fs::symlink_metadata(private.join("dangling"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a dangling user skill symlink must still be re-linked into the private home"
+        );
+    }
+
     #[test]
     fn a_user_skill_named_handover_switch_does_not_shadow_handovers() {
         let temp = TempDir::new().unwrap();
@@ -527,6 +582,26 @@ mod tests {
         assert!(
             text.contains("--from-provider"),
             "Handover's skill must win the collision, got: {text}"
+        );
+        assert!(!text.contains("description: user skill"));
+    }
+
+    /// APFS (this project's own platform) folds case by default: a user skill
+    /// named `Handover-Switch` must not be able to win the collision just
+    /// because it fails a byte-exact name comparison against `handover-switch`.
+    #[test]
+    fn a_differently_cased_user_skill_does_not_win_the_collision_on_a_case_folding_filesystem() {
+        let temp = TempDir::new().unwrap();
+        let (version, provider_home) = codex_home_fixture(&temp, &["Handover-Switch"]);
+        let codex_home = temp.path().join("codex_home");
+
+        materialize_codex_home(&codex_home, &version, Some(&provider_home)).unwrap();
+
+        let text =
+            std::fs::read_to_string(codex_home.join("skills/handover-switch/SKILL.md")).unwrap();
+        assert!(
+            text.contains("--from-provider"),
+            "Handover's skill must win the collision even under a different case, got: {text}"
         );
         assert!(!text.contains("description: user skill"));
     }
@@ -553,6 +628,52 @@ mod tests {
         assert!(
             !private.join("README.md").exists(),
             "a plain file is not a skill and is skipped"
+        );
+    }
+
+    /// The non-`NotFound` arm of the `read_dir(source)` match is what makes
+    /// the `()` return type honest: an `.unwrap()` there would pass every
+    /// other test in this module and panic at launch the first time a real
+    /// user's `skills/` path isn't a plain, readable directory.
+    #[test]
+    fn a_skills_path_that_is_a_regular_file_degrades_instead_of_failing_the_launch() {
+        let temp = TempDir::new().unwrap();
+        let (version, provider_home) = codex_home_fixture(&temp, &[]);
+        let skills = provider_home.join("skills");
+        std::fs::remove_dir(&skills).unwrap();
+        std::fs::write(&skills, b"not a directory").unwrap();
+        let codex_home = temp.path().join("codex_home");
+
+        materialize_codex_home(&codex_home, &version, Some(&provider_home)).unwrap();
+
+        assert!(
+            codex_home.join("skills/handover-switch/SKILL.md").exists(),
+            "Handover's own skill must still be present when the user's skills path is not a directory"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_skills_directory_degrades_instead_of_failing_the_launch() {
+        let temp = TempDir::new().unwrap();
+        let (version, provider_home) = codex_home_fixture(&temp, &["good"]);
+        let skills = provider_home.join("skills");
+        let mut permissions = std::fs::metadata(&skills).unwrap().permissions();
+        permissions.set_mode(0o000);
+        std::fs::set_permissions(&skills, permissions).unwrap();
+        let codex_home = temp.path().join("codex_home");
+
+        let outcome = materialize_codex_home(&codex_home, &version, Some(&provider_home));
+
+        // Restore before asserting: a failed assertion below must not leave a
+        // 0o000 directory behind that the temp-dir cleanup cannot delete.
+        let mut restored = std::fs::metadata(&skills).unwrap().permissions();
+        restored.set_mode(0o700);
+        std::fs::set_permissions(&skills, restored).unwrap();
+
+        outcome.unwrap();
+        assert!(
+            codex_home.join("skills/handover-switch/SKILL.md").exists(),
+            "Handover's own skill must still be present when the user's skills directory cannot be read"
         );
     }
 
