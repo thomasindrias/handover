@@ -88,8 +88,15 @@ fn codex_launch_uses_a_private_codex_home_with_no_config_overlay_flags() {
 /// asserts both halves where a user would actually see them: the process's
 /// own stderr, and the private `CODEX_HOME` the child process is actually
 /// handed.
+///
+/// The user's skill directory is a case-variant of the exact name
+/// (`Handover-Switch`, not `handover-switch`) on purpose: the collision check
+/// is case-insensitive because APFS folds case by default, and an
+/// exact-case fixture here would pass just as well under a byte-exact `==`
+/// comparison, silently losing coverage for that half of the design
+/// decision. See Task 4 fix round 2.
 #[test]
-fn a_colliding_user_skill_is_shadowed_with_a_visible_warning() {
+fn a_case_variant_colliding_user_skill_is_shadowed_with_a_visible_warning() {
     let temp = TempDir::new().unwrap();
     let repo = temp.path().join("repo");
     init_repo(&repo);
@@ -105,7 +112,7 @@ fn a_colliding_user_skill_is_shadowed_with_a_visible_warning() {
     // CODEX_HOME environment variable, so pointing it here is how a real
     // shell session would have it set, too.
     let real_codex_home = temp.path().join("real-codex-home");
-    let user_skill = real_codex_home.join("skills/handover-switch");
+    let user_skill = real_codex_home.join("skills/Handover-Switch");
     std::fs::create_dir_all(&user_skill).unwrap();
     std::fs::write(
         user_skill.join("SKILL.md"),
