@@ -165,9 +165,10 @@ otherwise requires. It cannot touch a live lease, nor another run's lease. That
 authority is recorded only when the caller *is* that run — an arm typed in a
 plain terminal adopts nothing, so `arm` plus `claim` can never become an
 unprompted recovery of a lease its caller never owned. That release is journaled
-as `run.recovered`, so no lease leaves a session's history unexplained. Arm-and-complete-on-exit follows from these rules rather than
-needing enforcement: a claim attempted while the provider still runs refuses,
-because its lease is live.
+as `run.recovered`, so no lease leaves a session's history unexplained.
+Arm-and-complete-on-exit follows from these rules rather than needing
+enforcement: a claim attempted while the provider still runs refuses, because
+its lease is live.
 
 When the provider `handover run` or `handover switch` supervises exits and an
 arm is pending, that supervisor claims it and launches its target in the same

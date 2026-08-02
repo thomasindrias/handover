@@ -101,6 +101,12 @@ fn initialize_result(request: &serde_json::Value) -> serde_json::Value {
 }
 
 fn tools_list_result() -> serde_json::Value {
+    // Built rather than hardcoded: this string is a contract advertised to
+    // agents, and a changed default must not be able to ship a false one.
+    let ttl_description = format!(
+        "How long the arm stays claimable, e.g. `{default}`. Defaults to {default}.",
+        default = crate::arm::DEFAULT_TTL
+    );
     serde_json::json!({
         "tools": [
             {
@@ -130,7 +136,7 @@ fn tools_list_result() -> serde_json::Value {
                     "properties": {
                         "provider": { "type": "string", "enum": ["claude", "codex"] },
                         "surface": { "type": "string", "enum": ["auto", "cli", "desktop"] },
-                        "ttl": { "type": "string", "description": "How long the arm stays claimable, e.g. `15m`. Defaults to 15m." },
+                        "ttl": { "type": "string", "description": ttl_description },
                     },
                     "required": ["provider"],
                 },

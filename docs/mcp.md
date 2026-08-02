@@ -30,10 +30,13 @@ running commands in a second terminal.
   to a session for a provider Handover did not launch, resolving to the existing
   session when one exists.
 
-`arm` and `claim` are scoped to the active run: the calling process must supply
-the same session id, run id, and private inbox path that provider checkpoint
-submission requires, and the session resolved from the working directory must be
-the one that run is attached to. `attach` cannot be scoped that way — by
+`arm` and `claim` are scoped to the active run, and three things must hold. The
+calling process must supply the same session id, run id, and private inbox path
+that provider checkpoint submission requires; the session resolved from the
+working directory must be the one that run is attached to; and that run must
+still hold the session's lease. The third gate is why a stale run environment is
+not enough: a run whose lease is gone is finished, and a finished run may not arm
+a switch the user never asked for. `attach` cannot be scoped that way — by
 definition no run exists yet — so it is scoped to the worktree its working
 directory resolves to. Neither is an authorization boundary; see
 `docs/architecture.md`.

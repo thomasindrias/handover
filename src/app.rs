@@ -52,8 +52,8 @@ const STALE_NARRATIVE_EVENT_THRESHOLD: u64 = 20;
 pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result<i32> {
     if environment.get("HANDOVER_RUN_ID").is_some() && !provider_command_allowed(&cli.command) {
         return Err(Error::InvalidState(
-            "an attached provider may only invoke Handover hooks, submit provider checkpoints, \
-             or arm and claim a switch — each through `--from-provider`; to record a checkpoint, \
+            "an attached provider may only invoke Handover hooks, or submit provider checkpoints \
+             and arm and claim a switch through `--from-provider`; to record a checkpoint, \
              pipe its JSON into `handover checkpoint --format json --from-provider`, and to hand \
              this session over, run `handover arm <provider> --from-provider`"
                 .into(),
@@ -1446,9 +1446,10 @@ fn release_for_claim(
     let Some(lease) = leases.read()? else {
         return Ok(());
     };
-    // Two separate refusals. A foreign-host lease may well have been created
-    // by the arming run -- it just cannot be checked from here -- so it must
-    // not be told that something else created it.
+    // Three separate refusals: host, then liveness, then ownership. A
+    // foreign-host lease may well have been created by the arming run -- it
+    // just cannot be checked from here -- so it must not be told that
+    // something else created it.
     if lease.host != host_name()? {
         let (_state, reason) = classify_lease(leases)?;
         return Err(Error::InvalidState(format!(

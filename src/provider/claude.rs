@@ -13,6 +13,13 @@ const HOOKS_JSON: &[u8] = include_bytes!("assets/claude-hooks.json");
 const CHECKPOINT_COMMAND: &[u8] = include_bytes!("assets/claude-command-checkpoint.md");
 const SWITCH_COMMAND: &[u8] = include_bytes!("assets/claude-command-switch.md");
 
+/// Where the two commands live inside the versioned plugin directory. Named
+/// once because these are content-addressed paths: `setup` and `verify` must
+/// spell them identically, and a changed spelling orphans every install that
+/// already materialized the old one.
+const CHECKPOINT_COMMAND_PATH: &str = "commands/handover-checkpoint.md";
+const SWITCH_COMMAND_PATH: &str = "commands/handover-switch.md";
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ClaudeAdapter;
 
@@ -45,22 +52,16 @@ impl ProviderAdapter for ClaudeAdapter {
         let version = integration_root.join("claude/1");
         materialize_immutable(&version.join(".claude-plugin/plugin.json"), PLUGIN_JSON)?;
         materialize_immutable(&version.join("hooks/hooks.json"), HOOKS_JSON)?;
-        materialize_immutable(
-            &version.join("commands/handover-checkpoint.md"),
-            CHECKPOINT_COMMAND,
-        )?;
-        materialize_immutable(&version.join("commands/handover-switch.md"), SWITCH_COMMAND)
+        materialize_immutable(&version.join(CHECKPOINT_COMMAND_PATH), CHECKPOINT_COMMAND)?;
+        materialize_immutable(&version.join(SWITCH_COMMAND_PATH), SWITCH_COMMAND)
     }
 
     fn verify(&self, integration_root: &Path) -> Result<()> {
         let version = integration_root.join("claude/1");
         verify_materialized(&version.join(".claude-plugin/plugin.json"), PLUGIN_JSON)?;
         verify_materialized(&version.join("hooks/hooks.json"), HOOKS_JSON)?;
-        verify_materialized(
-            &version.join("commands/handover-checkpoint.md"),
-            CHECKPOINT_COMMAND,
-        )?;
-        verify_materialized(&version.join("commands/handover-switch.md"), SWITCH_COMMAND)
+        verify_materialized(&version.join(CHECKPOINT_COMMAND_PATH), CHECKPOINT_COMMAND)?;
+        verify_materialized(&version.join(SWITCH_COMMAND_PATH), SWITCH_COMMAND)
     }
 
     fn probe(&self) -> Result<String> {

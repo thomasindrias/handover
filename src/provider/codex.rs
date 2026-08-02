@@ -101,7 +101,11 @@ pub(crate) fn materialize_codex_home(
     let skills = codex_home.join("skills");
     crate::store::ensure_private_dir(&skills)?;
 
-    if let Some(real_home) = provider_home {
+    // `handover setup codex` prints `CODEX_HOME=<review dir>`, and inside that
+    // review session `resolve_provider_home` resolves the review dir itself as
+    // the user's "real" home. Without this guard every link below is re-pointed
+    // at itself -- `mine -> .../review/skills/mine` -- and reads back as ELOOP.
+    if let Some(real_home) = provider_home.filter(|home| !is_same_directory(home, codex_home)) {
         for name in ["config.toml", "auth.json"] {
             let source = real_home.join(name);
             if source.exists() {
@@ -121,6 +125,19 @@ pub(crate) fn materialize_codex_home(
     )?;
 
     Ok(())
+}
+
+/// Whether two paths name the same directory on disk.
+///
+/// Canonicalised rather than compared literally, so a home reached by a
+/// different spelling of the same directory is still recognised. A path that
+/// cannot be canonicalised (the user's home may not exist at all) is treated as
+/// different, which is the pre-existing behaviour for every caller below.
+fn is_same_directory(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 /// Link each entry of the user's real `skills/` into the private one.
@@ -717,6 +734,43 @@ mod tests {
         .unwrap();
 
         assert!(codex_home.join("skills/handover-switch/SKILL.md").exists());
+    }
+
+    /// `handover setup codex` prints `CODEX_HOME=<review dir>`, and inside that
+    /// review session `$CODEX_HOME` *is* the review dir while `HANDOVER_RUN_ID`
+    /// is unset — so a second `handover setup codex` is allowed, and resolves
+    /// the private home as the user's own. Every entry would then be re-linked
+    /// to itself and read back as ELOOP, which is why each assertion below
+    /// reads *through* the link rather than merely checking it exists.
+    #[test]
+    fn a_private_home_handed_back_as_the_users_own_is_not_relinked_onto_itself() {
+        let temp = TempDir::new().unwrap();
+        let (version, provider_home) = codex_home_fixture(&temp, &["mine"]);
+        std::fs::write(provider_home.join("config.toml"), b"model = \"test\"\n").unwrap();
+        std::fs::write(provider_home.join("auth.json"), b"{}").unwrap();
+        let codex_home = temp.path().join("codex_home");
+
+        materialize_codex_home(&codex_home, &version, Some(&provider_home)).unwrap();
+        // The second pass is the review session re-running setup: the private
+        // home is handed back as the "real" one.
+        materialize_codex_home(&codex_home, &version, Some(&codex_home)).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(codex_home.join("config.toml")).unwrap(),
+            "model = \"test\"\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(codex_home.join("auth.json")).unwrap(),
+            "{}"
+        );
+        let skill = std::fs::read_to_string(codex_home.join("skills/mine/SKILL.md"))
+            .unwrap_or_else(|error| panic!("the user's skill is no longer readable: {error}"));
+        assert!(skill.contains("name: mine"));
+        assert!(
+            std::fs::read_to_string(codex_home.join("skills/handover-switch/SKILL.md"))
+                .unwrap()
+                .contains("--from-provider")
+        );
     }
 
     #[test]

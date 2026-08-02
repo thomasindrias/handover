@@ -10,7 +10,10 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 
 - `handover arm`, `handover claim`, and `handover attach`: a switch is now a
   one-shot, expiring capability that can be recorded while a provider is still
-  running and completed when it exits.
+  running and completed when it exits. An arm carries authority over a lease
+  only when the caller is the run holding it, so `arm` plus `claim` can never
+  release a crashed run's lease without the consent prompt
+  `handover switch --recover-lease` requires.
 - Quitting a supervised provider with a switch armed launches the armed target
   in the same terminal.
 - `handover status --json`'s `switch_readiness` block now reports any pending
@@ -27,13 +30,6 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 - A Handover-launched Codex session now keeps the user's own skills. The private
   per-run `CODEX_HOME` links each entry of the real `skills/` directory
   individually, beside Handover's own.
-
-### Changed
-
-- An arm now carries authority over a lease only when the caller is the run
-  holding it. `handover arm` typed in a plain terminal no longer adopts a
-  crashed run's lease, so `arm` plus `claim` can no longer release one without
-  the consent prompt `handover switch --recover-lease` requires.
 
 ## [0.1.1] - 2026-07-28
 

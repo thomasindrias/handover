@@ -540,15 +540,23 @@ fn claim_refuses_while_a_provider_is_still_live() {
     leases.clear(&live.run_id).unwrap();
 }
 
+/// The ownership refusal with a *non-`None`* `armed_run`: `Some(A) != Some(B)`,
+/// the case its message literally describes — the arming run died, and a
+/// different run took the session's lease before the claim landed. Arming from
+/// inside the run is what makes `armed_run` `Some(A)` at all; an arm typed in a
+/// plain terminal records `None` and is covered separately by
+/// `an_arm_from_outside_a_run_cannot_release_the_lease_it_found`.
 #[test]
 fn claim_refuses_when_a_different_run_holds_the_lease() {
     let (_temp, cwd, state, path) = finished_session();
     let (session, session_id) = session_dir_and_id(&state);
+    let (run_dir, run_id) = run_dir_and_id(&session);
     let leases = LeaseStore::new(&session);
 
+    // Run A holds the lease while it arms, so the arm adopts A.
     let arming_run = RunLease::new(
         session_id.clone(),
-        RunId::new(),
+        run_id.clone(),
         Provider::Claude,
         dead_identity(),
     )
@@ -559,14 +567,19 @@ fn claim_refuses_when_a_different_run_holds_the_lease() {
         .current_dir(&cwd)
         .env("HANDOVER_HOME", &state)
         .env("PATH", &path)
-        .args(["arm", "codex"])
+        .env("HANDOVER_SESSION_ID", session_id.to_string())
+        .env("HANDOVER_RUN_ID", run_id.to_string())
+        .env(
+            "HANDOVER_CHECKPOINT_INBOX",
+            run_dir.join("inbox/checkpoints"),
+        )
+        .args(["arm", "codex", "--from-provider"])
         .assert()
         .success();
 
     // Before the claim lands, a different run takes the session's lease --
-    // e.g. a fresh `handover run` started after the arm. Its run id was
-    // never seen by `arm`, so it cannot be the one that authorised the
-    // switch.
+    // e.g. a fresh `handover run` started after the arm. It is dead too, so
+    // the liveness rung above cannot be what refuses; only ownership can.
     leases.clear(&arming_run.run_id).unwrap();
     let foreign_run =
         RunLease::new(session_id, RunId::new(), Provider::Claude, dead_identity()).unwrap();

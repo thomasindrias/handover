@@ -19,18 +19,27 @@ happened — files touched, commands run, their failures — but not why. Withou
 fresh checkpoint the next provider receives a thin document.
 
 Build the JSON from the actual work in this conversation, exactly as
-`/handover-checkpoint` describes: `objective`, `summary`, and at least one
-`next_steps` entry are required, and every other array may be empty rather than
-invented. Then submit it:
+`/handover-checkpoint` describes. Every key below must be present. `objective`,
+`summary`, and at least one `next_steps` entry are required to carry content,
+and every other array may stay empty rather than invented. Fill in this exact
+shape and submit it:
 
 ```sh
-printf '%s' '<the JSON>' | "$HANDOVER_HOOK_BIN" checkpoint --format json --from-provider
+printf '%s' '{"objective":"...","summary":"...","decisions":[],"assumptions":[],"constraints":[],"completed":[],"in_progress":[],"blockers":[],"next_steps":["..."],"related_event_sequences":[]}' \
+  | "$HANDOVER_HOOK_BIN" checkpoint --format json --from-provider
 ```
+
+A `decisions` entry is `{"statement": "...", "reason": "..."}`.
+`related_event_sequences` holds sequence numbers from `handover log --json`,
+sorted and unique; leave it empty if unsure.
+
+Report whether Handover accepted it. If it rejected the payload, show the error
+and correct the JSON rather than retrying unchanged.
 
 ## 2. Arm the switch
 
 ```sh
-"$HANDOVER_HOOK_BIN" arm <provider> --from-provider
+"$HANDOVER_HOOK_BIN" arm "<provider>" --from-provider
 ```
 
 `<provider>` is the value from $ARGUMENTS. The `--from-provider` flag is
