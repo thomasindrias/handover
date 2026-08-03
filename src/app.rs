@@ -1984,19 +1984,17 @@ fn verify_switch_snapshot(
     Ok(())
 }
 
+/// The provider this session is bound to, whichever way it was bound.
+///
+/// Reading only `run.started` would report `None` for a session `handover
+/// attach` adopted — a provider Handover knows the name of, because `attach`
+/// recorded it.
 fn previous_provider(events: &[Event]) -> Result<Option<Provider>> {
-    let Some(event) = events
-        .iter()
-        .rev()
-        .find(|event| matches!(event.kind, EventKind::RunStarted { .. }))
-    else {
+    let Some(bound) = crate::session::binding(events) else {
         return Ok(None);
     };
-    event.provider.map(Some).ok_or_else(|| {
-        Error::InvalidState(format!(
-            "run.started event {} has no provider",
-            event.sequence
-        ))
+    bound.provider.map(Some).ok_or_else(|| {
+        Error::InvalidState(format!("binding event {} has no provider", bound.sequence))
     })
 }
 
@@ -2261,6 +2259,7 @@ pub(crate) fn build_status_value(
 ) -> Result<serde_json::Value> {
     let (_layout, snapshot, store) = current_session(environment)?;
     let events = store.events()?;
+    let bound = crate::session::binding(&events);
     let provider = previous_provider(&events)?;
     let saved_cwd_path = store
         .meta()
@@ -2300,6 +2299,12 @@ pub(crate) fn build_status_value(
         "schema_version": 1,
         "session_id": store.id(),
         "provider": provider,
+        "binding": bound.as_ref().map(|bound| serde_json::json!({
+            "tier": bound.tier,
+            "provider": bound.provider,
+            "sequence": bound.sequence,
+            "detached": bound.detached,
+        })),
         "worktree": snapshot.identity.worktree,
         "branch": snapshot.branch,
         "head": snapshot.head,
