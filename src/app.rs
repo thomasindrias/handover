@@ -1993,8 +1993,18 @@ fn previous_provider(events: &[Event]) -> Result<Option<Provider>> {
     let Some(bound) = crate::session::binding(events) else {
         return Ok(None);
     };
+    // A detached attachment is a window still on screen that Handover no longer
+    // records. Naming its provider would assert a binding that no longer
+    // exists — and this feeds the journaled `switch.requested.from`, which is
+    // permanent.
+    if bound.detached {
+        return Ok(None);
+    }
     bound.provider.map(Some).ok_or_else(|| {
-        Error::InvalidState(format!("binding event {} has no provider", bound.sequence))
+        Error::InvalidState(format!(
+            "{:?} binding event {} has no provider",
+            bound.tier, bound.sequence
+        ))
     })
 }
 

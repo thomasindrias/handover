@@ -63,6 +63,86 @@ fn status_reports_an_adopted_session_as_attach_tier_with_its_provider() {
     // reporting null here would be a lie the journal can disprove.
     assert_eq!(status["binding"]["provider"], "claude");
     assert_eq!(status["provider"], "claude");
+    // The adopted session is on claude, so the useful next step is the other
+    // provider -- not the old fallback, which named claude and told the user
+    // to switch to the provider they were already on.
+    assert_eq!(
+        status["switch_readiness"]["suggested_switch_command"],
+        "handover switch codex"
+    );
+}
+
+/// After a claim moves an adopted session on, the old desktop window is still
+/// on screen but nothing it does is journaled, and Handover cannot make it
+/// quit. `status` must report that honestly: nothing is bound right now, and
+/// the binding block names what was last attached -- claude -- as detached.
+///
+/// This single test pins both halves of the wiring `build_status_value` added:
+/// the `binding` block reflects `Binding` field-for-field (not a hardcoded
+/// stand-in), and the top-level `provider` goes to `null` once `previous_provider`
+/// recognises a detached binding as nothing being bound.
+#[test]
+fn status_reports_a_detached_binding_as_unbound_with_the_last_provider_named() {
+    let (_temp, repo, state, path) = adopted_worktree();
+
+    let handover = |args: &[&str]| {
+        cargo_bin_cmd!("handover")
+            .current_dir(&repo)
+            .env("HANDOVER_HOME", &state)
+            .env("PATH", &path)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    // The sequence of the `session.attached` event that bound this session --
+    // read from the journal, not assumed, since `arm` and `claim` each append
+    // events of their own first.
+    let log = handover(&["log", "--json"]);
+    assert!(
+        log.status.success(),
+        "{}",
+        String::from_utf8_lossy(&log.stderr)
+    );
+    let attached_sequence = String::from_utf8_lossy(&log.stdout)
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|envelope| envelope["event"]["type"] == "session.attached")
+        .expect("attach recorded a session.attached event")["event"]["sequence"]
+        .as_u64()
+        .unwrap();
+
+    let arm = handover(&["arm", "codex"]);
+    assert!(
+        arm.status.success(),
+        "{}",
+        String::from_utf8_lossy(&arm.stderr)
+    );
+
+    let claim = handover(&["claim"]);
+    assert!(
+        claim.status.success(),
+        "{}",
+        String::from_utf8_lossy(&claim.stderr)
+    );
+
+    let output = handover(&["status", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(status["binding"]["tier"], "attached");
+    assert_eq!(status["binding"]["provider"], "claude");
+    assert_eq!(status["binding"]["sequence"], attached_sequence);
+    assert_eq!(status["binding"]["detached"], true);
+    // Nothing is bound right now -- the claim moved the session to codex, and
+    // naming claude here would assert a binding that no longer exists. Read
+    // together with the fields above: the last attachment was claude, and it
+    // is detached.
+    assert_eq!(status["provider"], serde_json::Value::Null);
 }
 
 #[test]
