@@ -34,16 +34,21 @@ pub struct Binding {
 
 /// The session's current binding, or `None` if nothing was ever bound.
 ///
-/// The binding is whichever of `run.started` and `session.attached` came last,
-/// so a worktree can move between tiers in either direction and still be
-/// reported honestly.
+/// The binding is whichever of `run.started` and `session.attached` has the
+/// higher `sequence`, so a worktree can move between tiers in either
+/// direction and still be reported honestly. This reads the event's sequence
+/// number, not its position in `events` — callers are not required to pass
+/// events in sequence order, only `EventJournal::append_optional` is.
 pub fn binding(events: &[Event]) -> Option<Binding> {
-    let latest = events.iter().rev().find(|event| {
-        matches!(
-            event.kind,
-            EventKind::RunStarted { .. } | EventKind::SessionAttached {}
-        )
-    })?;
+    let latest = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                EventKind::RunStarted { .. } | EventKind::SessionAttached {}
+            )
+        })
+        .max_by_key(|event| event.sequence)?;
     let tier = match latest.kind {
         EventKind::SessionAttached {} => Tier::Attached,
         _ => Tier::Supervised,
@@ -134,6 +139,22 @@ mod tests {
         let bound = binding(&run_then_adopted).expect("a binding exists");
         assert_eq!(bound.tier, Tier::Attached);
         assert_eq!(bound.provider, Some(Provider::Claude));
+    }
+
+    #[test]
+    fn the_higher_sequence_wins_even_when_it_sorts_earlier_in_the_slice() {
+        // Array order disagrees with sequence order: the attach event (seq 5)
+        // sits first in the slice, but the run-started event (seq 3) is
+        // positionally last. The binding must follow the higher sequence
+        // number, not last-in-array, so the true winner here is the attach.
+        let events = [
+            attached(5, Provider::Claude),
+            run_started(3, Provider::Codex),
+        ];
+        let bound = binding(&events).expect("a binding exists");
+        assert_eq!(bound.tier, Tier::Attached);
+        assert_eq!(bound.provider, Some(Provider::Claude));
+        assert_eq!(bound.sequence, 5);
     }
 
     #[test]
