@@ -41,6 +41,19 @@ definition no run exists yet — so it is scoped to the worktree its working
 directory resolves to. Neither is an authorization boundary; see
 `docs/architecture.md`.
 
+`claim`'s "refuses while a provider still holds the run lease" behavior above
+can only trigger for a session that has a lease at all, and only a session
+`handover run` or `handover switch` created ever gets one. `handover attach`
+(`docs/architecture.md`, `docs/providers.md`) adopts a session Handover never
+launched, so such a session never holds a lease — a pending arm on it has
+nothing for that refusal to find. Reaching it through these MCP tools still
+needs the same active-run credentials `arm` and `claim` always require,
+though, and an attached session's own process was never given any, for the
+same reason it cannot submit a checkpoint through the run-scoped inbox
+(`docs/providers.md`): Handover injects nothing into a provider it did not
+launch. In practice a pending arm on an attached session is completed with
+plain `handover claim`, run directly rather than through `--from-provider`.
+
 There is no `switch` tool. Switching takes over the calling terminal and blocks
 until the new provider exits, and the calling session's own run lease is always
 live while it is asking. `arm` is the in-session form of the same intent: it

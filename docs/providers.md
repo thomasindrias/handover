@@ -73,6 +73,41 @@ through `attach` cannot submit a checkpoint through the run-scoped inbox,
 though a human can still record one for it directly with
 `handover checkpoint`.
 
+## Desktop transport
+
+`handover arm <provider> --surface desktop` — and `handover switch` when it
+reuses a pending arm recorded on that surface — opens the target's desktop
+application instead of launching and supervising a CLI child: `codex app
+<worktree>` for Codex, and `open claude://code/new` for Claude. The Claude
+route is undocumented private surface inside `Claude.app`'s own URL scheme,
+not a published Claude Code interface, and Handover uses it best-effort. It
+also accepts no workspace path, so it opens Claude's desktop app without
+telling it which worktree to open.
+
+**This does not work out of the box.** A desktop launch is deliberately given
+none of what a CLI launch gets — no `--plugin-dir`, no `CODEX_HOME`, no
+`HANDOVER_HOOK_BIN`, no run inbox — because there is nowhere to put them: a
+private provider home and a plugin directory are constructs of a launch
+Handover controls, and opening an already-installed application is not that.
+The claim that opened the application already committed the handover to the
+journal, so the desktop session has to pull it itself, over MCP, on its first
+turn — which means it works only once Handover's MCP server is configured for
+that application by hand (`docs/mcp.md`). Handover does not register its MCP
+server automatically. Opened with no MCP server configured, a desktop session
+gets no injected files, no handover, and no notice that either was expected.
+
+The `open` command this uses for Claude is macOS-only. Handover's own README
+states Linux support, and its release pipeline builds a
+`*-unknown-linux-musl` target, so this is a real gap: on Linux, every Claude
+desktop arm reaches a spawn failure, because `open` does not exist there. That
+failure is caught and degrades the command rather than failing it — the arm
+stays claimed, the handover stays committed, and the run's own exit code is
+preserved — but the message it prints explains only that the command could
+not run, not that the underlying reason is the platform. `codex app` does not
+go through `open`, so this particular failure mode is specific to the Claude
+route; whether Codex's own desktop application runs on Linux is outside
+anything Handover checks or controls.
+
 ## Checkpoints
 
 A checkpoint is the portable narrative that observed activity cannot supply.

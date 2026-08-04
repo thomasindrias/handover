@@ -175,6 +175,51 @@ arm is pending, that supervisor claims it and launches its target in the same
 terminal. `handover fork` supervises a child too, but deliberately does not:
 a fork is a separate line of work, not a continuation of this one.
 
+## Binding tier
+
+A session's binding — what it is currently attached to, and how — is a
+derived fact rather than a journaled one. `session::binding` (`src/session.rs`)
+reads the events a session already has and picks whichever of `run.started`
+and `session.attached` carries the higher sequence number. No event kind or
+payload field was added to say this directly: the journal is append-only,
+checksummed, and rejects unknown fields, so a name written into it is
+permanent, and the tier is fully recoverable from events Handover was already
+recording.
+
+Because the comparison is by sequence rather than by an order assumed in
+advance, a worktree moves between tiers in either direction: a session
+`handover run` created can later be adopted with `handover attach` once that
+run has stopped, and an adopted session can later be superseded by a fresh
+`handover run`. Each case is reported as whichever event actually has the
+higher sequence, not as whichever tier came first.
+
+- **Supervised** — the binding is a `run.started` event. Handover launched
+  the provider, holds its run lease, and observes its lifecycle hooks.
+- **Attached** — the binding is a `session.attached` event, recorded by
+  `handover attach`. Handover did not launch this provider, so there is no
+  lifecycle to observe: the session's journal holds narrative checkpoints and
+  refreshed Git facts, but no observed activity. This is not a defect; it is
+  what adoption is, and Handover reports it as a fact rather than implying a
+  completeness the session does not have.
+
+An attached binding can additionally be reported **detached**: still on
+screen, but no longer current. If a `switch.claimed` event has since moved
+sequence past the attaching `session.attached`, the attachment stays
+reported — its provider named, its sequence held — but with `detached: true`,
+and the top-level provider fields that read it (`status`'s `provider`,
+`list`'s `last_provider`) go to `null` rather than asserting a binding the
+journal no longer supports. Handover reports this rather than resolving it
+because it cannot: nothing here can make a desktop application quit, so the
+window may genuinely still be open on screen while the journal has already
+moved on.
+
+`status --json`'s `binding` block, `list --json`'s `tier`/`detached` row
+fields, and `doctor`'s diagnostics all read this same derivation, so the
+three cannot disagree about a session's tier. `doctor` reports an adopted
+session with a `note`-severity diagnostic — a fact worth stating that is not
+a fault — and `doctor`'s exit code keys on `severity == "error"` alone, so a
+note never fails the command the way a `warning` or `error` diagnostic would.
+
 ## Fork transaction
 
 `handover fork` deliberately creates a separate line of work. It is not an option on

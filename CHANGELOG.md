@@ -27,6 +27,30 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 - MCP `arm`, `claim`, and `attach` tools. `arm` and `claim` are scoped to the
   active run; `attach` is scoped to the worktree, because a session Handover did
   not launch has no run.
+- `handover status --json` reports a session's binding tier in a `binding`
+  block (`tier`, `provider`, `sequence`, `detached`), and `handover list
+  --json` rows gained `tier` and `detached`. The tier is derived from
+  whichever of `run.started` or `session.attached` is most recent, so a
+  worktree can move between them in either direction with no new event kind
+  added to say so. `handover doctor` now states an adopted session's tier as
+  a `note`-severity diagnostic, which never affects `doctor`'s exit code.
+  Once a claim has moved an attached session on, its provider is reported
+  `null` — not the provider that is no longer bound — while the binding
+  itself still names it as attached and `detached`.
+- `handover arm --replace` supersedes an already-pending arm instead of
+  refusing, retiring the superseded one with the same `switch.expired` event
+  lazy expiry already uses. `handover switch` has no equivalent flag: it still
+  refuses when a different provider is already armed.
+- `handover arm --surface desktop` (and `handover switch` reusing an arm
+  recorded on that surface) opens the target provider's desktop application
+  — `codex app <worktree>` for Codex, `open claude://code/new` for Claude —
+  instead of supervising a CLI child. A desktop launch gets no injected files
+  and pulls its handover over MCP on its first turn, which requires
+  Handover's MCP server to already be configured for that application by
+  hand (`docs/mcp.md`); Handover does not register it automatically. A
+  failed launch degrades the command rather than failing it: the arm stays
+  claimed and the run's own exit code is preserved. `open` is macOS-only, so
+  a Claude desktop arm cannot open on Linux.
 - A Handover-launched Codex session now keeps the user's own skills. The private
   per-run `CODEX_HOME` links each entry of the real `skills/` directory
   individually, beside Handover's own.
