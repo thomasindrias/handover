@@ -1285,6 +1285,106 @@ fn arm_replace_supersedes_a_pending_arm_and_journals_the_one_it_retired() {
     assert_eq!(claimed["to_provider"], "claude");
 }
 
+/// `--replace` retires the pending arm, so it must not do so before the gate
+/// that can still refuse the command.
+///
+/// Reproduced by the reviewer with a corrupted checkpoint blob: the journal
+/// ended at `switch.expired` with no replacement, and the user had just been
+/// told on stderr that the supersede succeeded. That is the "half happened"
+/// state `claim_core` and `next_launch_from_pending_arm` both go out of their
+/// way to prevent, and it violates what `commit_transition_handover`'s own
+/// contract states -- prove the document renders before mutating.
+///
+/// The gate is broken the same way `a_switch_that_cannot_render_its_handover_\
+/// arms_nothing` breaks it: the narrative checkpoint's rendered Markdown is
+/// corrupted, which `load_verified_checkpoint` catches against its canonical
+/// JSON. The saved cwd still resolves, so the failure lands at the render
+/// rather than earlier.
+#[test]
+fn arm_replace_that_fails_its_render_gate_leaves_the_pending_arm_intact() {
+    let (_temp, cwd, state, path) = finished_session();
+    let (session, _) = session_dir_and_id(&state);
+
+    let handover = |args: &[&str]| {
+        cargo_bin_cmd!("handover")
+            .current_dir(&cwd)
+            .env("HANDOVER_HOME", &state)
+            .env("PATH", &path)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let journal = || String::from_utf8_lossy(&handover(&["log", "--json"]).stdout).into_owned();
+
+    let first = handover(&["arm", "codex", "--json"]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    let pending = first["armed_sequence"].as_u64().unwrap();
+
+    let markdown = std::fs::read_dir(session.join("checkpoints"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "md"))
+        .expect("the finished run wrote a narrative checkpoint");
+    let canonical = std::fs::read(&markdown).unwrap();
+    std::fs::write(&markdown, b"not the canonical rendering\n").unwrap();
+
+    let refused = handover(&["arm", "claude", "--replace"]);
+    let stderr = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(
+        !refused.status.success(),
+        "--replace must fail when its handover will not render; stderr was: {stderr}"
+    );
+    // The command failed, so it must not have announced a supersede that has
+    // to be undone by reading the journal to find out.
+    assert!(
+        !stderr.contains("Superseded"),
+        "a command that failed must not report a supersede; stderr was: {stderr}"
+    );
+
+    // The half that matters: the arm the user had is still theirs.
+    let text = journal();
+    assert!(
+        !text.contains("switch.expired"),
+        "a --replace that failed its gate must retire nothing; journal was: {text}"
+    );
+
+    // With the cause fixed, `status` can render again -- and it still reports
+    // the arm the failed command was supposed to have superseded. Asserted
+    // after the repair rather than before it because `status` renders the same
+    // handover the gate does, so a corrupted checkpoint refuses it too; the
+    // repair changes no event, and `switch.expired` is checked above.
+    std::fs::write(&markdown, &canonical).unwrap();
+    let status: serde_json::Value =
+        serde_json::from_slice(&handover(&["status", "--json"]).stdout).unwrap();
+    assert_eq!(
+        status["switch_readiness"]["armed"]["sequence"], pending,
+        "the original arm must still be pending; status was: {status}"
+    );
+    assert_eq!(status["switch_readiness"]["armed"]["to"], "codex");
+
+    // "Nothing happened" is retryable: with the cause fixed the same command
+    // works, and only then is the original arm retired.
+    let retried = handover(&["arm", "claude", "--replace", "--json"]);
+    assert!(
+        retried.status.success(),
+        "the supersede must work once the cause is fixed; stderr was: {}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    let retried: serde_json::Value = serde_json::from_slice(&retried.stdout).unwrap();
+    assert_eq!(retried["to"], "claude");
+    let expired = journal()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|envelope| envelope["event"]["type"] == "switch.expired")
+        .expect("the successful supersede retires the arm it replaced");
+    assert_eq!(expired["event"]["payload"]["armed_sequence"], pending);
+}
+
 /// `--replace` with nothing pending must be a plain no-op: it arms, and it
 /// must not journal `switch.expired` for an arm that never existed. That
 /// event is a claim about the past that would be a lie -- and, being

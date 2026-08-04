@@ -1590,6 +1590,20 @@ fn arm_value(
         None
     };
     let _operation = SessionOperationLock::acquire(&store.session_dir())?;
+
+    // Gate on exactly what `switch_readiness.ready` means, minus its lease
+    // term: arming while a provider is still running is the point.
+    //
+    // Above the supersede below, and not beside it. `--replace` retires the
+    // pending arm, and a gate failure after that would leave the user with no
+    // arm at all having just been told the supersede succeeded -- the "half
+    // happened" state `claim_core` and `next_launch_from_pending_arm` both go
+    // out of their way to prevent, and the one `commit_transition_handover`'s
+    // contract forbids: prove the document renders before mutating. Nothing
+    // here goes stale by moving, because `arm_for_switch` re-reads the events
+    // for itself afterwards.
+    preview_handover(&store, &snapshot, provider)?;
+
     let events = store.events()?;
     if let Some(existing) = crate::arm::pending(&store, runtime, &events)? {
         if !replace {
@@ -1618,10 +1632,6 @@ fn arm_value(
             existing.sequence
         );
     }
-
-    // Gate on exactly what `switch_readiness.ready` means, minus its lease
-    // term: arming while a provider is still running is the point.
-    preview_handover(&store, &snapshot, provider)?;
 
     let events = store.events()?;
     let (_, events_since) = crate::list::narrative_freshness(&events);
