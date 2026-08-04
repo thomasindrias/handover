@@ -63,6 +63,19 @@ impl Diagnostic {
             command_argv: None,
         }
     }
+
+    /// A fact worth stating that is not a fault. `doctor`'s exit code keys on
+    /// `severity == "error"` alone, so a note never fails the command.
+    fn note(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            severity: "note".into(),
+            message: message.into(),
+            repair_command: None,
+            command: None,
+            command_argv: None,
+        }
+    }
 }
 
 pub fn check_format(layout: &StateLayout) -> Vec<Diagnostic> {
@@ -344,6 +357,22 @@ pub fn check_sessions(layout: &StateLayout) -> Vec<Diagnostic> {
                 }
                 check_handshake_timeout(&scan.envelopes, &mut diagnostics);
                 check_orphan_artifacts(&path, &scan.envelopes, &mut diagnostics);
+                let events = scan
+                    .envelopes
+                    .iter()
+                    .map(|envelope| envelope.event.clone())
+                    .collect::<Vec<_>>();
+                if crate::session::binding(&events)
+                    .is_some_and(|bound| bound.tier == crate::session::Tier::Attached)
+                {
+                    diagnostics.push(Diagnostic::note(
+                        "session.attached",
+                        format!(
+                            "session {id} was adopted by `handover attach`: it holds narrative \
+                             checkpoints and Git facts, but no observed activity"
+                        ),
+                    ));
+                }
             }
             Err(error) => diagnostics.push(Diagnostic::error(
                 "journal.corrupt",

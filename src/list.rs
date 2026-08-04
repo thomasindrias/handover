@@ -59,6 +59,7 @@ fn fallible_row(layout: &StateLayout, name: &OsStr) -> Result<serde_json::Value>
     let events = store.events()?;
     let meta = store.meta();
     let (bound, binding_diagnostic) = binding_state(layout, meta);
+    let tier_binding = crate::session::binding(&events);
     let (latest_narrative, events_since) = narrative_freshness(&events);
     Ok(serde_json::json!({
         "session_id": meta.id,
@@ -68,6 +69,7 @@ fn fallible_row(layout: &StateLayout, name: &OsStr) -> Result<serde_json::Value>
         "worktree": meta.worktree.worktree,
         "branch": last_branch(&events),
         "bound": bound,
+        "tier": tier_binding.as_ref().map(|bound| bound.tier),
         "last_provider": last_provider(&events),
         "last_activity": last_activity(&events),
         "latest_narrative_checkpoint": latest_narrative,
@@ -84,6 +86,7 @@ fn degraded_row(name: &str, diagnostic: &str) -> serde_json::Value {
         "worktree": null,
         "branch": null,
         "bound": false,
+        "tier": null,
         "last_provider": null,
         "last_activity": null,
         "latest_narrative_checkpoint": null,
@@ -107,11 +110,7 @@ fn binding_state(layout: &StateLayout, meta: &SessionMeta) -> (bool, Option<Stri
 }
 
 pub(crate) fn last_provider(events: &[Event]) -> Option<Provider> {
-    events
-        .iter()
-        .rev()
-        .find(|event| matches!(event.kind, EventKind::RunStarted { .. }))
-        .and_then(|event| event.provider)
+    crate::session::binding(events).and_then(|bound| bound.provider)
 }
 
 pub(crate) fn last_activity(events: &[Event]) -> Option<String> {

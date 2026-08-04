@@ -192,3 +192,34 @@ exit 0
     assert_eq!(status["binding"]["detached"], false);
     assert_eq!(status["provider"], "claude");
 }
+
+#[test]
+fn list_and_doctor_both_state_an_adopted_sessions_tier() {
+    let (_temp, repo, state, path) = adopted_worktree();
+
+    let listed = cargo_bin_cmd!("handover")
+        .current_dir(&repo)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["list", "--json"])
+        .output()
+        .unwrap();
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let row = &listed["sessions"][0];
+    assert_eq!(row["tier"], "attached");
+    // Same defect `status` had: the provider is known, so reporting null lies.
+    assert_eq!(row["last_provider"], "claude");
+
+    let doctored = cargo_bin_cmd!("handover")
+        .current_dir(&repo)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&doctored.stdout);
+    assert!(
+        text.contains("attach"),
+        "doctor must state the tier rather than imply a completeness the session lacks: {text}"
+    );
+}
