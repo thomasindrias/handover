@@ -1,6 +1,7 @@
 mod support;
 
 use assert_cmd::cargo::cargo_bin_cmd;
+use handover::model::{RunId, SessionId};
 use tempfile::TempDir;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
@@ -108,6 +109,118 @@ fn send(
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     (output.status.success(), responses)
+}
+
+/// The two fake providers a run and a claim need on `PATH`.
+fn fake_providers(bin: &std::path::Path) {
+    write_executable(
+        &bin.join("claude"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-claude 1.0'; exit 0; fi
+cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
+hook() { printf '%s' "$1" | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null; }
+hook '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}'
+printf '%s' '{"objective":"Be armed","summary":"Ready.","decisions":[],"assumptions":[],"constraints":[],"completed":[],"in_progress":[],"blockers":[],"next_steps":["Continue"],"related_event_sequences":[]}' | "$HANDOVER_HOOK_BIN" checkpoint --format json --from-provider
+hook '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"Stop"}'
+exit 0
+"#,
+    );
+    write_executable(
+        &bin.join("codex"),
+        "#!/usr/bin/env bash\nif [[ ${1:-} == \"--version\" ]]; then printf '%s\\n' 'fake-codex 1.0'; exit 0; fi\nexit 0\n",
+    );
+}
+
+/// Initialize `repo`, run a provider in it to completion, and arm a switch to
+/// codex from the terminal.
+///
+/// The run is over, so its lease is cleared while its run directory — and the
+/// checkpoint inbox inside it — survives. That is precisely the leftover run
+/// environment `authorize_run_scoped_write`'s lease requirement exists to
+/// refuse, and the only way to reach it without leaving a real provider
+/// running for the length of the test.
+///
+/// The pending arm matters as much as the run does: without one, a `claim`
+/// would fail at "no switch is armed for this session" whether or not
+/// authorization ran at all, and a regression that dropped run-scoping would
+/// ship green.
+fn armed_run_in(repo: &std::path::Path, state: &std::path::Path, path: &std::ffi::OsStr) {
+    init_repo(repo);
+    cargo_bin_cmd!("handover")
+        .current_dir(repo)
+        .env("HANDOVER_HOME", state)
+        .env("PATH", path)
+        .args(["run", "claude"])
+        .assert()
+        .success();
+    // Armed through the ordinary CLI, which needs no run environment.
+    cargo_bin_cmd!("handover")
+        .current_dir(repo)
+        .env("HANDOVER_HOME", state)
+        .env("PATH", path)
+        .args(["arm", "codex"])
+        .assert()
+        .success();
+}
+
+/// One state root holding one such session.
+fn armed_session_with_a_finished_run() -> (
+    TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::ffi::OsString,
+) {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    let state = temp.path().join("state");
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    fake_providers(&bin);
+    let path = path_with(&bin);
+    armed_run_in(&repo, &state, &path);
+    (temp, repo, state, path)
+}
+
+/// The session directory bound to `worktree`, and its id.
+///
+/// Resolved through the CLI's own `status` rather than by picking the lone
+/// entry under `<state>/sessions`: one state root can hold two sessions, and
+/// the mismatch test below depends on naming the right one.
+fn session_dir_and_id(
+    state: &std::path::Path,
+    worktree: &std::path::Path,
+    path: &std::ffi::OsStr,
+) -> (std::path::PathBuf, SessionId) {
+    let output = cargo_bin_cmd!("handover")
+        .current_dir(worktree)
+        .env("HANDOVER_HOME", state)
+        .env("PATH", path)
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let id = SessionId::parse(status["session_id"].as_str().unwrap()).unwrap();
+    (state.join("sessions").join(id.to_string()), id)
+}
+
+/// The lone run directory under a session, and its id. Run directories outlive
+/// the run that made them, which is what lets a test speak as a real, finished
+/// run.
+fn run_dir_and_id(session: &std::path::Path) -> (std::path::PathBuf, RunId) {
+    let dir = std::fs::read_dir(session.join("runs"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let id = RunId::parse(dir.file_name().unwrap().to_str().unwrap()).unwrap();
+    (dir, id)
 }
 
 #[test]
@@ -467,53 +580,25 @@ fn an_unknown_tool_name_returns_a_json_rpc_error_not_a_tool_result() {
     assert_eq!(responses[0]["error"]["code"], -32601);
 }
 
-/// The write tools are run-scoped. Without a real active run in the
-/// environment they refuse — as a tool result, not a protocol error.
+/// A caller carrying run credentials takes the strict, run-scoped path, and
+/// that path is unchanged: a run whose lease has been cleared cannot arm or
+/// claim, however genuine its environment is.
+///
+/// This is the security-relevant half of deriving `from_provider` instead of
+/// pinning it. A launched provider always has `HANDOVER_RUN_ID` set, so it can
+/// never take the worktree-scoped path by accident — and the run directory it
+/// names outlives the run, which is exactly the leftover environment the lease
+/// requirement exists to close off.
+///
+/// The environment here is real, not fabricated: session id, run id, and
+/// checkpoint inbox all come from a run that genuinely happened, so
+/// `active_run` accepts it and the refusal can only come from the lease.
 #[test]
-fn the_write_tools_refuse_outside_the_active_run() {
-    let temp = TempDir::new().unwrap();
-    let repo = temp.path().join("repo");
-    init_repo(&repo);
-    let state = temp.path().join("state");
-    let bin = temp.path().join("bin");
-    std::fs::create_dir(&bin).unwrap();
-    write_executable(
-        &bin.join("claude"),
-        r#"#!/usr/bin/env bash
-set -euo pipefail
-if [[ ${1:-} == "--version" ]]; then printf '%s\n' 'fake-claude 1.0'; exit 0; fi
-cwd_json=$(printf '%s' "$PWD" | sed 's/\\/\\\\/g; s/"/\\"/g')
-hook() { printf '%s' "$1" | "$HANDOVER_HOOK_BIN" __hook claude >/dev/null; }
-hook '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"SessionStart"}'
-printf '%s' '{"objective":"Be armed","summary":"Ready.","decisions":[],"assumptions":[],"constraints":[],"completed":[],"in_progress":[],"blockers":[],"next_steps":["Continue"],"related_event_sequences":[]}' | "$HANDOVER_HOOK_BIN" checkpoint --format json --from-provider
-hook '{"session_id":"native","cwd":"'"$cwd_json"'","hook_event_name":"Stop"}'
-exit 0
-"#,
-    );
-    let path = path_with(&bin);
-    cargo_bin_cmd!("handover")
-        .current_dir(&repo)
-        .env("HANDOVER_HOME", &state)
-        .env("PATH", &path)
-        .args(["run", "claude"])
-        .assert()
-        .success();
+fn the_write_tools_still_refuse_a_run_that_no_longer_holds_the_lease() {
+    let (temp, repo, state, path) = armed_session_with_a_finished_run();
+    let (session, session_id) = session_dir_and_id(&state, &repo, &path);
+    let (run, run_id) = run_dir_and_id(&session);
 
-    // Arm through the ordinary CLI, which needs no run environment. Without
-    // this the `claim` half of the loop below proves nothing: `claim` would
-    // fail at "no switch is armed for this session" whether or not
-    // authorization ran at all, and a regression that dropped claim's
-    // run-scoping would ship green.
-    cargo_bin_cmd!("handover")
-        .current_dir(&repo)
-        .env("HANDOVER_HOME", &state)
-        .env("PATH", &path)
-        .args(["arm", "codex"])
-        .assert()
-        .success();
-
-    // The server is started with no run environment at all — the state a
-    // human's `handover mcp-server` is in.
     for (name, arguments) in [
         ("arm", serde_json::json!({ "provider": "codex" })),
         ("claim", serde_json::json!({})),
@@ -524,37 +609,42 @@ exit 0
             "method": "tools/call",
             "params": { "name": name, "arguments": arguments },
         });
-        let (success, responses) = send(&repo, &state, &format!("{request}\n"));
-        assert!(success, "the server itself must not die");
+        let output = cargo_bin_cmd!("handover")
+            .current_dir(&repo)
+            .env("HANDOVER_HOME", &state)
+            .env("PATH", &path)
+            .env("HANDOVER_SESSION_ID", session_id.to_string())
+            .env("HANDOVER_RUN_ID", run_id.to_string())
+            .env("HANDOVER_CHECKPOINT_INBOX", run.join("inbox/checkpoints"))
+            .args(["mcp-server"])
+            .write_stdin(format!("{request}\n"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "the server itself must not die");
+        let responses: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
         assert_eq!(responses.len(), 1);
-        assert!(
-            responses[0].get("error").is_none(),
-            "a domain refusal is a tool result, not a protocol error: {:?}",
-            responses[0]
-        );
         assert_eq!(
             responses[0]["result"]["isError"], true,
-            "{name} must refuse outside the active run: {:?}",
+            "{name} must still refuse a run that no longer holds the lease: {:?}",
             responses[0]
         );
-        // The refusal must come from the run proof and nowhere else.
-        // `authorize_run_scoped_write` runs before either tool touches the
-        // pending arm, so this is the first thing that fails — and it is what
-        // makes each half of this loop discriminating. Drop authorization and
-        // `arm` refuses with "already armed" while `claim` succeeds outright;
-        // neither says this.
+        // The refusal must come from the run-scoped authorization and nowhere
+        // else. Drop that check and `arm` refuses with "already armed" while
+        // `claim` succeeds outright; neither says this.
         let text = responses[0]["result"]["content"][0]["text"]
             .as_str()
             .unwrap();
         assert!(
-            text.contains("HANDOVER_SESSION_ID is required"),
+            text.contains("no longer holds this session's lease"),
             "{name} must refuse at the run proof, not somewhere further in: {text}"
         );
     }
 
-    // Neither refusal claimed the arm that is sitting there waiting.
-    // `switch.requested` and `switch.armed` are legitimately present from the
-    // CLI arm above; `switch.claimed` would mean a write tool ran unproven.
     let log = cargo_bin_cmd!("handover")
         .current_dir(&repo)
         .env("HANDOVER_HOME", &state)
@@ -566,6 +656,159 @@ exit 0
         !String::from_utf8_lossy(&log.stdout).contains("switch.claimed"),
         "a refused write tool must leave no claim behind"
     );
+    drop(temp);
+}
+
+/// The other refusal the strict path owes: a provider process can `cd`
+/// anywhere, so a run attached to one session must not be able to walk into
+/// another worktree and write the session it finds there.
+///
+/// Checked before the lease, so this is what a genuine, *live* run of another
+/// session would hit too — the state a fabricated fixture cannot reach without
+/// leaving a real provider running for the length of the test.
+#[test]
+fn the_write_tools_still_refuse_a_run_belonging_to_another_session() {
+    // Both sessions share one `HANDOVER_HOME`, which is what a provider that
+    // walks into a second worktree actually sees — and what lets the run proof
+    // get past `active_run` and reach the session comparison itself.
+    let temp = TempDir::new().unwrap();
+    let state = temp.path().join("state");
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    fake_providers(&bin);
+    let path = path_with(&bin);
+    let own_repo = temp.path().join("own");
+    let other_repo = temp.path().join("other");
+    armed_run_in(&own_repo, &state, &path);
+    armed_run_in(&other_repo, &state, &path);
+    let (other_session, other_session_id) = session_dir_and_id(&state, &other_repo, &path);
+    let (other_run, other_run_id) = run_dir_and_id(&other_session);
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": "arm", "arguments": { "provider": "codex" } },
+    });
+    // The credentials name the other session's run; the cwd resolves to this
+    // one. Nothing here is fabricated: the run existed, its inbox is where the
+    // environment says, and `active_run` accepts it — so the refusal can only
+    // come from the session comparison.
+    let output = cargo_bin_cmd!("handover")
+        .current_dir(&own_repo)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .env("HANDOVER_SESSION_ID", other_session_id.to_string())
+        .env("HANDOVER_RUN_ID", other_run_id.to_string())
+        .env(
+            "HANDOVER_CHECKPOINT_INBOX",
+            other_run.join("inbox/checkpoints"),
+        )
+        .args(["mcp-server"])
+        .write_stdin(format!("{request}\n"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "the server itself must not die");
+    let responses: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        responses[0]["result"]["isError"], true,
+        "arm must still refuse a run attached to another session: {:?}",
+        responses[0]
+    );
+    let text = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        text.contains("run the command from your own session's worktree"),
+        "arm must refuse at the session comparison, not somewhere further in: {text}"
+    );
+
+    let log = cargo_bin_cmd!("handover")
+        .current_dir(&own_repo)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["log", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&log.stdout).contains("switch.claimed"),
+        "a refused write tool must leave no claim behind"
+    );
+}
+
+/// A caller with no run credentials takes the worktree-scoped path — which is
+/// exactly what the plain CLI `handover arm` already does for any process in
+/// that worktree, and what the `attach` tool already did here.
+///
+/// This is the case the pinned `from_provider = true` made impossible. A
+/// desktop session has no run environment at all — that is what attach tier
+/// means — so it could pull its handover with `preview` and never arm its way
+/// back out: the desktop leg was a one-way trip a human had to end from a
+/// terminal.
+#[test]
+fn the_write_tools_serve_an_attached_session_that_has_no_run() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    let state = temp.path().join("state");
+
+    // Adopt the worktree exactly as a desktop application would on its first
+    // turn: over MCP, with no run environment.
+    let attach = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": "attach", "arguments": { "provider": "claude" } },
+    });
+    let (_, responses) = send(&repo, &state, &format!("{attach}\n"));
+    assert_eq!(responses[0]["result"]["isError"], false);
+
+    // And arm its way back out, over the same server, still with no run.
+    let arm = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": { "name": "arm", "arguments": { "provider": "codex" } },
+    });
+    let (success, responses) = send(&repo, &state, &format!("{arm}\n"));
+    assert!(success);
+    assert_eq!(
+        responses[0]["result"]["isError"], false,
+        "an attached session must be able to arm its own switch: {:?}",
+        responses[0]
+    );
+    let text = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let armed: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(armed["to"], "codex");
+    let armed_sequence = armed["armed_sequence"].as_u64().unwrap();
+
+    // `claim` completes it from the same place, which is what makes the leg a
+    // round trip rather than a one-way one.
+    let claim = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": { "name": "claim", "arguments": { "arm": armed_sequence } },
+    });
+    let (success, responses) = send(&repo, &state, &format!("{claim}\n"));
+    assert!(success);
+    assert_eq!(
+        responses[0]["result"]["isError"], false,
+        "an attached session must be able to claim its own arm: {:?}",
+        responses[0]
+    );
+    let text = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let claimed: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(claimed["to_provider"], "codex");
 }
 
 /// `attach` is the deliberate exception: it is scoped to the worktree its cwd

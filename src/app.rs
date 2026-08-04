@@ -1716,6 +1716,30 @@ fn arm_command(
     Ok(0)
 }
 
+/// Whether an MCP caller has run credentials, and so which authorization rule
+/// its writes take.
+///
+/// Pinning this to `true` made the write tools unusable for the one session
+/// type that needs them most. A desktop session has no run environment at all
+/// — that is what attach tier *means* — so it could pull its handover with
+/// `preview` but never arm its way back out, leaving the desktop leg a one-way
+/// trip a human had to end from a terminal.
+///
+/// Deriving it grants no new privilege. A caller carrying `HANDOVER_RUN_ID`
+/// takes `authorize_run_scoped_write` exactly as before, and a launched
+/// provider always carries it — so nothing that was strict became lax. A
+/// caller without it takes the worktree-scoped path, which is precisely what
+/// the plain CLI `handover arm` and `handover claim` already do for any process
+/// in that worktree, and what the `attach` tool already did here.
+///
+/// `HANDOVER_RUN_ID` is the discriminator rather than the full triple because
+/// it is the one that says "I am a run": a caller that sets it but is missing
+/// the rest must still fail at the run proof, not fall through to the weaker
+/// rule.
+fn mcp_caller_has_run_credentials(environment: &Environment) -> bool {
+    environment.get("HANDOVER_RUN_ID").is_some()
+}
+
 pub(crate) fn mcp_arm_value(
     provider: Provider,
     surface: Surface,
@@ -1724,13 +1748,10 @@ pub(crate) fn mcp_arm_value(
     environment: &Environment,
     runtime: &dyn Runtime,
 ) -> Result<serde_json::Value> {
-    // The MCP surface is always an attached provider calling on its own
-    // behalf, never a human at a terminal — pin `from_provider` to `true`
-    // rather than threading a caller-supplied value. Named here (not passed
-    // as a bare `true` literal) so it reads unambiguously beside `replace`:
-    // two adjacent bools of the same type are a transposition risk, and a
-    // named local makes a swap visible at the call site.
-    let from_provider = true;
+    // Named here (not passed as a bare literal) so it reads unambiguously
+    // beside `replace`: two adjacent bools of the same type are a transposition
+    // risk, and a named local makes a swap visible at the call site.
+    let from_provider = mcp_caller_has_run_credentials(environment);
     arm_value(
         provider,
         surface,
@@ -1946,7 +1967,8 @@ pub(crate) fn mcp_claim_value(
     environment: &Environment,
     runtime: &dyn Runtime,
 ) -> Result<serde_json::Value> {
-    let (store, to_provider, built) = claim_core(arm, true, environment, runtime)?;
+    let from_provider = mcp_caller_has_run_credentials(environment);
+    let (store, to_provider, built) = claim_core(arm, from_provider, environment, runtime)?;
     Ok(claim_projection(&store, to_provider, built))
 }
 

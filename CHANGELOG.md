@@ -24,9 +24,13 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
   Claude, a `handover-switch` skill in Codex, and `handover arm <provider>
   --from-provider` underneath both. Type it where you are working; the session
   moves when you quit.
-- MCP `arm`, `claim`, and `attach` tools. `arm` and `claim` are scoped to the
-  active run; `attach` is scoped to the worktree, because a session Handover did
-  not launch has no run.
+- MCP `arm`, `claim`, and `attach` tools. `arm` and `claim` scope themselves to
+  the active run when the caller carries one — every provider Handover launches
+  does — and otherwise to the worktree they are called from, which is what the
+  plain CLI forms already do for any process there. `attach` is worktree-scoped
+  always, because a session Handover did not launch has no run. This is what
+  lets a desktop application Handover opened arm its way back out over MCP
+  instead of needing a human at a terminal to end the leg.
 - `handover status --json` reports a session's binding tier in a `binding`
   block (`tier`, `provider`, `sequence`, `detached`), and `handover list
   --json` rows gained `tier` and `detached`. The tier is derived from

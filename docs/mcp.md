@@ -30,15 +30,23 @@ running commands in a second terminal.
   to a session for a provider Handover did not launch, resolving to the existing
   session when one exists.
 
-`arm` and `claim` are scoped to the active run, and three things must hold. The
-calling process must supply the same session id, run id, and private inbox path
-that provider checkpoint submission requires; the session resolved from the
-working directory must be the one that run is attached to; and that run must
-still hold the session's lease. The third gate is why a stale run environment is
-not enough: a run whose lease is gone is finished, and a finished run may not arm
-a switch the user never asked for. `attach` cannot be scoped that way — by
-definition no run exists yet — so it is scoped to the worktree its working
-directory resolves to. Neither is an authorization boundary; see
+`arm` and `claim` scope themselves to whichever the caller can prove. A caller
+carrying `HANDOVER_RUN_ID` — which every provider Handover launches does — takes
+the run-scoped path, and three things must hold. The calling process must supply
+the same session id, run id, and private inbox path that provider checkpoint
+submission requires; the session resolved from the working directory must be the
+one that run is attached to; and that run must still hold the session's lease.
+The third gate is why a stale run environment is not enough: a run whose lease is
+gone is finished, and a finished run may not arm a switch the user never asked
+for.
+
+A caller with no run environment takes the worktree-scoped path instead, which is
+what the plain CLI `handover arm` and `handover claim` already do for any process
+in that worktree, and what `attach` has always done here — by definition no run
+exists for a session Handover did not launch. This is what lets a desktop
+application Handover opened arm its way back out over MCP rather than needing a
+human at a terminal to end the leg. It grants nothing a process in that worktree
+did not already have, and neither path is an authorization boundary; see
 `docs/architecture.md`.
 
 `claim`'s "refuses while a provider still holds the run lease" behavior above
@@ -46,13 +54,11 @@ can only trigger for a session that has a lease at all, and only a session
 `handover run` or `handover switch` created ever gets one. `handover attach`
 (`docs/architecture.md`, `docs/providers.md`) adopts a session Handover never
 launched, so such a session never holds a lease — a pending arm on it has
-nothing for that refusal to find. Reaching it through these MCP tools still
-needs the same active-run credentials `arm` and `claim` always require,
-though, and an attached session's own process was never given any, for the
-same reason it cannot submit a checkpoint through the run-scoped inbox
-(`docs/providers.md`): Handover injects nothing into a provider it did not
-launch. In practice a pending arm on an attached session is completed with
-plain `handover claim`, run directly rather than through `--from-provider`.
+nothing for that refusal to find. An attached session's own process has no run
+credentials — Handover injects nothing into a provider it did not launch, which
+is the same reason it cannot submit a checkpoint through the run-scoped inbox
+(`docs/providers.md`) — so it reaches these tools by the worktree-scoped path,
+exactly as a plain `handover claim` typed in that worktree would.
 
 There is no `switch` tool. Switching takes over the calling terminal and blocks
 until the new provider exits, and the calling session's own run lease is always

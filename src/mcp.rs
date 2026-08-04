@@ -130,7 +130,7 @@ fn tools_list_result() -> serde_json::Value {
             },
             {
                 "name": "arm",
-                "description": "Record a pending switch to another provider without launching anything. The switch completes when this session's provider exits, and the target comes up in the same terminal holding the handover. Scoped to the run this process is attached to.",
+                "description": "Record a pending switch to another provider without launching anything. The switch completes when this session's provider exits, and the target comes up in the same terminal holding the handover. Scoped to the run this process is attached to when it has one, and otherwise to the worktree it is called from — an attached session, such as a desktop application Handover opened, has no run.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -144,7 +144,7 @@ fn tools_list_result() -> serde_json::Value {
             },
             {
                 "name": "claim",
-                "description": "Consume this session's pending arm, commit the transition checkpoint, and return the handover. Refuses while a provider still holds the run lease. Scoped to the run this process is attached to.",
+                "description": "Consume this session's pending arm, commit the transition checkpoint, and return the handover. Refuses while a provider still holds the run lease. Scoped to the run this process is attached to when it has one, and otherwise to the worktree it is called from — an attached session, such as a desktop application Handover opened, has no run.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
