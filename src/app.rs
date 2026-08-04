@@ -651,15 +651,64 @@ enum ClaimedTransport {
     Supervised(LaunchRequest),
     /// `Surface::Desktop`: open the target's application and stop supervising.
     ///
-    /// The rendered document is deliberately not carried here. A desktop
-    /// launch takes no plugin directory, no `CODEX_HOME`, no hook binary and no
-    /// run inbox, so there is nowhere to put it; the claim committed it to the
+    /// The rendered document is deliberately not carried here, and neither are
+    /// any provider args the user typed. A desktop launch takes no plugin
+    /// directory, no `CODEX_HOME`, no hook binary, no run inbox and no flags,
+    /// so there is nowhere to put them; the claim committed the document to the
     /// journal, and the target pulls it over MCP. That is what makes a desktop
     /// session attach tier.
     Desktop {
         target: Provider,
         spec: DesktopLaunch,
     },
+}
+
+/// The transport an arm's `Surface` selects, and the only place that mapping
+/// exists.
+///
+/// Both commands that claim an arm route through here — the supervisor's
+/// claim-on-exit path and `handover switch` — so one arm cannot take one
+/// transport when a provider's exit claims it and another when the porcelain
+/// does.
+///
+/// `provider_args` are the flags the user typed for this launch: `switch`
+/// passes its own, and a claim-on-exit passes none, because a successor must
+/// not inherit the finished run's.
+fn claimed_transport(
+    surface: Surface,
+    target: Provider,
+    provider_args: Vec<OsString>,
+    built: BuiltHandover,
+    cwd: PathBuf,
+) -> ClaimedTransport {
+    match surface {
+        Surface::Auto | Surface::Cli => ClaimedTransport::Supervised(LaunchRequest {
+            provider: target,
+            provider_args,
+            document: built.rendered.markdown.into_bytes(),
+            recent_events_jsonl: built.recent_events_jsonl,
+            bootstrap: Some(BOOTSTRAP),
+            cwd,
+        }),
+        // The same cwd the supervised successor would have started in: a
+        // desktop target opens the directory its CLI counterpart would have run
+        // in, never the process's own.
+        Surface::Desktop => ClaimedTransport::Desktop {
+            target,
+            spec: desktop_launch(target, &cwd),
+        },
+    }
+}
+
+/// The run whose exit brought a desktop launch about, when one did.
+///
+/// `handover switch` opens the application itself and has no finished run, so
+/// this is what the two callers of `open_desktop` differ by — a struct rather
+/// than two more arguments, because `target` and a bare second `Provider` are
+/// transposable and this is not.
+struct FinishedRun {
+    provider: Provider,
+    exit_code: i32,
 }
 
 /// Launch `provider`, supervise it, and record its stop.
@@ -807,7 +856,18 @@ fn launch_supervised_run(
                 // application this opens may reach straight back for the
                 // handover over MCP, and it must not find the session held.
                 drop(operation);
-                open_desktop(environment, target, &spec, provider, exit_code);
+                // Whether it opened is deliberately not this command's verdict:
+                // this supervised a run that did its work, and that run's exit
+                // code is what it owes.
+                open_desktop(
+                    environment,
+                    target,
+                    &spec,
+                    Some(FinishedRun {
+                        provider,
+                        exit_code,
+                    }),
+                );
                 return Ok(exit_code);
             }
             Ok(None) => {
@@ -882,31 +942,25 @@ fn next_launch_from_pending_arm(
         pending.sequence
     );
     let built = claim_pending(store, leases, runtime, post, &pending)?;
-    Ok(Some(match pending.surface {
-        Surface::Auto | Surface::Cli => ClaimedTransport::Supervised(LaunchRequest {
-            provider: pending.to,
-            provider_args: Vec::new(),
-            document: built.rendered.markdown.into_bytes(),
-            recent_events_jsonl: built.recent_events_jsonl,
-            bootstrap: Some(BOOTSTRAP),
-            cwd: next_cwd,
-        }),
-        // The same saved cwd the successor would have started in: a desktop
-        // target opens the directory its CLI counterpart would have run in,
-        // never the process's own.
-        Surface::Desktop => ClaimedTransport::Desktop {
-            target: pending.to,
-            spec: desktop_launch(pending.to, &next_cwd),
-        },
-    }))
+    Ok(Some(claimed_transport(
+        pending.surface,
+        pending.to,
+        Vec::new(),
+        built,
+        next_cwd,
+    )))
 }
 
-/// Open a claimed desktop switch's target, and say what happened.
+/// Open a claimed desktop switch's target, say what happened, and report
+/// whether it opened.
 ///
-/// Never fails the command. By the time this runs the arm is consumed and the
-/// handover is committed, so a launch that does not happen is the third
+/// Never fails the command itself. By the time this runs the arm is consumed
+/// and the handover is committed, so a launch that does not happen is the third
 /// transport row — nothing opened, and the work still there to pick up — not a
-/// failed session, and not a lost one either.
+/// failed session, and not a lost one either. What that costs is the caller's
+/// judgement rather than this function's: a claim-on-exit owes the finished
+/// run's exit code and keeps it, while `switch` supervised nothing and has only
+/// this to answer for.
 ///
 /// The advice on that path has to be true of *that* state. There is no arm left
 /// to claim, so it must not say there is: naming a `handover claim` that would
@@ -916,24 +970,37 @@ fn open_desktop(
     environment: &Environment,
     target: Provider,
     spec: &DesktopLaunch,
-    finished: Provider,
-    exit_code: i32,
-) {
+    finished: Option<FinishedRun>,
+) -> bool {
     let target = target.executable();
     match launcher_from(environment).launch(spec) {
-        Ok(()) => eprintln!(
-            "Opened {target}'s desktop application (`{}`). Nothing supervises it from here: \
-             with Handover's MCP server configured it can pull this handover itself, and \
-             `handover preview {target}` renders the same document.",
-            spec.describe(),
-        ),
-        Err(error) => eprintln!(
-            "Could not open {target}'s desktop application: {error}. {} exited with \
-             {exit_code}, and the switch is already claimed — so there is nothing left to \
-             claim, but the handover is rendered: open the application yourself and read it \
-             with `handover preview {target}`.",
-            finished.executable(),
-        ),
+        Ok(()) => {
+            eprintln!(
+                "Opened {target}'s desktop application (`{}`). Nothing supervises it from \
+                 here: with Handover's MCP server configured it can pull this handover \
+                 itself, and `handover preview {target}` renders the same document.",
+                spec.describe(),
+            );
+            true
+        }
+        Err(error) => {
+            // The clause that differs: a claim-on-exit has a finished run to
+            // account for, and `switch` has none.
+            let claimed = match finished {
+                Some(run) => format!(
+                    "{} exited with {}, and the switch is already claimed",
+                    run.provider.executable(),
+                    run.exit_code
+                ),
+                None => "The switch is already claimed".to_owned(),
+            };
+            eprintln!(
+                "Could not open {target}'s desktop application: {error}. {claimed} — so there \
+                 is nothing left to claim, but the handover is rendered: open the application \
+                 yourself and read it with `handover preview {target}`.",
+            );
+            false
+        }
     }
 }
 
@@ -1058,22 +1125,39 @@ pub fn switch_command(
     };
     let built = claim_pending(&store, &leases, runtime, &invocation_snapshot, &pending)?;
 
-    launch_supervised_run(
-        &store,
-        &layout,
-        &leases,
-        runtime,
-        environment,
-        LaunchRequest {
-            provider,
-            provider_args,
-            document: built.rendered.markdown.into_bytes(),
-            recent_events_jsonl: built.recent_events_jsonl,
-            bootstrap: Some(BOOTSTRAP),
-            cwd: saved_cwd,
-        },
-        operation,
-    )
+    // The arm's surface, not this command's assumption: an arm reused here is
+    // the same arm a provider's exit would have claimed, so it must take the
+    // same transport either way. An arm this command created above asked for
+    // `Surface::Auto`, which is the terminal, exactly as before.
+    match claimed_transport(pending.surface, pending.to, provider_args, built, saved_cwd) {
+        ClaimedTransport::Supervised(request) => launch_supervised_run(
+            &store,
+            &layout,
+            &leases,
+            runtime,
+            environment,
+            request,
+            operation,
+        ),
+        ClaimedTransport::Desktop { target, spec } => {
+            // Nothing further is journaled, so the lock goes first — the
+            // application this opens may reach straight back for the handover
+            // over MCP, and it must not find the session held. Same ordering,
+            // and same reason, as the claim-on-exit path.
+            drop(operation);
+            // Supervising nothing, this has no child exit to relay: what it
+            // returns is its own verdict on the two things it was asked to do.
+            // The handover is committed either way -- that is why a failure
+            // still exits rather than falling back to the terminal -- but a
+            // launch that did not happen leaves an application the user must
+            // open themselves, and must not be reported as success.
+            if open_desktop(environment, target, &spec, None) {
+                Ok(0)
+            } else {
+                Ok(1)
+            }
+        }
+    }
 }
 
 fn resolve_saved_cwd(store: &SessionStore) -> Result<(PathBuf, PathBuf)> {
