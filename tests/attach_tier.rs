@@ -265,7 +265,17 @@ fn list_and_doctor_both_state_an_adopted_sessions_tier() {
     );
     let text = String::from_utf8_lossy(&doctored.stdout);
     assert!(
-        text.contains("attach"),
-        "doctor must state the tier rather than imply a completeness the session lacks: {text}"
+        text.contains("is bound at attach tier"),
+        "doctor must state the tier as a fact of the session, not imply a \
+         completeness it lacks: {text}"
+    );
+    // This session really was adopted by `handover attach`, but the note must
+    // not name that as the only way to reach the tier -- a desktop launch
+    // that succeeded reaches the identical fact (`docs/architecture.md`), and
+    // a wording naming only `handover attach` would mislead a user who never
+    // ran it.
+    assert!(
+        !text.contains("was adopted by `handover attach`"),
+        "doctor must not claim `handover attach` is the tier's only writer: {text}"
     );
 }

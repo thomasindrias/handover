@@ -368,8 +368,10 @@ pub fn check_sessions(layout: &StateLayout) -> Vec<Diagnostic> {
                     diagnostics.push(Diagnostic::note(
                         "session.attached",
                         format!(
-                            "session {id} was adopted by `handover attach`: it holds narrative \
-                             checkpoints and Git facts, but no observed activity"
+                            "session {id} is bound at attach tier, recorded either by \
+                             `handover attach` or by a desktop launch that succeeded: it \
+                             holds narrative checkpoints and Git facts, but no observed \
+                             activity"
                         ),
                     ));
                 }
