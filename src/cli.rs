@@ -37,6 +37,8 @@ pub enum Command {
         #[arg(long, default_value = crate::arm::DEFAULT_TTL)]
         ttl: String,
         #[arg(long)]
+        replace: bool,
+        #[arg(long)]
         from_provider: bool,
         #[arg(long)]
         json: bool,

@@ -85,12 +85,14 @@ pub fn run(cli: Cli, environment: &Environment, runtime: &dyn Runtime) -> Result
             provider,
             surface,
             ttl,
+            replace,
             from_provider,
             json,
         } => arm_command(
             provider,
             surface,
             &ttl,
+            replace,
             from_provider,
             json,
             environment,
@@ -938,9 +940,14 @@ pub fn switch_command(
     let pending = match crate::arm::pending(&store, runtime, &store.events()?)? {
         Some(existing) if existing.to == provider => existing,
         Some(existing) => {
+            // `switch` has no `--replace`: it is the porcelain for the
+            // common case, not the escape hatch for a conflicting arm. The
+            // remedies named here are the ones `switch` actually offers —
+            // kept in step with `arm_value`'s refusal wording where the two
+            // overlap, but without a supersede option `switch` doesn't have.
             return Err(Error::InvalidState(format!(
-                "a switch to {} is already armed at sequence {} (expires {}); \
-                 claim it with `handover claim`, or wait for it to expire",
+                "a switch to {} is already armed at sequence {}; claim it with \
+                 `handover claim`, or wait until {}",
                 existing.to.executable(),
                 existing.sequence,
                 existing.expires_at
@@ -1347,6 +1354,7 @@ fn arm_value(
     provider: Provider,
     surface: Surface,
     ttl: &str,
+    replace: bool,
     from_provider: bool,
     environment: &Environment,
     runtime: &dyn Runtime,
@@ -1361,12 +1369,31 @@ fn arm_value(
     let _operation = SessionOperationLock::acquire(&store.session_dir())?;
     let events = store.events()?;
     if let Some(existing) = crate::arm::pending(&store, runtime, &events)? {
-        return Err(Error::InvalidState(format!(
-            "a switch to {} is already armed at sequence {}; claim it or wait until {}",
+        if !replace {
+            return Err(Error::InvalidState(format!(
+                "a switch to {} is already armed at sequence {}; claim it, supersede it with \
+                 `--replace`, or wait until {}",
+                existing.to.executable(),
+                existing.sequence,
+                existing.expires_at
+            )));
+        }
+        // Retire it explicitly. Lazy expiry already uses `switch.expired` for
+        // an arm that outlived its TTL; a superseded one is the same fact
+        // reached deliberately, so it reads the same way in the journal.
+        store.append(
+            runtime,
+            None,
+            None,
+            EventKind::SwitchExpired {
+                armed_sequence: existing.sequence,
+            },
+        )?;
+        eprintln!(
+            "Superseded the pending switch to {} (armed at sequence {}).",
             existing.to.executable(),
-            existing.sequence,
-            existing.expires_at
-        )));
+            existing.sequence
+        );
     }
 
     // Gate on exactly what `switch_readiness.ready` means, minus its lease
@@ -1404,16 +1431,26 @@ fn arm_value(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn arm_command(
     provider: Provider,
     surface: Surface,
     ttl: &str,
+    replace: bool,
     from_provider: bool,
     json: bool,
     environment: &Environment,
     runtime: &dyn Runtime,
 ) -> Result<i32> {
-    let value = arm_value(provider, surface, ttl, from_provider, environment, runtime)?;
+    let value = arm_value(
+        provider,
+        surface,
+        ttl,
+        replace,
+        from_provider,
+        environment,
+        runtime,
+    )?;
     write_projection(&value, json)?;
     Ok(0)
 }
@@ -1422,10 +1459,26 @@ pub(crate) fn mcp_arm_value(
     provider: Provider,
     surface: Surface,
     ttl: &str,
+    replace: bool,
     environment: &Environment,
     runtime: &dyn Runtime,
 ) -> Result<serde_json::Value> {
-    arm_value(provider, surface, ttl, true, environment, runtime)
+    // The MCP surface is always an attached provider calling on its own
+    // behalf, never a human at a terminal — pin `from_provider` to `true`
+    // rather than threading a caller-supplied value. Named here (not passed
+    // as a bare `true` literal) so it reads unambiguously beside `replace`:
+    // two adjacent bools of the same type are a transposition risk, and a
+    // named local makes a swap visible at the call site.
+    let from_provider = true;
+    arm_value(
+        provider,
+        surface,
+        ttl,
+        replace,
+        from_provider,
+        environment,
+        runtime,
+    )
 }
 
 /// Release the lease the arm authorises us to release, if any.

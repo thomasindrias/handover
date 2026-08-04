@@ -1217,3 +1217,70 @@ fn switch_reuses_a_pending_arm_for_the_same_provider() {
         "switch must reuse the existing intent rather than recording a second one"
     );
 }
+
+#[test]
+fn arm_replace_supersedes_a_pending_arm_and_journals_the_one_it_retired() {
+    let (_temp, cwd, state, path) = finished_session();
+
+    let first = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["arm", "codex", "--json"])
+        .output()
+        .unwrap();
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    let superseded = first["armed_sequence"].as_u64().unwrap();
+
+    // Without the flag this is the established refusal.
+    let refused = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["arm", "claude"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success(), "bare arm must still refuse");
+
+    let replaced = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["arm", "claude", "--replace", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        replaced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replaced.stderr)
+    );
+    let replaced: serde_json::Value = serde_json::from_slice(&replaced.stdout).unwrap();
+    assert_eq!(replaced["to"], "claude");
+    assert!(replaced["armed_sequence"].as_u64().unwrap() > superseded);
+
+    // The retired arm is accounted for, not silently dropped.
+    let log = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["log", "--json"])
+        .output()
+        .unwrap();
+    let expired = String::from_utf8_lossy(&log.stdout)
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|envelope| envelope["event"]["type"] == "switch.expired")
+        .expect("superseding an arm must retire it in the journal");
+    assert_eq!(expired["event"]["payload"]["armed_sequence"], superseded);
+
+    // And exactly one arm is pending afterwards: claiming gets claude.
+    let claimed = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["claim", "--json"])
+        .output()
+        .unwrap();
+    let claimed: serde_json::Value = serde_json::from_slice(&claimed.stdout).unwrap();
+    assert_eq!(claimed["to_provider"], "claude");
+}

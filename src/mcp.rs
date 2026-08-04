@@ -137,6 +137,7 @@ fn tools_list_result() -> serde_json::Value {
                         "provider": { "type": "string", "enum": ["claude", "codex"] },
                         "surface": { "type": "string", "enum": ["auto", "cli", "desktop"] },
                         "ttl": { "type": "string", "description": ttl_description },
+                        "replace": { "type": "boolean", "description": "Supersede a pending arm for a different provider instead of refusing. The superseded arm is retired in the journal as `switch.expired`. Defaults to false." },
                     },
                     "required": ["provider"],
                 },
@@ -224,7 +225,13 @@ fn arm_tool_value(
             .ok_or_else(|| Error::InvalidState("ttl must be a string such as `15m`".into()))?
             .to_owned(),
     };
-    crate::app::mcp_arm_value(provider, surface, &ttl, environment, runtime)
+    let replace = match arguments.get("replace") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| Error::InvalidState("replace must be a boolean".into()))?,
+    };
+    crate::app::mcp_arm_value(provider, surface, &ttl, replace, environment, runtime)
 }
 
 fn claim_tool_value(
