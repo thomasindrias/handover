@@ -43,11 +43,12 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
   itself still names it as attached and `detached`.
 - `handover arm --replace` supersedes an already-pending arm instead of
   refusing, retiring the superseded one with the same `switch.expired` event
-  lazy expiry already uses. `handover switch` has no equivalent flag: it still
-  refuses when a different provider is already armed.
+  lazy expiry already uses, whether the new arm names a different provider or
+  refreshes the same one with a new surface or TTL. `handover switch` has no
+  equivalent flag: it still refuses when a different provider is already armed.
 - `handover arm --surface desktop` (and `handover switch` reusing an arm
   recorded on that surface) opens the target provider's desktop application
-  — `codex app <worktree>` for Codex, `open claude://code/new` for Claude —
+  — `codex app <saved cwd>` for Codex, `open claude://code/new` for Claude —
   instead of supervising a CLI child. A desktop launch gets no injected files
   and pulls its handover over MCP on its first turn, which requires
   Handover's MCP server to already be configured for that application by

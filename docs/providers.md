@@ -78,7 +78,9 @@ though a human can still record one for it directly with
 `handover arm <provider> --surface desktop` — and `handover switch` when it
 reuses a pending arm recorded on that surface — opens the target's desktop
 application instead of launching and supervising a CLI child: `codex app
-<worktree>` for Codex, and `open claude://code/new` for Claude. The Claude
+<saved cwd>` for Codex, and `open claude://code/new` for Claude. The path is
+the session's saved cwd — the directory a supervised successor would have
+started in — not the worktree root and not the invoking process's own. The Claude
 route is undocumented private surface inside `Claude.app`'s own URL scheme,
 not a published Claude Code interface, and Handover uses it best-effort. It
 also accepts no workspace path, so it opens Claude's desktop app without

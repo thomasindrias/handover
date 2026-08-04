@@ -24,25 +24,29 @@ impl DesktopLaunch {
     }
 }
 
-/// The command that opens `provider`'s desktop application on this worktree.
+/// The command that opens `provider`'s desktop application on `cwd`.
+///
+/// `cwd` is the session's saved cwd — the directory a supervised successor
+/// would have started in — and not necessarily the worktree root, which is why
+/// it is not named for one.
 ///
 /// Neither entry point accepts what Handover injects at a CLI launch — no
 /// plugin directory, no `CODEX_HOME`, no hook binary, no run inbox. That
 /// limitation is what forces the target to pull its handover over MCP, and what
 /// makes a desktop session attach tier.
-pub fn desktop_launch(provider: Provider, worktree: &Path) -> DesktopLaunch {
+pub fn desktop_launch(provider: Provider, cwd: &Path) -> DesktopLaunch {
     match provider {
         // `codex app [PATH]` is an official subcommand: "Launch the Desktop app
         // (opens the app installer if missing)", taking a workspace path and
         // nothing else.
         Provider::Codex => DesktopLaunch {
             program: OsString::from("codex"),
-            args: vec![OsString::from("app"), worktree.as_os_str().to_owned()],
+            args: vec![OsString::from("app"), cwd.as_os_str().to_owned()],
         },
         // Claude has no `app` subcommand. `Claude.app` registers the `claude`
         // URL scheme and `claude://code/new` is a route inside its bundle —
         // undocumented private surface, used best-effort. It accepts no
-        // workspace path, so none is passed.
+        // workspace path, so the cwd is not passed.
         Provider::Claude => DesktopLaunch {
             program: OsString::from("open"),
             args: vec![OsString::from("claude://code/new")],
@@ -176,14 +180,14 @@ mod tests {
     }
 
     #[test]
-    fn codex_opens_the_desktop_app_on_the_worktree() {
+    fn codex_opens_the_desktop_app_on_the_saved_cwd() {
         let spec = desktop_launch(Provider::Codex, Path::new("/work/oauth"));
         assert_eq!(spec.program, "codex");
         assert_eq!(spec.args, ["app", "/work/oauth"]);
     }
 
     #[test]
-    fn claude_opens_its_url_scheme_and_carries_no_worktree() {
+    fn claude_opens_its_url_scheme_and_carries_no_cwd() {
         // The route accepts no workspace path. Passing one would invent surface
         // that does not exist — and that absence is exactly why a Claude
         // desktop target has to pull its handover over MCP.

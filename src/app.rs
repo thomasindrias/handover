@@ -2338,7 +2338,7 @@ fn previous_provider(events: &[Event]) -> Result<Option<Provider>> {
     }
     bound.provider.map(Some).ok_or_else(|| {
         Error::InvalidState(format!(
-            "{:?} binding event {} has no provider",
+            "{} binding event {} has no provider",
             bound.tier, bound.sequence
         ))
     })

@@ -137,7 +137,7 @@ fn tools_list_result() -> serde_json::Value {
                         "provider": { "type": "string", "enum": ["claude", "codex"] },
                         "surface": { "type": "string", "enum": ["auto", "cli", "desktop"] },
                         "ttl": { "type": "string", "description": ttl_description },
-                        "replace": { "type": "boolean", "description": "Supersede a pending arm for a different provider instead of refusing. The superseded arm is retired in the journal as `switch.expired`. Defaults to false." },
+                        "replace": { "type": "boolean", "description": "Supersede the pending arm instead of refusing, whether it names a different provider or the same one — refreshing an arm for the same provider with a new surface or TTL is the same operation. The superseded arm is retired in the journal as `switch.expired`. Defaults to false." },
                     },
                     "required": ["provider"],
                 },

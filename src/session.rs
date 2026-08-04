@@ -22,6 +22,21 @@ pub enum Tier {
     Attached,
 }
 
+impl std::fmt::Display for Tier {
+    /// The same name `status`, `list`, and `doctor` serialize.
+    ///
+    /// Prose about a tier reaches the user through error messages rather than
+    /// JSON, and `{:?}` there prints `Attached` where every other surface
+    /// prints `attached`. The unit test below pins these two against each
+    /// other so they cannot drift apart again.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Supervised => "supervised",
+            Self::Attached => "attached",
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Binding {
     pub tier: Tier,
@@ -120,6 +135,17 @@ mod tests {
     #[test]
     fn a_session_with_no_binding_events_has_no_binding() {
         assert_eq!(binding(&[]), None);
+    }
+
+    /// A tier named in prose must read the same as a tier named in JSON.
+    #[test]
+    fn a_tier_displays_exactly_as_it_serializes() {
+        for tier in [Tier::Supervised, Tier::Attached] {
+            assert_eq!(
+                serde_json::to_value(tier).unwrap(),
+                serde_json::Value::String(tier.to_string()),
+            );
+        }
     }
 
     #[test]
