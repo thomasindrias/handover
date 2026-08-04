@@ -1284,3 +1284,49 @@ fn arm_replace_supersedes_a_pending_arm_and_journals_the_one_it_retired() {
     let claimed: serde_json::Value = serde_json::from_slice(&claimed.stdout).unwrap();
     assert_eq!(claimed["to_provider"], "claude");
 }
+
+/// `--replace` with nothing pending must be a plain no-op: it arms, and it
+/// must not journal `switch.expired` for an arm that never existed. That
+/// event is a claim about the past that would be a lie -- and, being
+/// append-only and checksummed, a permanent one. A regression such as
+/// branching on `replace` instead of on whether `crate::arm::pending` found
+/// something would pass every other test here while planting exactly that
+/// lie in the journal.
+#[test]
+fn arm_replace_with_nothing_pending_is_a_plain_no_op() {
+    let (_temp, cwd, state, path) = finished_session();
+
+    let armed = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["arm", "codex", "--replace", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        armed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&armed.stderr)
+    );
+    let armed: serde_json::Value = serde_json::from_slice(&armed.stdout).unwrap();
+    assert_eq!(armed["to"], "codex");
+    assert!(armed["armed_sequence"].as_u64().unwrap() > 0);
+
+    // Nothing was pending, so nothing was retired.
+    let log = cargo_bin_cmd!("handover")
+        .current_dir(&cwd)
+        .env("HANDOVER_HOME", &state)
+        .env("PATH", &path)
+        .args(["log", "--json"])
+        .output()
+        .unwrap();
+    let has_expired = String::from_utf8_lossy(&log.stdout)
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .any(|envelope| envelope["event"]["type"] == "switch.expired");
+    assert!(
+        !has_expired,
+        "--replace with nothing pending must not journal switch.expired; journal was: {}",
+        String::from_utf8_lossy(&log.stdout)
+    );
+}
