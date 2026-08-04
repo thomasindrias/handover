@@ -675,7 +675,9 @@ enum ClaimedTransport {
 ///
 /// `provider_args` are the flags the user typed for this launch: `switch`
 /// passes its own, and a claim-on-exit passes none, because a successor must
-/// not inherit the finished run's.
+/// not inherit the finished run's. The desktop transport can carry none at
+/// all, so this is also where args that cannot be applied are reported —
+/// beside the branch that drops them, which is the only place that knows.
 fn claimed_transport(
     surface: Surface,
     target: Provider,
@@ -695,10 +697,36 @@ fn claimed_transport(
         // The same cwd the supervised successor would have started in: a
         // desktop target opens the directory its CLI counterpart would have run
         // in, never the process's own.
-        Surface::Desktop => ClaimedTransport::Desktop {
-            target,
-            spec: desktop_launch(target, &cwd),
-        },
+        Surface::Desktop => {
+            // `codex app` and `claude://code/new` accept no flags, so there is
+            // nowhere to put args the user typed. Dropping them silently and
+            // then reporting success is the part that misleads: the arm may
+            // have been recorded minutes earlier by a provider, so whoever
+            // typed `handover switch <p> -- <args>` need not know the transport
+            // is desktop at all. Say what was not applied and open anyway --
+            // the handover is already committed, and refusing here would spend
+            // the claim for nothing.
+            //
+            // Only `switch` can reach this with anything to say: a
+            // claim-on-exit passes no args by construction.
+            if !provider_args.is_empty() {
+                eprintln!(
+                    "warning: the armed switch to {} opens its desktop application, which \
+                     accepts no arguments — so `{}` {} not applied.",
+                    target.executable(),
+                    shell_words::join(provider_args.iter().map(|arg| arg.to_string_lossy())),
+                    if provider_args.len() == 1 {
+                        "was"
+                    } else {
+                        "were"
+                    },
+                );
+            }
+            ClaimedTransport::Desktop {
+                target,
+                spec: desktop_launch(target, &cwd),
+            }
+        }
     }
 }
 

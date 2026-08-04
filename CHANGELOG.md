@@ -54,7 +54,9 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
   `session.attached` for the target it opened, so `status`, `list` and
   `doctor` report the application the user is now in rather than the provider
   it replaced — and the next arm's permanent `switch.requested.from` names it
-  too.
+  too. `handover switch <provider> -- <args>` on a desktop arm now warns that
+  the arguments were not applied instead of dropping them silently; neither
+  desktop entry point accepts any.
 - A Handover-launched Codex session now keeps the user's own skills. The private
   per-run `CODEX_HOME` links each entry of the real `skills/` directory
   individually, beside Handover's own.

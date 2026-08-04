@@ -684,3 +684,78 @@ fn a_desktop_launch_that_fails_journals_no_attachment() {
         "the session is still bound to the run that finished; status was: {status}"
     );
 }
+
+/// `handover switch <p> -- <args>` on a desktop arm has nowhere to put the
+/// args, and must not pretend otherwise.
+///
+/// `codex app` and `claude://code/new` accept no flags, so dropping them is
+/// correct — but the user typed them, and the arm may have been recorded
+/// minutes earlier by a provider, so the person typing `switch` need not know
+/// the transport is desktop at all. Reporting success while silently doing
+/// less than was asked is the failure here. It is a warning and not a refusal:
+/// the handover is already committed by the time the transport is chosen.
+#[test]
+fn a_desktop_switch_warns_about_provider_args_it_cannot_apply() {
+    let fixture = armed_session("desktop");
+    let launches = fixture.temp.path().join("desktop-launches");
+
+    let output = cargo_bin_cmd!("handover")
+        .current_dir(&fixture.cwd)
+        .env("HANDOVER_HOME", &fixture.state)
+        .env("PATH", &fixture.path)
+        .env(TEST_LAUNCH_LOG_ENV, &launches)
+        .args(["switch", "codex", "--", "--model", "o3"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains("warning:"),
+        "args that cannot be applied must be reported; stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("--model o3"),
+        "the warning must name the arguments that were not applied; stderr was: {stderr}"
+    );
+    // A warning, not a refusal: the claim is spent and the handover committed,
+    // so the application still opens and the command still succeeds.
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "unapplied args must not fail the switch; stderr was: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&launches).unwrap(),
+        format!(
+            "codex app {}\n",
+            fixture.cwd.canonicalize().unwrap().display()
+        ),
+        "the args have nowhere to go, so the command opened is unchanged"
+    );
+}
+
+/// The other half: a desktop switch typed with no args must say nothing.
+///
+/// A warning that fires unconditionally would train the user to ignore it,
+/// and the claim-on-exit path passes no args by construction — so every
+/// desktop hop from a provider's exit would carry it.
+#[test]
+fn a_desktop_switch_with_no_provider_args_warns_about_nothing() {
+    let fixture = armed_session("desktop");
+    let launches = fixture.temp.path().join("desktop-launches");
+
+    let output = cargo_bin_cmd!("handover")
+        .current_dir(&fixture.cwd)
+        .env("HANDOVER_HOME", &fixture.state)
+        .env("PATH", &fixture.path)
+        .env(TEST_LAUNCH_LOG_ENV, &launches)
+        .args(["switch", "codex"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !stderr.contains("accepts no arguments"),
+        "nothing was typed, so nothing was dropped; stderr was: {stderr}"
+    );
+}
