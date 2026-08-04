@@ -10,6 +10,53 @@ fn read(path: impl AsRef<Path>) -> String {
         .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()))
 }
 
+/// Every Markdown file the repository actually ships, so a new document cannot
+/// quietly escape the checks below.
+fn markdown_documents() -> Vec<PathBuf> {
+    fn walk(directory: &Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            // `target` is build output and `.superpowers` is untracked working
+            // material; neither is documentation this repository publishes.
+            if path.is_dir() {
+                if !matches!(name.as_str(), "target" | ".git" | ".superpowers") {
+                    walk(&path, found);
+                }
+            } else if path.extension().is_some_and(|extension| extension == "md") {
+                found.push(path);
+            }
+        }
+    }
+
+    let mut found = Vec::new();
+    walk(&root(), &mut found);
+    assert!(
+        found.len() >= 8,
+        "the walk found suspiciously little: {found:?}"
+    );
+    found
+}
+
+/// The desktop transport's launch seam is an environment variable that only
+/// tests set. Its `HANDOVER_TEST_` name says so, and no document may contradict
+/// that by presenting it as one a user configures.
+#[test]
+fn test_only_environment_variables_are_not_documented_as_user_facing() {
+    assert!(
+        handover::launch::TEST_LAUNCH_LOG_ENV.starts_with("HANDOVER_TEST_"),
+        "a variable only tests set must be named so it reads as one; found {}",
+        handover::launch::TEST_LAUNCH_LOG_ENV
+    );
+    for document in markdown_documents() {
+        assert!(
+            !read(&document).contains("HANDOVER_TEST"),
+            "{} documents a test-only environment variable as if a user should set it",
+            document.display()
+        );
+    }
+}
+
 #[test]
 fn repository_has_a_complete_open_source_surface() {
     let root = root();

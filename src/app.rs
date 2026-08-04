@@ -25,6 +25,7 @@ use crate::handover::{
     BOOTSTRAP, CaptureGap, CommandFact, HandoverInput, ParentLineage, is_recognized_test_command,
     render_with_selection,
 };
+use crate::launch::{DesktopLaunch, DesktopLauncher, desktop_launch, launcher_from};
 use crate::model::{
     Checkpoint, CheckpointAuthor, CheckpointKind, ContentRef, Event, EventEnvelope, EventKind,
     ForkOperation, ForkPhase, GitSnapshot, Provider, RunId, SessionId, Surface,
@@ -640,6 +641,27 @@ struct LaunchRequest {
     cwd: PathBuf,
 }
 
+/// What a claimed arm turns into, which is the one thing `Surface` selects.
+///
+/// The two differ in transport and in nothing else: the same gate, the same
+/// claim, and the same committed handover precede both.
+enum ClaimedTransport {
+    /// `Surface::Cli`, and `Surface::Auto` until something makes it choose:
+    /// supervise the successor in this terminal, carrying the document to it.
+    Supervised(LaunchRequest),
+    /// `Surface::Desktop`: open the target's application and stop supervising.
+    ///
+    /// The rendered document is deliberately not carried here. A desktop
+    /// launch takes no plugin directory, no `CODEX_HOME`, no hook binary and no
+    /// run inbox, so there is nowhere to put it; the claim committed it to the
+    /// journal, and the target pulls it over MCP. That is what makes a desktop
+    /// session attach tier.
+    Desktop {
+        target: Provider,
+        spec: DesktopLaunch,
+    },
+}
+
 /// Launch `provider`, supervise it, and record its stop.
 ///
 /// When the provider exits and an arm is pending, claim it and launch its
@@ -650,6 +672,10 @@ struct LaunchRequest {
 /// switch every time it starts keeps this loop going indefinitely; nothing
 /// here counts hops or refuses one. Termination rests on providers not doing
 /// that, not on the construction of this function.
+///
+/// An arm for `Surface::Desktop` ends the loop instead of continuing it: its
+/// target is opened as an application and supervised by nobody, so this returns
+/// the finished run's exit code exactly as an unarmed exit would.
 ///
 /// Takes ownership of `operation` — the lock is dropped before the child
 /// launches and re-acquired for teardown, exactly as the two call sites did.
@@ -775,7 +801,15 @@ fn launch_supervised_run(
         // result rather than failing a session that already did its work. The
         // arm survives, so the user can claim it once the cause is fixed.
         match next_launch_from_pending_arm(store, layout, leases, runtime, &post) {
-            Ok(Some(next)) => request = next,
+            Ok(Some(ClaimedTransport::Supervised(next))) => request = next,
+            Ok(Some(ClaimedTransport::Desktop { target, spec })) => {
+                // Nothing further is journaled, so the lock goes first — the
+                // application this opens may reach straight back for the
+                // handover over MCP, and it must not find the session held.
+                drop(operation);
+                open_desktop(environment, target, &spec, provider, exit_code);
+                return Ok(exit_code);
+            }
             Ok(None) => {
                 drop(operation);
                 return Ok(exit_code);
@@ -794,21 +828,25 @@ fn launch_supervised_run(
     }
 }
 
-/// Claim a pending arm and describe the launch that succeeds it, or `None` when
-/// nothing is armed.
+/// Claim a pending arm and describe the transport that succeeds it, or `None`
+/// when nothing is armed.
 ///
 /// Called only after the finished run's lease is cleared, and only with
 /// `SessionOperationLock` held. Every failure here is recoverable by
 /// construction: everything that can fail runs before the claim, so the caller
 /// can report it and keep the finished run's exit code, and the arm survives
 /// for `handover claim` to take once the cause is fixed.
+///
+/// The arm's `Surface` selects the transport and nothing else — the gate, the
+/// claim and the committed handover above are identical for both, so a desktop
+/// switch is refused for exactly the reasons a CLI one is.
 fn next_launch_from_pending_arm(
     store: &SessionStore,
     layout: &StateLayout,
     leases: &LeaseStore,
     runtime: &dyn Runtime,
     post: &GitSnapshot,
-) -> Result<Option<LaunchRequest>> {
+) -> Result<Option<ClaimedTransport>> {
     let Some(pending) = crate::arm::pending(store, runtime, &store.events()?)? else {
         return Ok(None);
     };
@@ -821,6 +859,14 @@ fn next_launch_from_pending_arm(
     // and the claim that consumes it must not be spent on a launch that is
     // about to fail. Both calls repeat verbatim at the top of the caller's
     // next iteration; both are idempotent.
+    //
+    // A desktop arm is gated the same way, deliberately: `codex app` is that
+    // same executable, so the probe is exactly the right question for it, and
+    // refusing before the claim is strictly kinder than claiming and then
+    // failing to open. `claude://code/new` needs `Claude.app` rather than the
+    // `claude` CLI, so for that one pairing this gate is stricter than the
+    // launch requires -- it refuses while the arm survives, which is the
+    // recoverable side to err on.
     let successor = adapter(pending.to);
     successor.setup(&layout.integrations())?;
     successor.probe()?;
@@ -836,14 +882,59 @@ fn next_launch_from_pending_arm(
         pending.sequence
     );
     let built = claim_pending(store, leases, runtime, post, &pending)?;
-    Ok(Some(LaunchRequest {
-        provider: pending.to,
-        provider_args: Vec::new(),
-        document: built.rendered.markdown.into_bytes(),
-        recent_events_jsonl: built.recent_events_jsonl,
-        bootstrap: Some(BOOTSTRAP),
-        cwd: next_cwd,
+    Ok(Some(match pending.surface {
+        Surface::Auto | Surface::Cli => ClaimedTransport::Supervised(LaunchRequest {
+            provider: pending.to,
+            provider_args: Vec::new(),
+            document: built.rendered.markdown.into_bytes(),
+            recent_events_jsonl: built.recent_events_jsonl,
+            bootstrap: Some(BOOTSTRAP),
+            cwd: next_cwd,
+        }),
+        // The same saved cwd the successor would have started in: a desktop
+        // target opens the directory its CLI counterpart would have run in,
+        // never the process's own.
+        Surface::Desktop => ClaimedTransport::Desktop {
+            target: pending.to,
+            spec: desktop_launch(pending.to, &next_cwd),
+        },
     }))
+}
+
+/// Open a claimed desktop switch's target, and say what happened.
+///
+/// Never fails the command. By the time this runs the arm is consumed and the
+/// handover is committed, so a launch that does not happen is the third
+/// transport row — nothing opened, and the work still there to pick up — not a
+/// failed session, and not a lost one either.
+///
+/// The advice on that path has to be true of *that* state. There is no arm left
+/// to claim, so it must not say there is: naming a `handover claim` that would
+/// now refuse is the wrong-advice bug this project has already shipped once.
+/// What is true is that the document exists, and `handover preview` renders it.
+fn open_desktop(
+    environment: &Environment,
+    target: Provider,
+    spec: &DesktopLaunch,
+    finished: Provider,
+    exit_code: i32,
+) {
+    let target = target.executable();
+    match launcher_from(environment).launch(spec) {
+        Ok(()) => eprintln!(
+            "Opened {target}'s desktop application (`{}`). Nothing supervises it from here: \
+             with Handover's MCP server configured it can pull this handover itself, and \
+             `handover preview {target}` renders the same document.",
+            spec.describe(),
+        ),
+        Err(error) => eprintln!(
+            "Could not open {target}'s desktop application: {error}. {} exited with \
+             {exit_code}, and the switch is already claimed — so there is nothing left to \
+             claim, but the handover is rendered: open the application yourself and read it \
+             with `handover preview {target}`.",
+            finished.executable(),
+        ),
+    }
 }
 
 pub fn run_command(

@@ -7,6 +7,7 @@ pub mod error;
 pub mod fork;
 pub mod git;
 pub mod handover;
+pub mod launch;
 pub mod list;
 pub mod mcp;
 pub mod model;
