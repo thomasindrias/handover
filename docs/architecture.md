@@ -195,12 +195,15 @@ higher sequence, not as whichever tier came first.
 
 - **Supervised** — the binding is a `run.started` event. Handover launched
   the provider, holds its run lease, and observes its lifecycle hooks.
-- **Attached** — the binding is a `session.attached` event, recorded by
-  `handover attach`. Handover did not launch this provider, so there is no
-  lifecycle to observe: the session's journal holds narrative checkpoints and
-  refreshed Git facts, but no observed activity. This is not a defect; it is
-  what adoption is, and Handover reports it as a fact rather than implying a
-  completeness the session does not have.
+- **Attached** — the binding is a `session.attached` event, recorded either by
+  `handover attach` or by a desktop launch that succeeded
+  (`docs/providers.md`), which reaches the same fact by opening the
+  application rather than by being told about one already open. Handover did
+  not launch this provider as a supervised child, so there is no lifecycle to
+  observe: the session's journal holds narrative checkpoints and refreshed Git
+  facts, but no observed activity. This is not a defect; it is what adoption
+  is, and Handover reports it as a fact rather than implying a completeness
+  the session does not have.
 
 An attached binding can additionally be reported **detached**: still on
 screen, but no longer current. If a `switch.claimed` event has since moved
