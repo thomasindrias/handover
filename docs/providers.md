@@ -96,6 +96,16 @@ that application by hand (`docs/mcp.md`). Handover does not register its MCP
 server automatically. Opened with no MCP server configured, a desktop session
 gets no injected files, no handover, and no notice that either was expected.
 
+A launch that succeeds records `session.attached` for the target it opened, so
+the session reads as attach tier bound to that application — the same fact
+`handover attach <provider>` records, reached by the hop instead of by hand.
+Without it nothing would ever say the session had moved: a desktop launch
+supervises nothing, so it produces no `run.started` and no lease. That single
+event is what makes `status`, `list`, and `doctor` name the application the
+user is now in, and what makes the next arm's `switch.requested.from` — which
+is permanent — name it too. A launch that *fails* records nothing: no binding
+was created, so none is claimed.
+
 The `open` command this uses for Claude is macOS-only. Handover's own README
 states Linux support, and its release pipeline builds a
 `*-unknown-linux-musl` target, so this is a real gap: on Linux, every Claude

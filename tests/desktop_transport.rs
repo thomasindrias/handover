@@ -177,8 +177,15 @@ fn assert_the_target_is_attachable_rather_than_supervised(fixture: &Fixture) {
         status["switch_readiness"]["lease"], "free",
         "a desktop hop supervises nothing, so it must leave no lease; status was: {status}"
     );
+    // The target may be *bound* — a hop that opened the application journals
+    // exactly that — but never as a run this process supervises. A lease-free
+    // session reading `supervised codex` would be a run that does not exist.
     assert_ne!(
-        status["binding"]["provider"], "codex",
+        (
+            status["binding"]["tier"].as_str(),
+            status["binding"]["provider"].as_str()
+        ),
+        (Some("supervised"), Some("codex")),
         "the desktop target must not be bound as a supervised run; status was: {status}"
     );
 
@@ -240,8 +247,15 @@ fn an_armed_desktop_switch_opens_the_application_instead_of_supervising_a_succes
         )
     );
     assert!(
-        stderr.contains("Opened codex's desktop application"),
-        "the user must be told what was opened; stderr was: {stderr}"
+        stderr.contains("Asked codex to open its desktop application"),
+        "the user must be told what was asked for; stderr was: {stderr}"
+    );
+    // Spawning proves the executable was found and exec'd, and nothing more:
+    // this process stops watching before any window appears, so the line must
+    // not assert one did.
+    assert!(
+        !stderr.contains("Opened codex's desktop application"),
+        "a spawn that returned Ok is not an application that opened; stderr was: {stderr}"
     );
     // Supervising nothing, the command can only return the finished run's exit.
     assert_eq!(
@@ -304,8 +318,15 @@ fn switch_takes_the_desktop_transport_when_the_arm_it_reuses_asked_for_it() {
         )
     );
     assert!(
-        stderr.contains("Opened codex's desktop application"),
-        "the user must be told what was opened; stderr was: {stderr}"
+        stderr.contains("Asked codex to open its desktop application"),
+        "the user must be told what was asked for; stderr was: {stderr}"
+    );
+    // Spawning proves the executable was found and exec'd, and nothing more:
+    // this process stops watching before any window appears, so the line must
+    // not assert one did.
+    assert!(
+        !stderr.contains("Opened codex's desktop application"),
+        "a spawn that returned Ok is not an application that opened; stderr was: {stderr}"
     );
     // Nothing was supervised, so there is no child exit to relay: what this
     // reports is whether the switch it was asked for happened, and it did.
@@ -507,5 +528,159 @@ fn a_desktop_application_that_will_not_open_keeps_the_exit_code_and_names_the_ha
         preview.status.success(),
         "the advice names `handover preview codex`, so it must work; stderr was: {}",
         String::from_utf8_lossy(&preview.stderr)
+    );
+}
+
+/// What the hop leaves in the journal, and what every surface therefore says
+/// about it afterwards.
+///
+/// A desktop launch supervises nothing, so unless the hop itself journals the
+/// attachment there is no record at all that the session moved. The symptom is
+/// not cosmetic: `previous_provider` reads the same derivation, so the *next*
+/// arm writes `switch.requested {from: <predecessor>}` — into an append-only,
+/// checksummed journal — naming a provider that was handed away from, and the
+/// rendered handover header reads `Provider: claude → claude`.
+fn assert_the_hop_bound_the_session_to_the_application_it_opened(fixture: &Fixture) {
+    let status = fixture.status();
+    assert_eq!(
+        status["binding"]["tier"], "attached",
+        "a desktop hop opens an application Handover does not supervise, which is \
+         precisely attach tier; status was: {status}"
+    );
+    assert_eq!(
+        status["binding"]["provider"], "codex",
+        "the binding must name the application that was opened, not the provider it \
+         replaced; status was: {status}"
+    );
+    assert_eq!(
+        status["binding"]["detached"], false,
+        "nothing has claimed the session away from the application just opened; \
+         status was: {status}"
+    );
+    assert_eq!(
+        status["provider"], "codex",
+        "status's own provider line must agree with the binding; status was: {status}"
+    );
+
+    // `list` derives from the same events, so a disagreement here would mean
+    // the derivation is not the single one it is supposed to be.
+    let listed: serde_json::Value =
+        serde_json::from_slice(&fixture.command(&["list", "--json"]).stdout).unwrap();
+    let row = listed["sessions"]
+        .as_array()
+        .expect("list reports an array of sessions")
+        .iter()
+        .find(|row| row["session_id"] == status["session_id"])
+        .unwrap_or_else(|| panic!("the hopped session must be listed; list was: {listed}"));
+    assert_eq!(row["tier"], "attached", "list row was: {row}");
+    assert_eq!(row["detached"], false, "list row was: {row}");
+    assert_eq!(row["last_provider"], "codex", "list row was: {row}");
+
+    // The permanent half, and the one that matters most: the next arm records
+    // where the session is being handed over *from*, and that event can never
+    // be edited afterwards.
+    let armed = fixture.command(&["arm", "claude", "--json"]);
+    assert!(
+        armed.status.success(),
+        "arming from the desktop session must work; stderr was: {}",
+        String::from_utf8_lossy(&armed.stderr)
+    );
+    let journal = String::from_utf8_lossy(&fixture.command(&["log", "--json"]).stdout).into_owned();
+    let requested = journal
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|envelope| envelope["event"]["type"] == "switch.requested")
+        .next_back()
+        .expect("the arm journals a switch.requested");
+    assert_eq!(
+        requested["event"]["payload"]["from"], "codex",
+        "the journaled intent must be handed over *from* the application that was \
+         opened; event was: {requested}"
+    );
+    assert_eq!(requested["event"]["payload"]["to"], "claude");
+}
+
+/// The claim-on-exit half: a provider's exit claimed a desktop arm.
+#[test]
+fn a_desktop_hop_on_a_run_s_exit_journals_the_attachment_to_its_target() {
+    let fixture = fixture();
+    let launches = fixture.temp.path().join("desktop-launches");
+
+    let output = cargo_bin_cmd!("handover")
+        .current_dir(&fixture.cwd)
+        .env("HANDOVER_HOME", &fixture.state)
+        .env("PATH", &fixture.path)
+        .env(TEST_LAUNCH_LOG_ENV, &launches)
+        .args(["run", "claude"])
+        .output()
+        .unwrap();
+    assert!(
+        launches.exists(),
+        "the desktop launch must have been attempted; stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_the_hop_bound_the_session_to_the_application_it_opened(&fixture);
+}
+
+/// The porcelain half: `handover switch` reused an arm recorded on the desktop
+/// surface. Both call sites route through one mapping, and this is what proves
+/// they did not diverge on the append the way they once did on the transport.
+#[test]
+fn a_desktop_hop_from_switch_journals_the_attachment_to_its_target() {
+    let fixture = armed_session("desktop");
+    let launches = fixture.temp.path().join("desktop-launches");
+
+    let output = cargo_bin_cmd!("handover")
+        .current_dir(&fixture.cwd)
+        .env("HANDOVER_HOME", &fixture.state)
+        .env("PATH", &fixture.path)
+        .env(TEST_LAUNCH_LOG_ENV, &launches)
+        .args(["switch", "codex"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_the_hop_bound_the_session_to_the_application_it_opened(&fixture);
+}
+
+/// A launch that did not happen created no binding, so it must journal none.
+///
+/// The rule is not symmetry for its own sake: `session.attached` is permanent,
+/// and one written for an application that never opened would move every
+/// surface — and the next arm's `switch.requested.from` — onto a provider the
+/// user never reached.
+#[test]
+fn a_desktop_launch_that_fails_journals_no_attachment() {
+    let fixture = armed_session("desktop");
+    let unwritable = fixture
+        .temp
+        .path()
+        .join("no-such-directory/desktop-launches");
+
+    let output = cargo_bin_cmd!("handover")
+        .current_dir(&fixture.cwd)
+        .env("HANDOVER_HOME", &fixture.state)
+        .env("PATH", &fixture.path)
+        .env(TEST_LAUNCH_LOG_ENV, &unwritable)
+        .args(["switch", "codex"])
+        .output()
+        .unwrap();
+    assert_ne!(output.status.code(), Some(0));
+
+    let journal = String::from_utf8_lossy(&fixture.command(&["log", "--json"]).stdout).into_owned();
+    assert!(
+        !journal.contains("session.attached"),
+        "nothing opened, so nothing may be recorded as attached; journal was: {journal}"
+    );
+    let status = fixture.status();
+    assert_eq!(
+        status["binding"]["tier"], "supervised",
+        "the session is still bound to the run that finished; status was: {status}"
     );
 }

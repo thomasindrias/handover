@@ -656,7 +656,9 @@ enum ClaimedTransport {
     /// directory, no `CODEX_HOME`, no hook binary, no run inbox and no flags,
     /// so there is nowhere to put them; the claim committed the document to the
     /// journal, and the target pulls it over MCP. That is what makes a desktop
-    /// session attach tier.
+    /// session attach tier — and `open_desktop` journals the `session.attached`
+    /// that says so, because a launch nothing supervises leaves no other trace
+    /// of what the session is now bound to.
     Desktop {
         target: Provider,
         spec: DesktopLaunch,
@@ -852,14 +854,18 @@ fn launch_supervised_run(
         match next_launch_from_pending_arm(store, layout, leases, runtime, &post) {
             Ok(Some(ClaimedTransport::Supervised(next))) => request = next,
             Ok(Some(ClaimedTransport::Desktop { target, spec })) => {
-                // Nothing further is journaled, so the lock goes first — the
-                // application this opens may reach straight back for the
-                // handover over MCP, and it must not find the session held.
+                // The lock goes first — the application this opens may reach
+                // straight back for the handover over MCP, and it must not find
+                // the session held. The attach `open_desktop` journals
+                // afterwards takes the lock again for itself, briefly, once the
+                // launch has already succeeded.
                 drop(operation);
                 // Whether it opened is deliberately not this command's verdict:
                 // this supervised a run that did its work, and that run's exit
                 // code is what it owes.
                 open_desktop(
+                    store,
+                    runtime,
                     environment,
                     target,
                     &spec,
@@ -966,21 +972,32 @@ fn next_launch_from_pending_arm(
 /// to claim, so it must not say there is: naming a `handover claim` that would
 /// now refuse is the wrong-advice bug this project has already shipped once.
 /// What is true is that the document exists, and `handover preview` renders it.
+///
+/// Callers must have released `SessionOperationLock` before calling: the
+/// application this opens may reach straight back over MCP, and it must not
+/// find the session held. The attach append below re-acquires it for itself.
 fn open_desktop(
+    store: &SessionStore,
+    runtime: &dyn Runtime,
     environment: &Environment,
     target: Provider,
     spec: &DesktopLaunch,
     finished: Option<FinishedRun>,
 ) -> bool {
+    let provider = target;
     let target = target.executable();
     match launcher_from(environment).launch(spec) {
         Ok(()) => {
+            // What is actually known: the executable was found and exec'd.
+            // Whether the application came up happens after this process stops
+            // watching, so the line must not claim it did.
             eprintln!(
-                "Opened {target}'s desktop application (`{}`). Nothing supervises it from \
-                 here: with Handover's MCP server configured it can pull this handover \
-                 itself, and `handover preview {target}` renders the same document.",
+                "Asked {target} to open its desktop application (`{}`). Nothing supervises \
+                 it from here: with Handover's MCP server configured it can pull this \
+                 handover itself, and `handover preview {target}` renders the same document.",
                 spec.describe(),
             );
+            journal_desktop_attach(store, runtime, provider);
             true
         }
         Err(error) => {
@@ -1001,6 +1018,36 @@ fn open_desktop(
             );
             false
         }
+    }
+}
+
+/// Record that the session is now bound to the application just opened.
+///
+/// A desktop launch supervises nothing, so nothing else would ever journal
+/// this — and without it all three surfaces keep reporting the *predecessor*
+/// while the user is in the target's application, and the next arm writes a
+/// permanent `switch.requested {from: <predecessor>}` naming a provider that
+/// was handed over from. `session.attached` is exactly the fact, which is why
+/// this reuses it rather than inventing a desktop-shaped event: `binding()`
+/// then reports attach tier for the target on `status`, `list` and `doctor`,
+/// and `previous_provider` follows, all for free.
+///
+/// Deliberately not fallible to the caller. This runs only after a launch that
+/// succeeded, so the application is already open; failing the command now would
+/// be useless — there is nothing to undo — and confusing. What the user gets
+/// instead is the truth about what is stale and the one command that fixes it.
+fn journal_desktop_attach(store: &SessionStore, runtime: &dyn Runtime, provider: Provider) {
+    let appended = SessionOperationLock::acquire(&store.session_dir()).and_then(|_operation| {
+        store.append(runtime, None, Some(provider), EventKind::SessionAttached {})
+    });
+    if let Err(error) = appended {
+        eprintln!(
+            "warning: could not record the attachment to {}: {error}. The application is \
+             open, but this session's binding still names the provider it replaced — run \
+             `handover attach {}` from this worktree to correct it.",
+            provider.executable(),
+            provider.executable(),
+        );
     }
 }
 
@@ -1140,10 +1187,11 @@ pub fn switch_command(
             operation,
         ),
         ClaimedTransport::Desktop { target, spec } => {
-            // Nothing further is journaled, so the lock goes first — the
-            // application this opens may reach straight back for the handover
-            // over MCP, and it must not find the session held. Same ordering,
-            // and same reason, as the claim-on-exit path.
+            // The lock goes first — the application this opens may reach
+            // straight back for the handover over MCP, and it must not find the
+            // session held. Same ordering, and same reason, as the
+            // claim-on-exit path; and as there, the attach `open_desktop`
+            // journals afterwards re-acquires the lock for itself.
             drop(operation);
             // Supervising nothing, this has no child exit to relay: what it
             // returns is its own verdict on the two things it was asked to do.
@@ -1151,7 +1199,7 @@ pub fn switch_command(
             // still exits rather than falling back to the terminal -- but a
             // launch that did not happen leaves an application the user must
             // open themselves, and must not be reported as success.
-            if open_desktop(environment, target, &spec, None) {
+            if open_desktop(&store, runtime, environment, target, &spec, None) {
                 Ok(0)
             } else {
                 Ok(1)

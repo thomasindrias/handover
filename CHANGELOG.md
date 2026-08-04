@@ -50,7 +50,11 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
   hand (`docs/mcp.md`); Handover does not register it automatically. A
   failed launch degrades the command rather than failing it: the arm stays
   claimed and the run's own exit code is preserved. `open` is macOS-only, so
-  a Claude desktop arm cannot open on Linux.
+  a Claude desktop arm cannot open on Linux. A launch that succeeds journals
+  `session.attached` for the target it opened, so `status`, `list` and
+  `doctor` report the application the user is now in rather than the provider
+  it replaced — and the next arm's permanent `switch.requested.from` names it
+  too.
 - A Handover-launched Codex session now keeps the user's own skills. The private
   per-run `CODEX_HOME` links each entry of the real `skills/` directory
   individually, beside Handover's own.
